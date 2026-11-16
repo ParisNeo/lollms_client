@@ -1353,6 +1353,86 @@ class _AgentStreamState:
                 self._pending_buffer = self._pending_buffer[pseudo_art_match.end():]
                 return True
 
+        # Intercept bare function-call syntax: tool_<name>(arg=val, ...)
+        # Small models frequently emit `tool_read_file(file_name="readme.md")` as a
+        # bare line WITHOUT any <tool> wrapper or JSON payload. Convert it into a
+        # proper <tool>{...}</tool> block so the standard pipeline handles it.
+        if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact:
+            bare_fn_match = re.search(
+                r'(?m)^[ \t]*(?:```(?:python|xml|json)?\s*)?(?:`{1,3}\s*)?(?:>\s*)?(?:`{1,3}\s*)?(tool_\w+)\s*\((.*?)\)\s*$',
+                self._pending_buffer,
+                re.DOTALL | re.IGNORECASE
+            )
+            if bare_fn_match:
+                _raw_fn = bare_fn_match.group(1)
+                _raw_args = bare_fn_match.group(2)
+
+                # Refuse to hijack a line that is actually inside an active call
+                # form that is already complete (e.g. `<tool>tool_x(...)</tool>`)
+                # by only accepting forms that do NOT already have a <tool> prefix
+                # in the same line.
+                line_prefix = self._pending_buffer[:bare_fn_match.start()].rsplit("\n", 1)[-1]
+                if "<tool" not in line_prefix.lower():
+                    _parsed_args: Dict[str, Any] = {}
+                    _arg_pattern = re.compile(
+                        r'([a-zA-Z_]\w*)\s*=\s*(?:'
+                        r'"((?:[^"\\]|\\.)*)"'
+                        r"|'((?:[^'\\]|\\.)*)'"
+                        r'|(true|false|null|None|True|False)'
+                        r'|(-?\d+(?:\.\d+)?)'
+                        r'|([^,\)]+)'
+                        r')',
+                        re.IGNORECASE
+                    )
+                    for _am in _arg_pattern.finditer(_raw_args):
+                        _akey = _am.group(1)
+                        if _am.group(2) is not None:
+                            _aval: Any = _am.group(2)
+                        elif _am.group(3) is not None:
+                            _aval = _am.group(3)
+                        elif _am.group(4) is not None:
+                            _tok = _am.group(4).lower()
+                            _aval = {"true": True, "false": False, "none": None, "null": None}.get(_tok, _am.group(4))
+                        elif _am.group(5) is not None:
+                            _num = _am.group(5)
+                            try:
+                                _aval = int(_num) if "." not in _num else float(_num)
+                            except ValueError:
+                                _aval = _num
+                        else:
+                            _aval = str(_am.group(6) or "").strip()
+
+                        # Normalise path-like keys to `file_name` and safe relatives.
+                        if _akey.lower() in ("path", "file_path", "filepath", "filename"):
+                            _akey = "file_name"
+                        _parsed_args[_akey] = _aval
+
+                    _normalized = json.dumps({"name": _raw_fn, "parameters": _parsed_args})
+                    self.completed_actions.append({"type": "tool", "json": _normalized})
+                    self.tool_json_data = _normalized
+                    self.tool_trigger = True
+                    self._action_dispatched = True
+
+                    # Drop any conversational preamble already streamed on the same
+                    # line, and clear the matched call from the pending buffer.
+                    _before = self._pending_buffer[:bare_fn_match.start()]
+                    if _before.strip():
+                        self.content += _before
+                        self._cb(_before)
+
+                    self._pending_buffer = self._pending_buffer[bare_fn_match.end():]
+
+                    ASCIIColors.info(
+                        f"[AgentStreamState] Normalized bare function call '{_raw_fn}(...)' → JSON tool call."
+                    )
+                    if self.is_callback_mode:
+                        self._cb("", MSG_TYPE.MSG_TYPE_TOOL_START, {
+                            "tool_name": _raw_fn,
+                            "parameters": _parsed_args,
+                            "stream_complete": True
+                        })
+                    return True
+
         # Intercept direct XML tool calls (e.g. <tool_load_skill title="..." /> or `><tool_...>)
         if not self._in_think_block and not self._is_accumulating_tool and not self._is_accumulating_artifact:
             direct_tool_match = re.search(r'(?m)^\s*(?:[-=]{3,}\s*)?(?:`{1,3}\s*)?(?:>\s*)?(?:`{1,3}\s*)?(?:```(?:xml|json)?\s*)?<(tool_\w+)\b([^>]*?)(?:>(.*?)</\1>|/?>)', self._pending_buffer, re.DOTALL | re.IGNORECASE)

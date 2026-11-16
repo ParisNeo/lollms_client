@@ -59,7 +59,7 @@ import json
 from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 from sqlalchemy import (Column, DateTime, Float, Index, Integer, String,
                         Text, ForeignKey, create_engine)
@@ -1827,6 +1827,156 @@ def auto_extract_ontology_from_content(content: str) -> Tuple[str, str, str, Lis
             obj = tag
 
     return subject, predicate, obj, list(set(tags))
+
+
+class ProjectMemory:
+    """
+    Project-scoped episodic memory that persists under `<workspace>/.lollms_code/`.
+
+    Wraps a dedicated `LollmsMemoryManager` writing to
+    `<workspace>/.lollms_code/episodic_memory.db` so project knowledge survives
+    across sessions without polluting the global handbag memory. Additive to
+    `LollmsPersonality.memory_manager` (which stays as the session/associative
+    layer); this class is the DURABLE, per-repo episodic store.
+
+    Usage:
+        pm = ProjectMemory(workspace_path)
+        pm.remember("User's build tool is `make` (not ninja).", tags=["build"])
+        hits = pm.search("build tool")
+    """
+
+    DEFAULT_DB_NAME = "episodic_memory.db"
+    _LEVEL_WORKING = 1         # Immediate context: recent facts from this session
+    _LEVEL_CONSOLIDATED = 2    # Durable: high-confidence facts worth keeping
+
+    def __init__(
+        self,
+        workspace_path: Union[str, Path, None],
+        *,
+        owner_id: Optional[str] = None,
+        working_token_budget: int = 2000,
+    ):
+        self.workspace_path = Path(workspace_path).resolve() if workspace_path else None
+        self._manager: Optional[LollmsMemoryManager] = None
+        self._db_path: Optional[Path] = None
+        self._owner_id = owner_id or (
+            f"project_{self.workspace_path.name}" if self.workspace_path else "project_default"
+        )
+
+        if self.workspace_path is None:
+            return
+
+        try:
+            state_dir = self.workspace_path / ".lollms_code"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            self._db_path = state_dir / self.DEFAULT_DB_NAME
+            self._manager = LollmsMemoryManager(
+                db_path=f"sqlite:///{self._db_path}",
+                owner_id=self._owner_id,
+                config=MemoryConfig(working_token_budget=working_token_budget),
+            )
+            ASCIIColors.success(
+                f"[ProjectMemory] Episodic memory ready: {self._db_path}"
+            )
+        except Exception as exc:
+            ASCIIColors.warning(f"[ProjectMemory] Failed to initialize: {exc}")
+            self._manager = None
+            self._db_path = None
+
+    @property
+    def is_ready(self) -> bool:
+        return self._manager is not None
+
+    @property
+    def db_path(self) -> Optional[Path]:
+        return self._db_path
+
+    def remember(
+        self,
+        content: str,
+        *,
+        tags: Optional[List[str]] = None,
+        importance: float = 0.7,
+        level: Optional[int] = None,
+    ) -> Optional[str]:
+        """Persist one episodic fact. Returns the memory id or None on failure."""
+        if not self._manager or not content or not content.strip():
+            return None
+        try:
+            rec = self._manager.add(
+                content=content.strip(),
+                tags=list(tags or []),
+                importance=max(0.0, min(1.0, float(importance))),
+                level=level if level is not None else self._LEVEL_CONSOLIDATED,
+            )
+            return rec if isinstance(rec, str) else None
+        except Exception as exc:
+            ASCIIColors.warning(f"[ProjectMemory] remember() failed: {exc}")
+            return None
+
+    def search(self, query: str, *, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Return the top-k episodic matches for a query (empty list on failure)."""
+        if not self._manager or not query or not query.strip():
+            return []
+        try:
+            hits = self._manager.query(text=query, top_k=top_k) or []
+            return [h for h in hits if isinstance(h, dict)]
+        except Exception as exc:
+            ASCIIColors.warning(f"[ProjectMemory] search() failed: {exc}")
+            return []
+
+    def build_context_block(self, query: str, *, top_k: int = 5) -> str:
+        """Render an `=== EPISODIC MEMORY ===` block for system-prompt injection.
+
+        Returns "" when there are no hits (so the caller can skip injecting an
+        empty block that would only burn tokens).
+        """
+        hits = self.search(query, top_k=top_k)
+        if not hits:
+            return ""
+        lines = [
+            "=== EPISODIC MEMORY (project-scoped, persisted across sessions) ===",
+            "These are durable facts learned about THIS project in past sessions. "
+            "Treat them as ground truth unless contradicted by explicit user input.",
+        ]
+        for h in hits:
+            content = (h.get("content") or "").strip()
+            if not content:
+                continue
+            imp = h.get("importance")
+            imp_str = f" [{float(imp):.0%}]" if isinstance(imp, (int, float)) else ""
+            lines.append(f"- {content}{imp_str}")
+        lines.append("=== END EPISODIC MEMORY ===")
+        return "\n".join(lines)
+
+    def forget(self, memory_id: str) -> bool:
+        """Delete one memory by id. Returns True on success."""
+        if not self._manager or not memory_id:
+            return False
+        try:
+            self._manager.delete(memory_id)
+            return True
+        except Exception:
+            return False
+
+    def wipe(self) -> bool:
+        """Erase ALL episodic memories for this project. Returns True on success."""
+        if not self._manager:
+            return False
+        try:
+            import sqlite3 as _sqlite3
+            for table in ("memories", "memory_embeddings", "memory_decay_history", "memory_relationships"):
+                try:
+                    conn = _sqlite3.connect(str(self._db_path))
+                    conn.execute(f"DELETE FROM {table}")
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+            return True
+        except Exception as exc:
+            ASCIIColors.warning(f"[ProjectMemory] wipe() failed: {exc}")
+            return False
 
 
 class FailureMemory:

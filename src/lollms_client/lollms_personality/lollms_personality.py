@@ -13,8 +13,8 @@
 from __future__ import annotations
 
 import ast
-import builtins
 import base64
+import builtins
 import hashlib
 import importlib
 import importlib.util
@@ -22,12 +22,12 @@ import inspect
 import json
 import os
 import re
+import time
 import traceback
 import uuid
-import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
@@ -79,7 +79,7 @@ if _compile is None or not callable(_compile) or _compile.__module__ != 'builtin
 
 from lollms_client.lollms_types import MSG_TYPE, EventMode, normalize_event_mode
 
-from lollms_client.lollms_memory import FailureMemory
+from lollms_client.lollms_memory import FailureMemory, ProjectMemory
 from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactManager
 from lollms_client.lollms_artefact.lollms_artefact import ArtefactManager as _ArtefactManager
 from lollms_client.lollms_history import HistoryManager
@@ -2707,6 +2707,16 @@ class LollmsPersonality:
         if self.workspace_path:
             self.workspace_path.mkdir(parents=True, exist_ok=True)
             self._resolved_workspace = Path(self.workspace_path).resolve()
+            # Re-bind project memory + USER.md when the workspace moves.
+            if not getattr(self, '_project_memory', None) or getattr(self._project_memory, 'workspace_path', None) != self._resolved_workspace:
+                try:
+                    object.__setattr__(self, '_project_memory', ProjectMemory(self._resolved_workspace))
+                except Exception:
+                    pass
+                try:
+                    self._init_user_profile(self._resolved_workspace / ".lollms_code" / "USER.md")
+                except Exception:
+                    pass
         else:
             self._resolved_workspace = None
 
@@ -2728,6 +2738,29 @@ class LollmsPersonality:
 
         if self.enable_artefact_system and self._resolved_workspace:
             self._init_artefact_system()
+
+        # ── Project-scoped episodic memory + per-workspace user profile ──
+        # These are the durable "don't repeat myself" layers. They are
+        # deliberately SEPARATE from `self.memory_manager` (handbag-level,
+        # session-associative) and both live under `<workspace>/.lollms_code/`.
+        object.__setattr__(self, '_project_memory', None)
+        object.__setattr__(self, '_user_profile_path', None)
+        object.__setattr__(self, '_user_profile_content', "")
+        if self._resolved_workspace:
+            try:
+                object.__setattr__(
+                    self,
+                    '_project_memory',
+                    ProjectMemory(self._resolved_workspace),
+                )
+            except Exception as pm_err:
+                ASCIIColors.warning(f"[{self.name}] ProjectMemory init failed: {pm_err}")
+            try:
+                self._init_user_profile(
+                    self._resolved_workspace / ".lollms_code" / "USER.md"
+                )
+            except Exception as up_err:
+                ASCIIColors.warning(f"[{self.name}] User profile init failed: {up_err}")
 
         self.ensure_data_vectorized()
 
@@ -4001,6 +4034,8 @@ class LollmsPersonality:
                 top_k: int = 5,
                 threshold: float = 0.0,
                 method: str = "dense",
+                max_chars_per_chunk: int = 0,
+                auto_crop: bool = True,
             ) -> dict:
                 # Defensive casts — agents frequently emit numeric params as strings.
                 try:
@@ -4009,6 +4044,12 @@ class LollmsPersonality:
                     top_k = 5
                 if top_k <= 0:
                     top_k = 5
+                try:
+                    max_chars_per_chunk = int(max_chars_per_chunk) if max_chars_per_chunk is not None else 0
+                except (TypeError, ValueError):
+                    max_chars_per_chunk = 0
+                if max_chars_per_chunk < 0:
+                    max_chars_per_chunk = 0
                 try:
                     threshold = float(threshold) if threshold is not None else 0.0
                 except (TypeError, ValueError):
@@ -4025,6 +4066,7 @@ class LollmsPersonality:
                     ASCIIColors.info(
                         f"[RAG-DIAG] ENTRY query='{query[:80]}' datasource_name={datasource_name!r} "
                         f"top_k={top_k} threshold={threshold} method={method} "
+                        f"max_chars_per_chunk={max_chars_per_chunk} auto_crop={auto_crop} "
                         f"safe_store_keys={list(safe_store_map.keys())} "
                         f"kb_path_keys={list(kb_path_map.keys())} "
                         f"data_source_names={[ds.name for ds in self.data_sources]}"
@@ -4045,6 +4087,16 @@ class LollmsPersonality:
                     except Exception:
                         pass
                     datasource_name = _auto
+
+                # ── CROP ENFORCEMENT ──
+                # Clamp the effective top_k so the LLM cannot request an
+                # arbitrary number of chunks that would flood the context.
+                # `auto_crop=False` lets an advanced caller bypass the guard.
+                _requested_top_k = top_k
+                top_k = _rag_effective_top_k(top_k, auto_crop)
+                _crop_per_chunk = max_chars_per_chunk
+                if _crop_per_chunk <= 0:
+                    _crop_per_chunk = _calculate_dynamic_tool_char_limit(self.lollms_client) or 0
 
                 # Branch 1: handbag SafeStore binding
                 if datasource_name and datasource_name in safe_store_map:
@@ -4133,17 +4185,38 @@ class LollmsPersonality:
                             )
                             return {"success": True, "output": f"No relevant content found in '{datasource_name}' for query: '{query}'."}
                         parts = []
+                        _crop_count = 0
                         for i, src in enumerate(normalised["sources"], 1):
                             title = src.get("title") or src.get("source") or "Document"
                             score = src.get("score")
                             score_str = f" (Score: {score:.2f})" if isinstance(score, (int, float)) else ""
-                            parts.append(f"[{i}] {title}{score_str}:\n{src.get('content', '')}")
-                        ASCIIColors.success(f"[RAG-DIAG] SafeStore '{datasource_name}' -> {len(normalised['sources'])} hit(s)")
+                            _raw_content = src.get("content", "") or ""
+                            _cut_content, _was_cut = _rag_crop_chunk_content(_raw_content, _crop_per_chunk)
+                            if _was_cut:
+                                _crop_count += 1
+                            parts.append(f"[{i}] {title}{score_str}:\n{_cut_content}")
+                        ASCIIColors.success(f"[RAG-DIAG] SafeStore '{datasource_name}' -> {len(normalised['sources'])} hit(s) (cropped: {_crop_count})")
+                        _crop_note = ""
+                        if top_k < _requested_top_k:
+                            _crop_note += (
+                                f"\n\n[CROP NOTICE: You requested {_requested_top_k} chunk(s); "
+                                f"the context budget allows {top_k}. Narrow the query or use "
+                                f"tool_read_rag_document for a specific document.]"
+                            )
+                        if _crop_count:
+                            _crop_note += (
+                                f"\n[{_crop_count} chunk(s) truncated to {_crop_per_chunk} chars to "
+                                f"protect the context window. Use tool_read_rag_document or "
+                                f"tool_expand_rag_context to retrieve the full content.]"
+                            )
                         return {
                             "success": True,
                             "sources_count": len(normalised["sources"]),
                             "sources": normalised["sources"],
-                            "output": "\n\n".join(parts),
+                            "cropped_chunks": _crop_count,
+                            "effective_top_k": top_k,
+                            "requested_top_k": _requested_top_k,
+                            "output": "\n\n".join(parts) + _crop_note,
                         }
                     except Exception as e:
                         ASCIIColors.error(f"[RAG-DIAG] SafeStore '{datasource_name}' query EXCEPTION: {e}")
@@ -4237,19 +4310,39 @@ class LollmsPersonality:
                                     "output": f"No relevant content found in '{datasource_name}' for query: '{query}'.",
                                 }
                             _parts = []
+                            _crop_count = 0
                             for _i, _src in enumerate(_norm["sources"], 1):
                                 _title = _src.get("title") or _src.get("source") or "Document"
                                 _score = _src.get("score")
                                 _score_str = f" (Score: {_score:.2f})" if isinstance(_score, (int, float)) else ""
-                                _parts.append(f"[{_i}] {_title}{_score_str}:\n{_src.get('content', '')}")
+                                _raw_content = _src.get("content", "") or ""
+                                _cut_content, _was_cut = _rag_crop_chunk_content(_raw_content, _crop_per_chunk)
+                                if _was_cut:
+                                    _crop_count += 1
+                                _parts.append(f"[{_i}] {_title}{_score_str}:\n{_cut_content}")
                             ASCIIColors.success(
-                                f"[RAG-DIAG] SafeStore '{datasource_name}' -> {len(_norm['sources'])} hit(s)"
+                                f"[RAG-DIAG] SafeStore '{datasource_name}' -> {len(_norm['sources'])} hit(s) (cropped: {_crop_count})"
                             )
+                            _crop_note = ""
+                            if top_k < _requested_top_k:
+                                _crop_note += (
+                                    f"\n\n[CROP NOTICE: You requested {_requested_top_k} chunk(s); "
+                                    f"the context budget allows {top_k}. Narrow the query or use "
+                                    f"tool_read_rag_document for a specific document.]"
+                                )
+                            if _crop_count:
+                                _crop_note += (
+                                    f"\n[{_crop_count} chunk(s) truncated to {_crop_per_chunk} chars. "
+                                    f"Use tool_read_rag_document or tool_expand_rag_context for full content.]"
+                                )
                             return {
                                 "success": True,
                                 "sources_count": len(_norm["sources"]),
                                 "sources": _norm["sources"],
-                                "output": "\n\n".join(_parts),
+                                "cropped_chunks": _crop_count,
+                                "effective_top_k": top_k,
+                                "requested_top_k": _requested_top_k,
+                                "output": "\n\n".join(_parts) + _crop_note,
                             }
                         except Exception as _e:
                             ASCIIColors.error(
@@ -4292,22 +4385,69 @@ class LollmsPersonality:
                         )
                         return {"success": True, "output": f"No relevant content found for query: '{query}'."}
                     parts = []
+                    _crop_count = 0
                     for i, src in enumerate(result.get("sources", []), 1):
                         title = src.get("title") or src.get("source") or "Document"
                         score = src.get("score")
                         score_str = f" (Score: {score:.2f})" if isinstance(score, (int, float)) and (score <= 1.0) else (f" (Score: {score})" if score is not None else "")
-                        parts.append(f"[{i}] {title}{score_str}:\n{src.get('content', '')}")
-                    ASCIIColors.success(f"[RAG-DIAG] path/default -> {len(result.get('sources', []))} hit(s)")
+                        _raw_content = src.get("content", "") or ""
+                        _cut_content, _was_cut = _rag_crop_chunk_content(_raw_content, _crop_per_chunk)
+                        if _was_cut:
+                            _crop_count += 1
+                        parts.append(f"[{i}] {title}{score_str}:\n{_cut_content}")
+                    ASCIIColors.success(f"[RAG-DIAG] path/default -> {len(result.get('sources', []))} hit(s) (cropped: {_crop_count})")
+                    _crop_note = ""
+                    if top_k < _requested_top_k:
+                        _crop_note += (
+                            f"\n\n[CROP NOTICE: You requested {_requested_top_k} chunk(s); "
+                            f"the context budget allows {top_k}. Narrow the query or use "
+                            f"tool_read_rag_document for a specific document.]"
+                        )
+                    if _crop_count:
+                        _crop_note += (
+                            f"\n[{_crop_count} chunk(s) truncated to {_crop_per_chunk} chars. "
+                            f"Use tool_read_rag_document or tool_expand_rag_context for full content.]"
+                        )
                     return {
                         "success": True,
                         "sources_count": len(result.get("sources", [])),
                         "sources": result.get("sources", []),
-                        "output": "\n\n".join(parts),
+                        "cropped_chunks": _crop_count,
+                        "effective_top_k": top_k,
+                        "requested_top_k": _requested_top_k,
+                        "output": "\n\n".join(parts) + _crop_note,
                     }
                 except Exception as e:
                     ASCIIColors.error(f"[RAG-DIAG] path/default query EXCEPTION: {e}")
                     trace_exception(e)
                     return {"success": False, "error": f"RAG query failed: {e}"}
+
+            def _rag_artefact_safe_filename(document_title: str, datasource_name: Optional[str]) -> str:
+                """Derive a collision-safe workspace-relative artefact filename.
+
+                Full RAG documents are persisted under a reserved folder
+                (`_rag_documents/`) so they never overwrite real workspace files
+                and are easily identifiable in the tree. Duplicate titles get a
+                numeric suffix; path separators and control characters are
+                stripped so a malicious/odd document title cannot traverse out of
+                the folder.
+                """
+                stem = re.sub(r'[^A-Za-z0-9._-]+', '_', str(document_title or "document")).strip("._") or "document"
+                if not re.search(r'\.[A-Za-z0-9]{1,8}$', stem):
+                    stem += ".md"
+                folder = f"_rag_documents/{_sanitise_tool_ident(str(datasource_name or 'rag'), fallback='rag')}"
+                candidate = f"{folder}/{stem}"
+                if self._resolved_workspace:
+                    base = self._resolved_workspace / candidate
+                    if base.exists():
+                        p = Path(stem)
+                        suffix = p.suffix or ".md"
+                        name = p.stem
+                        n = 2
+                        while (self._resolved_workspace / folder / f"{name}_{n}{suffix}").exists():
+                            n += 1
+                        candidate = f"{folder}/{name}_{n}{suffix}"
+                return candidate
 
             def _resolve_store_for_datastore(datasource_name: Optional[str]):
                 """Resolve a datasource_name to a live store-like binding.
@@ -4391,6 +4531,7 @@ class LollmsPersonality:
                 datasource_name: Optional[str] = None,
                 query: Optional[str] = None,
                 max_chars: int = 0,
+                as_artefact: bool = True,
             ) -> dict:
                 """Read the FULL content of a document in a RAG store.
 
@@ -4400,6 +4541,13 @@ class LollmsPersonality:
                 provided, the tool uses it to identify the best-matching document
                 via query_full_documents; otherwise it resolves document_title
                 directly.
+
+                When `as_artefact=True` (default) and the personality has a
+                workspace, the document is ingested into the artefact system as
+                a FULL-visibility file so the LLM can read it again via
+                `<unlock_file>` without re-querying the store. This avoids
+                both the token cost of inline injection AND the "no RAG" loop
+                where the model keeps re-querying because it forgot the text.
                 """
                 try:
                     max_chars = int(max_chars) if max_chars is not None else 0
@@ -4475,19 +4623,70 @@ class LollmsPersonality:
                         }
 
                     truncated = False
+                    saved_full_text = full_text
                     if max_chars and len(full_text) > max_chars:
                         full_text = full_text[:max_chars]
                         truncated = True
+
+                    # ── 📚 ARTEFACT INGESTION ──
+                    # Persist the FULL document as a workspace artefact so it
+                    # survives across rounds. The model can re-`<unlock_file>`
+                    # it later instead of re-querying the store, and the
+                    # content is versioned/visible in the discussion tree.
+                    artefact_note = ""
+                    artefact_path = None
+                    if as_artefact and getattr(self, '_artefact_manager', None) and self._resolved_workspace:
+                        try:
+                            safe_title = self._rag_artefact_safe_filename(title, datasource_name)
+                            artefact_path = safe_title
+                            self._artefact_manager.add(
+                                title=safe_title,
+                                artefact_type="text",
+                                content=saved_full_text,
+                                language="markdown",
+                                active=True,
+                                visibility=ArtefactVisibility.FULL,
+                            )
+                            _abs_target = self._resolved_workspace / safe_title
+                            try:
+                                _abs_target.parent.mkdir(parents=True, exist_ok=True)
+                                _abs_target.write_text(saved_full_text, encoding="utf-8")
+                            except Exception as ws_write_err:
+                                ASCIIColors.warning(
+                                    f"[{self.name}] RAG full-document workspace write failed for "
+                                    f"'{safe_title}': {ws_write_err}"
+                                )
+                            artefact_note = (
+                                f"\n\n📚 **Full document loaded as artefact:** `{safe_title}` "
+                                f"({len(saved_full_text):,} chars). The complete text is now in "
+                                f"your context window AND persisted to the workspace. Re-open it "
+                                f"later with `<unlock_file>{safe_title}</unlock_file>` instead of "
+                                f"re-querying — it will not consume additional RAG queries."
+                            )
+                            ASCIIColors.success(
+                                f"[{self.name}] 📚 RAG full document '{title}' ingested as artefact "
+                                f"'{safe_title}' ({len(saved_full_text):,} chars)."
+                            )
+                        except Exception as artefact_err:
+                            ASCIIColors.warning(
+                                f"[{self.name}] Failed to ingest RAG document as artefact: {artefact_err}"
+                            )
+                            artefact_note = (
+                                f"\n\n[ARTEFACT INGESTION FAILED: {artefact_err}. "
+                                f"The document text above is still valid but not persisted.]"
+                            )
 
                     header = f"=== FULL DOCUMENT: {title} (datasource: {datasource_name}) ==="
                     if truncated:
                         header += f" [truncated to {max_chars} chars — raise max_chars to read more]"
                     return {
                         "success": True,
-                        "output": f"{header}\n{full_text}\n=== END FULL DOCUMENT ===",
+                        "output": f"{header}\n{full_text}\n=== END FULL DOCUMENT ==={artefact_note}",
                         "document_title": title,
                         "chars": len(full_text),
+                        "full_chars": len(saved_full_text),
                         "truncated": truncated,
+                        "artefact_path": artefact_path,
                     }
                 except Exception as e:
                     trace_exception(e)
@@ -4695,16 +4894,25 @@ class LollmsPersonality:
                         f"Available databases:\n{ds_list_str}\n\n"
                         f"Pass `datasource_name` (one of: {_ds_options}) to target a specific database by name; "
                         "omit it to query the default knowledge base.\n\n"
+                        "YOU CONTROL how many chunks come back via `top_k` (default 5). "
+                        "The system enforces a context-budget cap: if `top_k` is too high for "
+                        "the remaining context window, it is reduced automatically and the "
+                        "result reports both `requested_top_k` and `effective_top_k`. "
+                        "Individual chunks that would bloat the window are cropped and flagged "
+                        "with `cropped_chunks`. Use `max_chars_per_chunk` (>0) to hard-cap each "
+                        "excerpt, or `auto_crop=false` to disable server-side protection entirely.\n\n"
                         "Returns the best-matching chunks. If a returned excerpt is too short or you need the "
                         "surrounding prose, use `tool_expand_rag_context` (neighborhood) or "
-                        "`tool_read_rag_document` (full document) on the SAME source."
+                        "`tool_read_rag_document` (FULL document → persisted as an artefact) on the SAME source."
                     ),
                     "parameters": [
                         {"name": "query", "type": "str", "description": "The search query or keywords."},
                         {"name": "datasource_name", "type": "str", "description": f"Exact database name to query. Valid values: {_ds_options}.", "optional": True},
-                        {"name": "top_k", "type": "int", "description": "Maximum number of chunks to return (default 5).", "optional": True},
+                        {"name": "top_k", "type": "int", "description": "How many chunks YOU want the model to receive (default 5). Clamped automatically when the context budget is tight.", "optional": True},
                         {"name": "threshold", "type": "float", "description": "Minimum relevance percentage (0-100). Chunks scored below this are dropped. Use 0 for no filtering (default 0.0).", "optional": True},
                         {"name": "method", "type": "str", "description": "Retrieval strategy: 'dense' (semantic vectors), 'hybrid' (vectors + BM25 fusion), 'lexical' (BM25 keywords only), 'graph' (knowledge-graph subgraph). Default 'dense'.", "optional": True},
+                        {"name": "max_chars_per_chunk", "type": "int", "description": "Hard character cap applied to EACH returned excerpt (0 = use the model's dynamic tool-char limit). Set a small value (e.g. 1200) to sample many chunks cheaply.", "optional": True},
+                        {"name": "auto_crop", "type": "bool", "description": "When true (default), the system clamps top_k and crops chunks to fit the remaining context window. Set false ONLY when you are certain the result will fit.", "optional": True},
                     ],
                     "callable": _tool_query_rag_unified,
                 },
@@ -4736,16 +4944,21 @@ class LollmsPersonality:
                         "Use this when a chunk returned by tool_query_rag is a fragment and the whole "
                         "document is needed to answer correctly — the full text is returned so you can "
                         "quote it verbatim.\n"
+                        "The document is ALSO persisted as a FULL-visibility workspace artefact "
+                        f"under `_rag_documents/<datasource>/` (see the returned `artefact_path`). "
+                        "You can later re-open it with `<unlock_file>` WITHOUT re-querying the store.\n"
                         f"Available databases:\n{ds_list_str}\n\n"
                         "Provide `document_title` (from a prior tool_query_rag hit) and, optionally, a "
                         "`query` to help identify the document if the exact title is uncertain. "
-                        "Pass `max_chars` > 0 to cap very large documents."
+                        "Pass `max_chars` > 0 to cap very large documents, or `as_artefact=false` to "
+                        "skip workspace persistence (e.g. for a quick one-off peek)."
                     ),
                     "parameters": [
                         {"name": "document_title", "type": "str", "description": "The document title or file name as shown by tool_query_rag (e.g. 'manual.pdf').", "optional": True},
                         {"name": "datasource_name", "type": "str", "description": f"Exact database name. Valid values: {_ds_options}.", "optional": True},
                         {"name": "query", "type": "str", "description": "Optional query used to disambiguate the target document if the exact title is uncertain.", "optional": True},
                         {"name": "max_chars", "type": "int", "description": "Maximum characters to return (0 = no limit). Use to avoid blowing up a small context window.", "optional": True},
+                        {"name": "as_artefact", "type": "bool", "description": "When true (default) and a workspace exists, the full document is persisted as a workspace artefact for later re-use. Set false for a throwaway peek.", "optional": True},
                     ],
                     "callable": _tool_read_rag_document,
                 }
@@ -4770,6 +4983,68 @@ class LollmsPersonality:
                     ],
                     "callable": _tool_expand_rag_context,
                 }
+
+            # ── Helper: cap hits to fit the active model's context budget ──
+            def _rag_effective_top_k(requested_top_k: int, auto_crop: bool) -> int:
+                """Clamp `requested_top_k` so the returned excerpts cannot blow the context.
+
+                The LLM decides how many chunks it WANTS (`requested_top_k`), the
+                system enforces a HARD CAP derived from the active model's context
+                window: at most ~25% of the remaining context budget may be spent
+                on a single RAG round, and no single chunk may exceed the dynamic
+                per-tool char limit. When the budget is too small the crop is
+                applied silently and reported back to the model so it can narrow
+                the query or switch strategy.
+                """
+                requested = max(1, int(requested_top_k))
+                if not auto_crop:
+                    return requested
+                try:
+                    max_ctx = 0
+                    if self.lollms_client and hasattr(self.lollms_client, "get_ctx_size"):
+                        max_ctx = self.lollms_client.get_ctx_size() or 0
+                    if max_ctx <= 0:
+                        return requested
+                    # Rough estimate: current prompt already consumes most of
+                    # the window; reserve ~25% for a single RAG injection.
+                    try:
+                        used = self._count_tokens_cached(
+                            getattr(self, '_current_full_prompt_snapshot', '') or ''
+                        )
+                    except Exception:
+                        used = 0
+                    remaining = max(512, max_ctx - used)
+                    rag_token_budget = int(remaining * 0.25)
+                    # ~4 chars per token
+                    char_budget = rag_token_budget * 4
+                    per_chunk = _calculate_dynamic_tool_char_limit(self.lollms_client) or 4000
+                    capped_by_chars = max(1, char_budget // max(1, per_chunk))
+                    effective = min(requested, capped_by_chars)
+                    if effective < requested:
+                        try:
+                            ASCIIColors.warning(
+                                f"[{self.name}] RAG crop: LLM requested {requested} chunk(s), "
+                                f"context budget allows {effective} "
+                                f"(remaining≈{remaining} tok, per-chunk≈{per_chunk} chars)."
+                            )
+                        except Exception:
+                            pass
+                    return max(1, effective)
+                except Exception:
+                    return requested
+
+            def _rag_crop_chunk_content(content: str, cap_chars: int) -> tuple[str, bool]:
+                if not content:
+                    return content, False
+                if cap_chars <= 0 or len(content) <= cap_chars:
+                    return content, False
+                marker = (
+                    f"\n\n[... excerpt cropped to {cap_chars} chars to protect the "
+                    f"context window. Call tool_read_rag_document to pull the "
+                    f"FULL document, or tool_expand_rag_context for the "
+                    f"neighborhood, or re-query with a narrower question ...]"
+                )
+                return content[:cap_chars].rstrip() + marker, True
 
             try:
                 ASCIIColors.info(
@@ -5445,6 +5720,37 @@ class LollmsPersonality:
             return False
         if clean_a == clean_b:
             return True
+
+        # ── 🔁 DEGENERATE CONVERGENCE DETECTION (prefix-shrink loop) ──
+        # Observed failure mode (see ai_danger.py run, rounds 25–34): the model
+        # enters a self-referential loop where each round REPEATS the previous
+        # text minus its tail. Successive rounds produce:
+        #   "The pipeline is running. Let me check…"
+        #   "The pipeline is running."
+        #   "The pipeline is running"
+        #   "The pipeline"
+        # Each successive text is a *strict prefix* of the previous, but the
+        # strings are technically DIFFERENT, so the identity/overlap checks
+        # below return False every time and the stall counter resets. That is
+        # exactly why the loop-guard fails to trip until the text is nearly
+        # empty. Detect "B is a near-prefix of A" as repetition.
+        if clean_b != clean_a:
+            _shorter, _longer = (clean_b, clean_a) if len(clean_b) <= len(clean_a) else (clean_a, clean_b)
+            # Require enough content to be meaningful (avoid false-positive on
+            # short generic interjections like "Ok" vs "Okay").
+            if len(_shorter) >= 30:
+                _prefix_ratio = len(_shorter) / max(1, len(_longer))
+                if _longer.startswith(_shorter) and _prefix_ratio >= 0.30:
+                    # Shorter text is a meaningful prefix of the longer one AND
+                    # covers at least 30% of it → the model is degrading, not
+                    # generating novel content.
+                    return True
+                # Prefix with trailing-punct/whitespace noise still counts.
+                _shorter_core = _shorter.rstrip(".…,;:!? ")
+                _longer_core = _longer.rstrip(".…,;:!? ")
+                if len(_shorter_core) >= 30:
+                    if _longer_core.startswith(_shorter_core) and (len(_shorter_core) / max(1, len(_longer_core))) >= 0.30:
+                        return True
         if len(clean_a) > 80 and clean_a in clean_b:
             return True
         if len(clean_b) > 80 and clean_b in clean_a:
@@ -5474,8 +5780,17 @@ class LollmsPersonality:
     def wipe_all_memories(self) -> bool:
         """
         Permanently deletes all episodic and associative memories from the personality's 
-        independent memory database. This includes working, deep, and archived memory tiers.
+        independent memory database. This includes working, deep, and archived memory tiers,
+        PLUS the project-scoped `.lollms_code/episodic_memory.db` store.
         """
+        # Wipe the workspace-scoped episodic store first (best-effort).
+        pm = getattr(self, '_project_memory', None)
+        if pm is not None:
+            try:
+                pm.wipe()
+            except Exception:
+                pass
+
         if not hasattr(self, 'memory_manager') or not self.memory_manager:
             ASCIIColors.warning(f"[{self.name}] No independent memory manager attached. Cannot wipe memories.")
             return False
@@ -5786,6 +6101,122 @@ JSON:"""
 
         except Exception as e:
             ASCIIColors.warning(f"[{self.name}] Memory consolidation failed: {e}")
+
+    def _project_episodic_consolidation(self, user_prompt: str, ai_response: str) -> None:
+        """Extract project-durable facts from the turn and persist to `.lollms_code/`.
+
+        Reuses the existing LLM-driven classification (same exclusions as
+        `_autonomous_memory_consolidation`) but routes the accepted facts to the
+        workspace-scoped `ProjectMemory` so they survive process restarts and
+        are retrievable from other sessions of the same project.
+        """
+        pm = getattr(self, '_project_memory', None)
+        if pm is None or not getattr(pm, 'is_ready', False):
+            return
+        if not self.lollms_client:
+            return
+
+        try:
+            clean_user = str(user_prompt or "").strip()
+            clean_ai = re.sub(r'<[^>]+>', '', str(ai_response or "")).strip()
+            if len(clean_user) < 10 or len(clean_ai) < 10:
+                return
+
+            classification_prompt = (
+                "Analyze this interaction. Extract PROJECT-DURABLE facts worth remembering across "
+                "future sessions of the SAME project (NOT a to-do, NOT an ephemeral request).\n"
+                "Examples of GOOD facts:\n"
+                "- 'The user's name is Amine.'\n"
+                "- 'The build system is `make`, not ninja.'\n"
+                "- 'The repo has a strict 4-space indentation rule.'\n"
+                "- 'Tests live in `test/`, run via `pytest -q`.'\n"
+                "Examples of BAD (reject):\n"
+                "- 'User asked to add feature X' (ephemeral task)\n"
+                "- 'User wants to fix bug Y' (ephemeral task)\n"
+                "- Greetings, progress updates, thanks.\n\n"
+                f"User: \"{clean_user}\"\n"
+                f"AI: \"{clean_ai}\"\n\n"
+                "Output EXACTLY a JSON object:\n"
+                "{\"save\": true, \"facts\": [\"fact1\", \"fact2\"], \"importance\": 0.0-1.0, \"tags\": [\"...\"]}\n"
+                "or {\"save\": false} if nothing is durable.\n\n"
+                "JSON:"
+            )
+            raw = self.lollms_client.generate_text(
+                prompt=classification_prompt,
+                temperature=0.1,
+                n_predict=384,
+                think=True,
+            )
+            if not isinstance(raw, str):
+                return
+
+            # Extract first balanced JSON object (same robustness as the
+            # session-level consolidation: models love to append a second
+            # example object or extra prose that would break greedy regex).
+            start = raw.find("{")
+            parsed = None
+            while start != -1 and parsed is None:
+                depth = 0
+                in_str = False
+                esc = False
+                for i in range(start, len(raw)):
+                    ch = raw[i]
+                    if in_str:
+                        if esc:
+                            esc = False
+                        elif ch == "\\":
+                            esc = True
+                        elif ch == '"':
+                            in_str = False
+                        continue
+                    if ch == '"':
+                        in_str = True
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                parsed = json.loads(raw[start:i + 1])
+                            except Exception:
+                                parsed = None
+                            break
+                start = raw.find("{", start + 1) if start + 1 < len(raw) else -1
+
+            if not isinstance(parsed, dict) or not parsed.get("save"):
+                return
+
+            facts = [str(f).strip() for f in (parsed.get("facts") or []) if str(f).strip()]
+            if not facts:
+                return
+
+            importance = float(parsed.get("importance", 0.75) or 0.75)
+            tags = [str(t) for t in (parsed.get("tags") or []) if str(t).strip()]
+
+            task_reject = re.compile(
+                r'^(?:user\s+(?:wants|asked|needs|requested)\s+to|organize|create|implement|'
+                r'build|fix|add|refactor|delete|remove)\b',
+                re.IGNORECASE,
+            )
+            for fact in facts:
+                if task_reject.search(fact):
+                    continue
+                pm.remember(fact, tags=tags, importance=importance, level=2)
+                ASCIIColors.success(
+                    f"[{self.name}] 📌 Project memory saved: {fact[:80]}"
+                )
+                cb = getattr(self, '_active_streaming_callback', None)
+                if cb:
+                    try:
+                        cb(
+                            f"🧠 **Remembered (project)**: {fact}",
+                            MSG_TYPE.MSG_TYPE_INFO,
+                            {"type": "project_memory_saved", "content": fact, "tags": tags},
+                        )
+                    except Exception:
+                        pass
+        except Exception as exc:
+            ASCIIColors.warning(f"[{self.name}] Project episodic consolidation error: {exc}")
 
     def _autonomous_context_cleanup(self, user_prompt: str) -> str:
         """
@@ -7859,19 +8290,40 @@ JSON:"""
                 pass
 
     def _build_user_profile_context(self) -> str:
-        """Injects the global user profile into the system prompt."""
+        """Inject `<workspace>/.lollms_code/USER.md` into the system prompt.
+
+        This profile is the agent's persistent, MUTABLE record of the user.
+        It is deliberately seeded by the LLM on first contact (see
+        `_build_onboarding_block`) and refined over time: whenever a new
+        durable requirement / preference / identity fact surfaces, the agent
+        emits a `<user_profile_update>` Aider-SEARCH/REPLACE patch to grow it.
+        """
         if not getattr(self, '_user_profile_content', ""):
             return ""
 
+        profile_path = getattr(self, '_user_profile_path', None)
+        path_hint = (
+            f" (file: {profile_path})" if profile_path is not None else ""
+        )
         return (
-            "\n=== GLOBAL USER PROFILE (IDENTITY & PREFERENCES) ===\n"
-            "This is the universal profile of the user. It applies to ALL projects and sessions.\n"
-            "If you learn a new universal fact about the user (e.g., their name, a global coding standard they follow), you MUST update this file.\n"
-            "To update it, emit: `<user_profile_update>` with Aider SEARCH/REPLACE blocks inside.\n"
-            "CRITICAL: Do NOT store project-specific facts (like 'the current project uses FastAPI') here. Use the Scratchpad for project state.\n"
+            "\n=== USER PROFILE (PERSISTENT, MUTABLE)" + path_hint + " ===\n"
+            "This is what you have LEARNED so far about the user across sessions in THIS project. "
+            "It is your memory of who they are and what they expect.\n"
+            "\n"
+            "RULES:\n"
+            "1. TREAT the recorded preferences as defaults — apply them WITHOUT re-asking.\n"
+            "2. EVERY TIME you discover a NEW durable fact (name, preferred stack, a pet peeve, "
+            "an established convention, the repo's owner), immediately persist it with:\n"
+            "   `<user_profile_update>` containing an Aider SEARCH/REPLACE block that edits the relevant section.\n"
+            "3. If a previously recorded fact turned out to be WRONG, patch it — do NOT just append a "
+            "contradiction. Keep the file accurate.\n"
+            "4. Keep entries SHORT (one line each). This file is injected into every prompt, so "
+            "bloat directly hurts the user.\n"
+            "5. Do NOT put project-ARCHITECTURE facts here (those go in the Scratchpad or episodic memory). "
+            "This file is about the HUMAN.\n"
             "=== PROFILE CONTENT ===\n"
             f"{self._user_profile_content}\n"
-            "=== END PROFILE ===\n"
+            "=== END USER PROFILE ===\n"
         )
 
     def _execute_scratchpad_clear(self) -> str:
@@ -7979,22 +8431,39 @@ JSON:"""
             return f"[SYSTEM ERROR] Failed to update user profile: {e}"
 
     def _build_onboarding_block(self) -> str:
-        """Injects a mandatory first-run onboarding protocol if the user profile is empty."""
+        """Inject a first-run USER discovery prompt when the profile is empty.
+
+        The USER.md file lives in `<workspace>/.lollms_code/USER.md` and is
+        editable/correction-friendly: the agent writes it via
+        `<user_profile_update>` and refines it over time as it learns new
+        requirements. The prompt only fires ONCE — as soon as a name is on
+        record we stop nagging and let the profile grow organically.
+        """
         profile_content = getattr(self, '_user_profile_content', "")
         import re as _re
-        name_match = _re.search(r'## Identity\s*\n+\s*- Name:\s*(\S+)', profile_content)
+        name_match = _re.search(r'##\s*Identity\s*\n+\s*[-*]\s*Name\s*:\s*(\S+)', profile_content)
         if name_match and name_match.group(1).strip():
             return ""
 
         return (
-            "\n=== FIRST-RUN ONBOARDING PROTOCOL (MANDATORY) ===\n"
-            "The user's profile is empty. You MUST conduct a brief onboarding interview before doing any work.\n"
-            "Ask the following questions one by one, wait for the user's response, and then save them to your profile.\n"
-            "1. What is your name?\n"
-            "2. What programming language are we primarily working in?\n"
-            "3. Do you have any specific coding style preferences (e.g., tabs vs spaces, type hints)?\n"
-            "After gathering all answers, use `<user_profile_update>` to save them, then emit `<done/>`.\n"
-            "=== END ONBOARDING PROTOCOL ===\n"
+            "\n=== FIRST-RUN USER DISCOVERY PROTOCOL (BRIEF, NON-BLOCKING) ===\n"
+            "Your USER.md profile is currently empty. Before starting work on the user's request, "
+            "introduce yourself briefly and gather (in ONE natural-language sentence, not a questionnaire) "
+            "the following basics:\n"
+            "1. The user's name (how they want to be addressed).\n"
+            "2. The languages / frameworks they primarily work with.\n"
+            "3. Any global style or tooling preferences they care about.\n"
+            "Do NOT interrogate. If the user is already mid-task, complete their request FIRST, "
+            "then at the END of your final reply ask ONE short follow-up question "
+            "(e.g. 'By the way, what should I call you?').\n"
+            "When you have any answer (even partial), persist it immediately with:\n"
+            "`<user_profile_update>`\n"
+            "<<<<<<< SEARCH\n## Identity\n- Name: \n- Occupation: \n=======\n## Identity\n- Name: <the name>\n- Occupation: <the occupation if known>\n>>>>>>> REPLACE\n"
+            "`</user_profile_update>`\n"
+            "The profile is mutable: whenever you discover a NEW durable fact about the user "
+            "(their team, a pet peeve, a preferred commit-message format) update the file with "
+            "another `<user_profile_update>` block. It applies to ALL future sessions in this project.\n"
+            "=== END USER DISCOVERY PROTOCOL ===\n"
         )
 
     def _enforce_git_safety(self, title: str, is_overwrite: bool) -> Optional[str]:
@@ -8656,6 +9125,9 @@ JSON:"""
         self._init_scratchpad()
         object.__setattr__(self, '_active_streaming_callback', streaming_callback)
         object.__setattr__(self, '_active_event_mode', event_mode)
+        # Snapshot the incoming prompt so RAG crop helpers can estimate how much
+        # of the context window is already spent (used by _rag_effective_top_k).
+        object.__setattr__(self, '_current_full_prompt_snapshot', str(prompt or ""))
         auto_load_doc_editor_flag = kwargs.get("auto_load_document_editor", True)
 
         cleaned_prompt = prompt
@@ -8728,6 +9200,19 @@ JSON:"""
 
         stable_system_prompt = self._build_system_prompt(active_tools, dynamic_effort=dynamic_effort)
         stable_system_prompt += self._build_user_profile_context()
+
+        # ── PROJECT-SCOPED EPISODIC MEMORY (durable, cross-session) ──
+        # Retrieve the top-k facts learned about THIS project in past sessions
+        # and inject them so the agent never re-asks what it was already told.
+        try:
+            _pm = getattr(self, '_project_memory', None)
+            if _pm is not None and getattr(_pm, 'is_ready', False):
+                _episodic_block = _pm.build_context_block(cleaned_prompt, top_k=6)
+                if _episodic_block:
+                    stable_system_prompt += "\n" + _episodic_block + "\n"
+                    ASCIIColors.info(f"[{self.name}] 🧠 Injected project episodic memory ({_episodic_block.count('- ')} fact(s)).")
+        except Exception as _pm_err:
+            ASCIIColors.warning(f"[{self.name}] Episodic memory injection failed: {_pm_err}")
 
         # Pre-hydrate RAG knowledge base context into prompt.
         #
@@ -9176,6 +9661,20 @@ JSON:"""
                     ASCIIColors.warning(f"Failed to write full prompt log: {debug_err}")
 
             messages = _normalize_messages(messages)
+
+            # Keep the crop helper's "used tokens" estimate in sync with the
+            # actual prompt being sent to the model (system + history + tool
+            # results). This is what makes dynamic RAG cropping responsive to
+            # the real context fill level rather than the initial user prompt.
+            try:
+                _snapshot_text = "\n".join(
+                    str(m.get("content", ""))
+                    for m in messages
+                    if isinstance(m, dict) and isinstance(m.get("content"), str)
+                )
+                object.__setattr__(self, '_current_full_prompt_snapshot', _snapshot_text)
+            except Exception:
+                pass
 
             pending_vlm = getattr(self, '_pending_vlm_images', [])
             if pending_vlm:
@@ -11190,6 +11689,105 @@ JSON:"""
                     ASCIIColors.info(f"[{self.name}] 🐛 === ROUND {round_count} END: Context compaction triggered ===")
                 continue
 
+            # ── 🛡️ POST-MUTATION MANDATORY-CONTINUATION GUARD ──
+            # If the last executed action was a successful MUTATING tool
+            # (execute_python_code / write_file / apply_patch / execute_shell),
+            # the model MUST either invoke another tool or emit <done/> on the
+            # next round. Concretely, see ai_danger.py round 19: the model
+            # successfully fixed HERO_PHOTO, then produced rounds 20–34 of pure
+            # "The pipeline is running…" prose WITHOUT ever re-running the
+            # script it just fixed. This guard forces the model back into the
+            # execution contract whenever it goes silent after a mutation.
+            _last_action_was_mutation = False
+            if tool_results_this_turn:
+                _last_result = tool_results_this_turn[-1]
+                _last_mutation_tool = _last_result.get("name", "")
+                if _last_mutation_tool in (
+                    "tool_execute_python_code",
+                    "tool_execute_python_file",
+                    "tool_execute_shell_command",
+                    "tool_write_file",
+                ) and _last_result.get("success"):
+                    _last_action_was_mutation = True
+
+            if (
+                _last_action_was_mutation
+                and not was_cancelled
+                and not has_new_actions_this_round
+                and not ss.was_action_dispatched()
+                and not text_is_repetitive
+                and stripped_round_text
+                and not ss.was_done_detected()
+                # Do NOT hit the guard if the model is genuinely answering the
+                # user's question in prose (final answer). Only fire when the
+                # model writes a "let me / now I will / running / checking"
+                # workflow-announcement (i.e. it intends more work but doesn't
+                # actually perform it).
+                and (
+                    bool(_INTENT_ANNOUNCEMENT_RE.search(stripped_round_text))
+                    or bool(re.search(
+                        r'(?im)\b(?:let\s+me\s+(?:run|execute|check|try|re-?run|verify|test)|'
+                        r'now\s+(?:let\s+me\s+)?(?:run|execute|check|try|re-?run)|'
+                        r'(?:i\'?ll|i\s+will|going\s+to|i\'?m\s+going\s+to)\s+(?:run|execute|check|re-?run|test|verify)|'
+                        r'(?:the\s+)?(?:pipeline|script|program|code)\s+(?:is|was)\s+(?:running|in\s+progress|still\s+running)|'
+                        r'(?:waiting|wait)\s+(?:for|on)\s+(?:it|the\s+pipeline|the\s+script|the\s+execution)|'
+                        r'still\s+(?:running|processing|in\s+progress))\b',
+                        stripped_round_text
+                    ))
+                )
+            ):
+                consecutive_stall_count = getattr(self, '_consecutive_stall_count', 0) + 1
+                object.__setattr__(self, '_consecutive_stall_count', consecutive_stall_count)
+
+                active_temperature = min(0.95, base_temperature + (0.15 * consecutive_stall_count))
+
+                if consecutive_stall_count >= 4:
+                    ASCIIColors.error(
+                        f"[{self.name}] Terminating after {consecutive_stall_count} consecutive "
+                        f"'intent without execution' stalls following a successful mutation. "
+                        f"The LLM is trapped in a prose-only loop."
+                    )
+                    final_response = re.sub(r'(?i)<done\s*/?>', '', ss.get_clean_text()).strip()
+                    if not final_response:
+                        final_response = (
+                            "[Task terminated: The agent mutated files successfully but then "
+                            "entered a prose-only loop without re-running the tool it should have "
+                            "invoked. The last successful mutation's effect is on disk.]"
+                        )
+                    if streaming_callback and event_mode.has_callbacks and not event_mode.is_silent:
+                        try:
+                            streaming_callback("", MSG_TYPE.MSG_TYPE_ROUND_END, {
+                                "round_id": round_count,
+                                "status": "loop_break"
+                            })
+                        except Exception:
+                            pass
+                    break
+
+                ASCIIColors.warning(
+                    f"[{self.name}] Post-mutation intent-only stall detected (Round {round_count}, "
+                    f"consecutive: {consecutive_stall_count}). Forcing tool invocation. "
+                    f"Last successful action: {_last_result.get('name')}"
+                )
+                virtual_history.append(SimpleNamespace(sender_type="assistant", content=ss.get_clean_text().strip()))
+                virtual_history.append(SimpleNamespace(
+                    sender_type="user",
+                    content=(
+                        "[SYSTEM DIRECTIVE: YOU ALREADY MUTATED THE FILE AND MUST RE-RUN/VERIFY IT NOW.\n"
+                        "In the previous round, your tool call succeeded — the change is on disk. "
+                        "You have since emitted ONLY prose ('The pipeline is running…', 'Let me check…', etc.) "
+                        "WITHOUT invoking any tool.\n"
+                        "The pipeline you claim is 'running' WAS NEVER STARTED — you must launch it NOW.\n"
+                        "MANDATORY NEXT ACTION: Emit the concrete execution tool call as your FIRST token:\n"
+                        "- To run/verify the script: `<tool>{\"name\": \"tool_execute_shell_command\", "
+                        "\"parameters\": {\"command\": \"python3 <script>.py ...\"}}</tool>`\n"
+                        "- If your fix is complete and verified: provide your final answer and emit `<done/>`.\n"
+                        "Do NOT emit another trailing-text preamble. EITHER invoke a tool OR emit `<done/>`.]"
+                    )
+                ))
+                ss = _AgentStreamState(callback=streaming_callback, event_mode=event_mode)
+                continue
+
             has_actions_this_round = bool(ss.completed_actions)
             if len(tool_calls_this_turn) > 0 or getattr(ss, 'context_trigger', False) or getattr(ss, 'artifact_trigger', False) or has_actions_this_round:
                 if not raw_round_text.strip() and not has_actions_this_round:
@@ -11556,6 +12154,24 @@ JSON:"""
                     self._autonomous_memory_consolidation(prompt, final_response)
                 except Exception as mem_ex:
                     ASCIIColors.warning(f"[{self.name}] Failed to process memory tags: {mem_ex}")
+
+        # ── PROJECT-SCOPED EPISODIC CONSOLIDATION ──
+        # Mirror the durable slice of the turn into `.lollms_code/episodic_memory.db`
+        # so it survives process restarts and is retrievable in future sessions.
+        # We call the SAME classification path as the session-level consolidation
+        # (which already filters tasks / greetings / filler) and store any accepted
+        # fact at level 2 (durable, cross-session).
+        if not was_cancelled:
+            try:
+                final_resp_probe = str(final_response or "")
+                if (
+                    final_resp_probe
+                    and "[Generation error:" not in final_resp_probe
+                    and "Server Connection Failure" not in final_resp_probe
+                ):
+                    self._project_episodic_consolidation(prompt, final_response)
+            except Exception as pm_cons_err:
+                ASCIIColors.warning(f"[{self.name}] Project episodic consolidation failed: {pm_cons_err}")
 
         try:
             if prompt.strip().lower() in ("yes", "y", "oui", "ye", "yeah"):

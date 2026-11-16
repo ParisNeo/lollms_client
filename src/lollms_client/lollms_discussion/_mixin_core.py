@@ -80,23 +80,26 @@ class CoreMixin:
                     ASCIIColors.info(f"[CoreMixin] Restored persisted workspace path: {workspace_path}")
 
             # ── NATIVE AUTO-INGESTION & CLEAN ISOLATION DIRECTORIES ──
-            if workspace_path:
+            # When the caller supplies an explicit workspace_path, it IS the
+            # workspace data root — we never inject a "workspace_data" subfolder
+            # inside a user-provided directory. Only the auto-generated default
+            # layout keeps the isolated workspace_data/artefacts_metadata tree.
+            custom_workspace = bool(workspace_path)
+            if custom_workspace:
                 parent_dir = Path(workspace_path)
+                parent_dir.mkdir(parents=True, exist_ok=True)
+                ws_data_dir = parent_dir
+                metadata_dir = parent_dir / ".artefacts_metadata"
+                metadata_dir.mkdir(parents=True, exist_ok=True)
             else:
                 parent_dir = Path("./data_workspace") / "discussions" / resolved_id
+                parent_dir.mkdir(parents=True, exist_ok=True)
 
-            parent_dir.mkdir(parents=True, exist_ok=True)
-
-            ws_data_dir = parent_dir
-            if not parent_dir.name.lower() == "workspace_data":
                 ws_data_dir = parent_dir / "workspace_data"
-            ws_data_dir.mkdir(parents=True, exist_ok=True)
+                ws_data_dir.mkdir(parents=True, exist_ok=True)
 
-            metadata_dir = parent_dir
-            if not parent_dir.name.lower() == "artefacts_metadata":
-                if ws_data_dir.parent != parent_dir or parent_dir.name.lower() != "artefacts_metadata":
-                    metadata_dir = parent_dir / "artefacts_metadata"
-            metadata_dir.mkdir(parents=True, exist_ok=True)
+                metadata_dir = parent_dir / "artefacts_metadata"
+                metadata_dir.mkdir(parents=True, exist_ok=True)
 
             object.__setattr__(self, '_workspace_path_val', str(parent_dir.resolve()))
             object.__setattr__(self, 'workspace_data_path', str(ws_data_dir.resolve()))
@@ -279,18 +282,17 @@ class CoreMixin:
         Returns:
             Dict[str, int]: A report of the synchronization operations.
         """
+        # A user-supplied workspace path is used verbatim as the workspace data
+        # root. We do NOT create a nested "workspace_data" folder inside it.
+        # Defensive normalization: strip a trailing "workspace_data" segment so
+        # legacy callers passing "<dir>/workspace_data" still land on a clean root.
         parent_dir = Path(new_workspace_path).resolve()
+        if parent_dir.name == "workspace_data" and parent_dir.parent.name:
+            parent_dir = parent_dir.parent
         parent_dir.mkdir(parents=True, exist_ok=True)
 
         ws_data_dir = parent_dir
-        if not parent_dir.name.lower() == "workspace_data":
-            ws_data_dir = parent_dir / "workspace_data"
-        ws_data_dir.mkdir(parents=True, exist_ok=True)
-
-        metadata_dir = parent_dir
-        if not parent_dir.name.lower() == "artefacts_metadata":
-            if ws_data_dir.parent != parent_dir or parent_dir.name.lower() != "artefacts_metadata":
-                metadata_dir = parent_dir / "artefacts_metadata"
+        metadata_dir = parent_dir / ".artefacts_metadata"
         metadata_dir.mkdir(parents=True, exist_ok=True)
 
         object.__setattr__(self, '_workspace_path_val', str(parent_dir))
@@ -971,7 +973,13 @@ class CoreMixin:
             rel_str = str(rel_parts).replace("\\", "/")
             file_ext = f_path.suffix.lower()
 
-            if Path(rel_str).name.startswith("."):
+            # Honor the visible-dotfile whitelist: allow .gitignore/.env/... through,
+            # reject hidden infra dirs/files. _is_ignored_path already encodes this
+            # policy; trusting our local basename prefix check here was dropping
+            # legitimate visible dotfiles the policy explicitly allows.
+            from lollms_client.lollms_artefact import _VISIBLE_DOTFILES
+            base_name = Path(rel_str).name
+            if base_name.startswith(".") and base_name.lower() not in _VISIBLE_DOTFILES:
                 continue
 
             existing_art = self.artefacts.get(rel_str) or self.artefacts.get(f_path.name) or self.artefacts.get(f_path.stem)

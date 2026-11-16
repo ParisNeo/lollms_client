@@ -8,6 +8,7 @@ from .lollms_memory import (
     MemoryConfig,
     MemoryOntology,
     FailureMemory,
+    ProjectMemory,
     _MemoryRecord,
     _MemoryRelationship,
     _RetrievalLog
@@ -19,6 +20,8 @@ __all__ = [
     "MemoryConfig",
     "MemoryOntology",
     "FailureMemory",
+    "ProjectMemory",
+    "ProjectMemory",
     "SSAMEngine",
     "SemanticTriple",
     "LTI",

@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-15 16:44]
+
+- fix: memory and personality module
+
 ## [2026-11-15 16:16]
 
 - feat(personality): update agent state and personality logic
