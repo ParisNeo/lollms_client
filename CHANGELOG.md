@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-16 17:57]
+
+- docs: add deprecation notice and execution safety guidelines
+
 ## [2026-11-16 16:18]
 
 - docs: add skill and tool editor agent documentation and enhance agentic features

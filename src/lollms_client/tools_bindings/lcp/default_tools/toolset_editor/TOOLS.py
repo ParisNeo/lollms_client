@@ -586,10 +586,10 @@ def _load_module_from_path(entry: Path) -> Any:
 # ---------------------------------------------------------------------------
 
 def tool_edit_toolset_activate(
-    def tool_edit_toolset_active(toolset_name: str,
-        toolset_folder: Optional[str] = None,
-        env: Optional[Any] = None,
-    ) -> Dict[str, Any]:
+    toolset_name: str,
+    toolset_folder: Optional[str] = None,
+    env: Optional[Any] = None,
+) -> Dict[str, Any]:
         """Open a live editing session against one target LCP toolset.
 
     Loads the toolset's TOOLS.py into the session's editing area and pins the

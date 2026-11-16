@@ -995,6 +995,36 @@ exception.
 
 ---
 
+## 12.5 — Executing code & the `env` risk category (author note)
+
+If your toolset's tools **execute Python** (e.g. wrap `execute_python`) or
+otherwise mutate the **process environment**, know the following, because it
+governs whether your code runs under the agent's sandbox:
+
+- `execute_python` executes user code in an isolated child process under
+  `SandboxContext`. Process mutation of `os.environ` (`os.environ[...] = ...`,
+  `del os.environ[...]`, `os.putenv`, `os.unsetenv`, and the
+  `os.environ.update/setdefault/pop/popitem/clear` methods) is classified as
+  the **`env`** risk category.
+- `safe` mode **prompts** the operator for `env`; `[a]lways` persists consent for
+  the session. Consent is transported into the sandboxed child so the runtime
+  guards allow the mutation only when `"env"` is approved. **Reading** the
+  environment (`os.getenv`, `os.environ["K"]`) is never flagged.
+- Headless/CI (`_is_headless_environment()`) **never** grants `env` — that is
+  the intended security property.
+
+A host that must pre-authorize environment writes (so a toolset helper such as
+`configure_ngspice47()` runs without a prompt) calls:
+
+```python
+from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as ep
+ep._approve_categories(frozenset({"env"}))
+```
+
+Full contract: [`docs/TOOLSET_STAGING_AND_SANDBOX.md`](../TOOLSET_STAGING_AND_SANDBOX.md) §5.
+
+---
+
 ## 13. Key invariants
 
 - A toolset is a plain Python module at `default_tools/<name>/TOOLS.py` (plus
@@ -1036,3 +1066,7 @@ exception.
   `{tool_name, action_type, label, content, metadata}` dicts. Sinks may be
   absent or fail — guard `if not callable(sink)` and normalize tuple/bool/str
   returns to `(decision, reason)`; never raise from the emit path.
+- If a toolset executes Python or mutates `os.environ`, it is subject to the
+  `execute_python` sandbox's **`env`** risk category. Environment mutation is
+  prompted in `safe` mode and never granted in headless/CI; reads are never
+  flagged. See §12.5 and `docs/TOOLSET_STAGING_AND_SANDBOX.md` §5.

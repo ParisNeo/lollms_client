@@ -1,5 +1,16 @@
 # Building a Tool-Editor Agent (Handbag + `extra_tools`)
 
+> **⚠️ SUPERSESSION NOTICE (current).** The shipped, tested editing surface is the
+> **`toolset_staging`** toolset (`src/lollms_client/tools_bindings/lcp/default_tools/
+> toolset_staging/`, tools `tool_stage_*`), **not** `toolset_editor`. Wherever this
+> document says `toolset_editor` / `tool_edit_toolset_*`, read **`toolset_staging` /
+> `tool_stage_*`**. The authoritative, current guide — covering the three-part wiring,
+> the sub-agent binding-inheritance pitfall, the `tool_stage_list_stageable` `diagnosis`
+> field, and the `execute_python` `env` risk category — is
+> [`docs/TOOLSET_STAGING_AND_SANDBOX.md`](./TOOLSET_STAGING_AND_SANDBOX.md). This file is
+> retained for the architectural rationale that remains valid; the tool names below are
+> legacy.
+
 A guide to constructing a **dedicated editor persona** whose single job is to inspect,
 modify, and validate an existing LCP toolset — while only ever standing on the verified
 mechanics of `LollmsPersonality`, `Handbag`, and `LCPBinding`.
@@ -108,29 +119,34 @@ Boundaries that are **still enforced**:
 ### 0.1 — Wire it in from the caller app
 
 The caller builds the handbag (or handbag-less personality) with **two** `extra_tools`
-entries: the target toolset and the editor toolset.
+entries: the target toolset and the **staging** toolset.
 
 ```python
 from pathlib import Path
 from lollms_client.lollms_personality.lollms_personality import LollmsPersonality
 
-EDITOR_TOOLSET = (
-    Path("src/lollms_client/tools_bindings/lcp/default_tools/toolset_editor").resolve()
+STAGING_TOOLSET = (
+    Path("src/lollms_client/tools_bindings/lcp/default_tools/toolset_staging").resolve()
 )
 TARGET_TOOLSET = Path("workspace/file_tools").resolve()   # contains TOOLS.py
-WORKSPACE      = Path("workspace").resolve()
+WORKSPACE      = Path("workspace").resolve()               # ANCESTOR of TARGET_TOOLSET
 
 editor = LollmsPersonality.from_handbag(
     handbag_path=Path("editor_handbag"),
     lollms_client=client,
-    extra_tools=[EDITOR_TOOLSET, TARGET_TOOLSET],   # <-- both
-    workspace_path=WORKSPACE,
+    extra_tools=[STAGING_TOOLSET, TARGET_TOOLSET],   # <-- both
+    workspace_path=WORKSPACE,                        # <-- must CONTAIN the target
     max_tokens_per_turn=8192,
 )
 ```
 
-Once bound, the agent sees eight `tool_edit_toolset_*` tools alongside the
-target toolset's own `tool_*` functions.
+Once bound, the agent sees the eight `tool_stage_*` tools alongside the target
+toolset's own `tool_*` functions.
+
+**Crucial:** `workspace_path` must be an **ancestor** of `TARGET_TOOLSET`, not
+the toolset folder itself. `tool_stage_list_stageable` enumerates workspace
+candidates via `workspace.rglob("TOOLS.py")`; pointing it at the toolset makes
+that scan find nothing. See `docs/TOOLSET_STAGING_AND_SANDBOX.md` §2.2.
 
 ### 0.2 — The loop, tool by tool
 
@@ -728,6 +744,30 @@ Do **not** write code or documentation that promises:
 
 ---
 
+## 10.4 — The sub-agent binding-inheritance trap (the "blocks after spawning a test agent" bug)
+
+A **sub-agent** is a fresh process. Its `env` does **not** carry the parent's
+`client.tools` binding, so `_list_external_toolsets` returns `[]` inside it —
+`tool_stage_list_stageable` will report `count: 0` for an out-of-workspace
+toolset even when the parent agent sees it fine. If the sub-agent is then asked
+to edit that toolset, it has no legal path and improvises into `execute_python`,
+which blocks (see §10.6 below on the `env` category).
+
+**Two valid fixes:**
+
+1. Do the editing on the agent constructed with
+   `from_handbag(extra_tools=[..., toolset_staging])` — the one that owns the
+   binding. Never delegate the *editing* itself to a spawned test agent.
+2. If a sub-agent must edit, place the target toolset **under that sub-agent's
+   `workspace_path`** so the filesystem scan (`rglob("TOOLS.py")`) finds it
+   without needing the parent's binding.
+
+The `tool_stage_list_stageable` return value now includes a `diagnosis` string
+that explicitly names this cause ("…sub-agent spawn does not inherit…") so an
+agent can read it instead of looping.
+
+---
+
 ## 10.5 — The "tool_spawn_test_agent has no file tools" trap (observed in production)
 
 An editor agent that has **only** the target toolset (LTspice, SQL, etc.) plus
@@ -748,15 +788,37 @@ constrained (see `tool_maker/TOOLS.py`, `_FORBIDDEN_TEST_TARGETS` and
 given `tool_maker` but not `toolset_editor`, so it has no way to read the
 target's source directly.
 
-**Fix**: add `toolset_editor` to `extra_tools` (alongside the target toolset).
-The editor agent then calls `tool_edit_toolset_read()`, which returns the
-full `TOOLS.py` source as a tool result — no file tools, no sub-agent required.
+**Fix**: add `toolset_staging` to `extra_tools` (alongside the target toolset).
+The editor agent then calls `tool_stage_read()`, which returns the full
+`TOOLS.py` source as a tool result — no file tools, no sub-agent required.
 
 If you must keep using `tool_maker` for legacy reasons, remember:
 `tool_spawn_test_agent` is for **behavioural testing of live tools**, never for
 **reading source**. Reading source belongs to `tool_edit_toolset_read` (or, if
 you insist, to a handbag `workspace_tools` grant — but then the child agent
 still cannot inherit it).
+
+---
+
+## 10.6 — The `env` sandbox category (the `configure_ngspice47()` case)
+
+Separate from toolset editing: if an agent edits a toolset *by running Python*
+(which it should not — use `tool_stage_patch`), it hits the `execute_python`
+sandbox. A common toolset helper mutates the process environment:
+
+```python
+os.environ["SPICE_SCRIPTS"] = str(scripts_dir)   # configure_ngspice47()
+```
+
+This is now a first-class risk category, **`env`**. In `safe` autonomy mode the
+operator is prompted (`ENV: os.environ[...] =`); `[a]lways` persists the consent
+(`execute_python._approve_categories({"env"})`). The consent is transported into
+the sandboxed child via the spawn `sandbox_state`, where
+`_gated_putenv`/`_gated_unsetenv`/`_Environ.__setitem__` allow the mutation iff
+`"env"` is approved. Headless/CI stays **denied** by design.
+
+Reading the environment (`os.getenv`, `os.environ["K"]`) is never flagged — only
+mutation is. Full details: `docs/TOOLSET_STAGING_AND_SANDBOX.md` §5.
 
 ---
 
@@ -959,9 +1021,12 @@ Source symbols and files this document was checked against:
   - `TOOLS_ENTRYPOINT` (= `"TOOLS.py"`) and the folder / `<folder>.py` / first-`.py`
     fallbacks live in `src/lollms_client/tools_bindings/lcp/tool_layout.py`.
   - Office / PDF gate via `set_session_flags()`.
-- `toolset_editor` toolset — `src/lollms_client/tools_bindings/lcp/default_tools/toolset_editor/TOOLS.py`
-  - `tool_edit_toolset_list` — combined workspace + external enumeration;
-    each entry carries `source` = "workspace"|"external".
+- **`toolset_staging`** toolset — `src/lollms_client/tools_bindings/lcp/default_tools/toolset_staging/TOOLS.py`
+  (note: legacy references to `toolset_editor` / `tool_edit_toolset_*` in this
+  document map onto these)
+  - `tool_stage_list_stageable` — combined workspace + external enumeration;
+    each entry carries `source` = "workspace"|"external"; returns a `diagnosis`
+    when the count is zero.
   - `_list_workspace_toolsets` (workspace rglob for `TOOLS.py`)
   - `_list_external_toolsets` (live-binding `discovered_tools` walk; the
     `extra_tools` exception that lets an editor edit a folder outside

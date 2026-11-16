@@ -14,10 +14,16 @@
 
 import re
 import uuid
-from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, Any, Sequence, TYPE_CHECKING
 
 from ascii_colors import ASCIIColors, trace_exception
 from lollms_client.lollms_artefact import ArtefactType
+from lollms_client.lollms_discussion._context_compressor import (
+    ContextCompressor,
+    HistoryMessage,
+    ImageRef,
+    PinnedFile,
+)
 
 if TYPE_CHECKING:
     from ._message import LollmsMessage
@@ -29,6 +35,44 @@ class PromptMixin:
     form instructions for the system prompt and post-processes the LLM response
     to apply any XML action tags it contains.
     """
+
+    # ─────────────────────────────────────── context compression ─────────────
+
+    def plan_context_compression(
+        self,
+        pinned_files: Sequence[PinnedFile],
+        images: Sequence[ImageRef],
+        history: Sequence[HistoryMessage],
+        *,
+        context_threshold_chars: int = 180_000,
+        target_chars: int = 120_000,
+        max_images: int = 4,
+        keep_recent_files: int = 2,
+        keep_recent_messages: int = 6,
+        fixed_overhead_chars: int = 0,
+    ):
+        """Plan a pure-heuristic context-poisoning compression.
+
+        Returns a ``CompressionPlan`` describing which actions to apply (unload
+        stale files, drop oldest images beyond the cap, collapse an old history
+        span). Deterministic, no LLM, no side effects — the caller applies the
+        returned actions and rebuilds the prompt. When the context is already
+        under ``context_threshold_chars`` the plan has ``triggered=False`` and
+        no actions.
+        """
+        compressor = ContextCompressor(
+            context_threshold_chars=context_threshold_chars,
+            target_chars=target_chars,
+            max_images=max_images,
+            keep_recent_files=keep_recent_files,
+            keep_recent_messages=keep_recent_messages,
+        )
+        return compressor.plan(
+            pinned_files,
+            images,
+            history,
+            fixed_overhead_chars=fixed_overhead_chars,
+        )
 
     # ─────────────────────────────────────── instruction builders ────────────
 
