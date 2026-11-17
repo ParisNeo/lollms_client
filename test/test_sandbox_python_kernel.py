@@ -26,10 +26,10 @@ import pytest
 # namespace. Importing via `src.lollms_client` collides with unrelated packages
 # that install a top-level `src` module on PyPI. Fall back to explicitly
 # prepending the repo's `src/` folder to `sys.path` for dev-checkout runs.
-try:
-    from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as ep
+try:  # isort: skip_file
+    from lollms_client.tools_bindings.lcp.default_tools.execute_python import TOOLS as ep
     from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (
-        execute_python_data_query as epdq,
+        TOOLS as epdq,
     )
     from lollms_client.tools_bindings.lcp.default_tools.execute_python.sandbox_kernel import (
         validate_source,
@@ -43,11 +43,11 @@ except ImportError:  # pragma: no cover - dev checkout fallback
     _SRC_ROOT = _REPO_ROOT / "src"
     if str(_SRC_ROOT) not in sys.path:
         sys.path.insert(0, str(_SRC_ROOT))
-    from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as ep
-    from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (
-        execute_python_data_query as epdq,
+    from lollms_client.tools_bindings.lcp.default_tools.execute_python import TOOLS as ep  # noqa: E402
+    from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (  # noqa: E402
+        TOOLS as epdq,
     )
-    from lollms_client.tools_bindings.lcp.default_tools.execute_python.sandbox_kernel import (
+    from lollms_client.tools_bindings.lcp.default_tools.execute_python.sandbox_kernel import (  # noqa: E402
         validate_source,
         SandboxContext,
         SandboxPermissionError,

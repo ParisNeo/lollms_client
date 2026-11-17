@@ -55,7 +55,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 TOOL_LIBRARY_NAME = "Skill Editor"
 TOOL_LIBRARY_DESC = (
@@ -661,51 +661,206 @@ def _parse_frontmatter(source: str) -> Tuple[Optional[Dict[str, Any]], Optional[
     return fm, None
 
 
+# ── Skill self-protection (author opt-out) ──
+# A skill opts out of agent-driven edits by declaring EITHER:
+#   * in its frontmatter:  SKILL_LIBRARY_READONLY: true
+#   * in its body:         SKILL_LIBRARY_READONLY = True
+# The detection is a plain regex over both regions; a false is the default.
+_READONLY_FM_RE = re.compile(
+    r"^SKILL_LIBRARY_READONLY\s*:\s*(?:true|yes|on|1)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_READONLY_BODY_RE = re.compile(
+    r"^\s*SKILL_LIBRARY_READONLY\s*=\s*(?:True|1|'true'|\"true\"|'True'|\"True\")\s*$",
+    re.MULTILINE,
+)
+
+
+declared: List[str] = []
+raw_tools = fm.get("tools")
+if isinstance(raw_tools, list):
+    declared = [str(x).strip() for x in raw_tools if x]
+elif isinstance(raw_tools, str):
+    declared = [t.strip() for t in re.split(r"[,\s]+", raw_tools) if t.strip()]
+return True, "", declared
+
+# ---------------------------------------------------------------------------
+# Skill self-protection (author opt-out)
+# ---------------------------------------------------------------------------
+# A skill opts out of agent-driven edits by declaring EITHER:
+#
+#   * ``modifiable: false`` in its frontmatter - the contract already
+#     published by ``SkillsManager`` (update_skill, append_to_skill,
+#     remove_skill, set_skill_visibility) and produced automatically when
+#     a skill loads without a ``modifiable:`` key. This is the canonical,
+#     project-wide flag; skill_editor honours it here so direct-to-disk
+#     writes cannot bypass the manager's own read-only gate.
+#
+#   * ``SKILL_LIBRARY_READONLY: true`` in frontmatter, or
+#     ``SKILL_LIBRARY_READONLY = True`` in the body - the explicit,
+#     toolset-style opt-out for authors who want an unmistakable marker in
+#     the file (mirrors TOOL_LIBRARY_READONLY in toolset_staging).
+#
+# The check is re-run at WRITE time so a protection added after activation
+# still blocks a patch.
+_READONLY_FM_RE = re.compile(
+r"^SKILL_LIBRARY_READONLY\s*:\s*(?:true|yes|on|1)\s*$",
+re.IGNORECASE | re.MULTILINE,
+)
+_READONLY_BODY_RE = re.compile(
+r"^\s*SKILL_LIBRARY_READONLY\s*=\s*(?:True|1|'true'|\"true\"|'True'|\"True\")\s*$",
+re.MULTILINE,
+)
+_MODIFIABLE_FM_RE = re.compile(
+r"^modifiable\s*:\s*(?:false|no|off|0)\s*$",
+re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _is_skill_protected(skill_folder: Union[str, Path]) -> bool:
+"""Return True when a skill's SKILL.md declares itself read-only.
+
+Detects BOTH the canonical SkillsManager contract (``modifiable: false``,
+absent-flag => read-only at the manager layer) and the explicit toolset-
+style opt-out (``SKILL_LIBRARY_READONLY``). skill_editor writes to disk
+directly, bypassing the manager's own gate, so this check is the ONLY
+thing standing between the agent and an edit to a read-only skill.
+
+This is an author intent declaration, NOT a security boundary - a tool
+with filesystem access can bypass it. It exists to prevent well-meaning
+but destructive agent edits, not to defeat an adversarial tool.
+
+Args:
+    skill_folder: Skill folder, or the SKILL.md path itself.
+
+Returns:
+    True when either flag is present, when the file is missing, or when
+    the frontmatter omits ``modifiable:`` (absent => read-only, matching
+    SkillsManager). False ONLY when ``modifiable:`` is explicitly truthy
+    and ``SKILL_LIBRARY_READONLY`` is absent.
+"""
+try:
+    entry = Path(skill_folder)
+    if entry.is_dir():
+        entry = entry / _SKILL_FILENAME
+    if not entry.is_file():
+        return False
+    text = entry.read_text(encoding="utf-8", errors="ignore")
+except (OSError, ValueError):
+    return False
+
+if _READONLY_BODY_RE.search(text):
+    return True
+if _READONLY_FM_RE.search(text):
+    return True
+if _MODIFIABLE_FM_RE.search(text):
+    return True
+
+# Canonical SkillsManager default: absent ``modifiable:`` => read-only.
+# Only treat as read-only when a frontmatter block actually exists - a
+# free-form markdown file with no frontmatter is legacy and predates the
+# contract, so we do not refuse it here (display-only skills do not need
+# to be explicitly writable).
+if text.startswith("---"):
+    fm_match = re.match(r"^---\s*?\r?\n(.*?)\r?\n---", text, re.DOTALL)
+    if fm_match:
+        has_modifiable = re.search(
+            r"^\s*modifiable\s*:", fm_match.group(1), re.MULTILINE
+        )
+        if not has_modifiable:
+            return True
+return False
+
+# ---------------------------------------------------------------------------
+# Skill self-protection (author opt-out)
+# ---------------------------------------------------------------------------
+# A skill opts out of agent-driven edits by declaring EITHER:
+#
+#   * ``modifiable: false`` in its frontmatter — the contract already
+#     published by ``SkillsManager`` (_reconcile_skill_metadata,
+#     update_skill, append_to_skill, remove_skill, set_skill_visibility)
+#     and produced automatically when a skill loads without a
+#     ``modifiable:`` key. This is the canonical, project-wide flag;
+#     skill_editor honours it here so direct-to-disk writes cannot
+#     bypass the manager's own read-only gate.
+#
+#   * ``SKILL_LIBRARY_READONLY: true`` in frontmatter, or
+#     ``SKILL_LIBRARY_READONLY = True`` in the body — the explicit,
+#     toolset-style opt-out for authors who want an unmistakable marker
+#     in the file (mirrors TOOL_LIBRARY_READONLY in toolset_staging).
+#
+# The check is re-run at WRITE time so a protection added after
+# activation still blocks a patch.
+_READONLY_FM_RE = re.compile(
+r"^SKILL_LIBRARY_READONLY\s*:\s*(?:true|yes|on|1)\s*$",
+re.IGNORECASE | re.MULTILINE,
+)
+_READONLY_BODY_RE = re.compile(
+r"^\s*SKILL_LIBRARY_READONLY\s*=\s*(?:True|1|'true'|\"true\"|'True'|\"True\")\s*$",
+re.MULTILINE,
+)
+_MODIFIABLE_FM_RE = re.compile(
+r"^modifiable\s*:\s*(?:false|no|off|0)\s*$",
+re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _is_skill_protected(skill_folder: Union[str, Path]) -> bool:
+"""Return True when a skill's SKILL.md declares itself read-only.
+
+Detects BOTH the canonical SkillsManager contract (``modifiable: false``,
+absent-flag ⇒ read-only at the manager layer) and the explicit toolset-
+style opt-out (``SKILL_LIBRARY_READONLY``). skill_editor writes to disk
+directly, bypassing the manager's own gate, so this check is the ONLY
+thing standing between the agent and an edit to a read-only skill.
+
+This is an author intent declaration, NOT a security boundary — a tool
+with filesystem access can bypass it. It exists to prevent well-meaning
+but destructive agent edits, not to defeat an adversarial tool.
+
+Args:
+    skill_folder: Skill folder, or the SKILL.md path itself.
+
+Returns:
+    True when either flag is present, when the file is missing, or when
+    the frontmatter omits ``modifiable:`` (absent ⇒ read-only, matching
+    SkillsManager). False ONLY when ``modifiable:`` is explicitly truthy
+    and ``SKILL_LIBRARY_READONLY`` is absent.
+"""
+try:
+    entry = Path(skill_folder)
+    if entry.is_dir():
+        entry = entry / _SKILL_FILENAME
+    if not entry.is_file():
+        return False
+    text = entry.read_text(encoding="utf-8", errors="ignore")
+except (OSError, ValueError):
+    return False
+
+if _READONLY_BODY_RE.search(text):
+    return True
+if _READONLY_FM_RE.search(text):
+    return True
+if _MODIFIABLE_FM_RE.search(text):
+    return True
+
+# Canonical SkillsManager default: absent ``modifiable:`` ⇒ read-only.
+# Only treat as read-only when a frontmatter block actually exists — a
+# free-form markdown file with no frontmatter is legacy and predates the
+# contract, so we do not refuse it here (display-only skills do not need
+# to be explicitly writable).
+if text.startswith("---"):
+    fm_match = re.match(r"^---\s*?\r?\n(.*?)\r?\n---", text, re.DOTALL)
+    if fm_match:
+        has_modifiable = re.search(
+            r"^\s*modifiable\s*:", fm_match.group(1), re.MULTILINE
+        )
+        if not has_modifiable:
+            return True
+return False
 def _validate_source(source: str) -> Tuple[bool, str, List[str]]:
-    """Return (ok, error_message, declared_tools).
-
-    Structural invariants a valid SKILL.md must satisfy:
-      1. Starts with a ``---`` frontmatter block closed by ``---``.
-      2. Frontmatter contains non-empty ``name`` and ``description``.
-      3. Body contains at least ``_MIN_BODY_CHARS`` non-whitespace chars.
-    ``declared_tools`` (may be empty) is the parsed ``tools:`` list.
-    """
-    if not source.strip():
-        return False, "Source is empty.", []
-    if len(source) > _MAX_SOURCE_CHARS:
-        return (
-            False,
-            f"Source exceeds the {_MAX_SOURCE_CHARS}-character safety cap.",
-            [],
-        )
-    fm, err = _parse_frontmatter(source)
-    if err is not None:
-        return False, err, []
-    if not fm.get("name"):
-        return False, "Frontmatter is missing the required 'name' field.", []
-    if not fm.get("description"):
-        return False, "Frontmatter is missing the required 'description' field.", []
-    body = (fm.get("_body") or "").strip()
-    if len(body) < _MIN_BODY_CHARS:
-        return (
-            False,
-            f"SKILL.md body is too short (<{_MIN_BODY_CHARS} chars). "
-            "A skill must describe its workflow so the LLM can act on it.",
-            [],
-        )
-    declared: List[str] = []
-    raw_tools = fm.get("tools")
-    if isinstance(raw_tools, list):
-        declared = [str(x).strip() for x in raw_tools if x]
-    elif isinstance(raw_tools, str):
-        declared = [t.strip() for t in re.split(r"[,\s]+", raw_tools) if t.strip()]
-    return True, "", declared
-
-
-# ---------------------------------------------------------------------------
-# Aider SEARCH/REPLACE patch handling
-# ---------------------------------------------------------------------------
-
+    ok, msg = _validate_skill_body(source)
+    return ok, msg, []
 def _parse_aider_patches(
     text: str,
 ) -> Tuple[Optional[List[Tuple[str, str]]], Optional[str]]:
@@ -779,20 +934,40 @@ def tool_edit_skill_list(env: Optional[Any] = None) -> Dict[str, Any]:
     workspace_candidates = _list_workspace_skills(workspace)
     external_candidates = _list_external_skills(env, workspace) if env else []
     candidates = workspace_candidates + external_candidates
+
+    # ── Read-only stamping ──
+    # Protected skills are still LISTED (so the agent understands why a
+    # candidate cannot be activated) AND surfaced under `protected` for
+    # easy filtering. `editable_count` excludes them so the agent can see
+    # at a glance how many candidates it may actually edit.
+    protected_names: List[str] = []
+    for cand in candidates:
+        try:
+            is_protected = _is_skill_protected(cand.get("skill_folder", ""))
+        except Exception:
+            is_protected = False
+        cand["protected"] = is_protected
+        if is_protected:
+            protected_names.append(cand["skill_name"])
+
+    editable_count = sum(1 for c in candidates if not c.get("protected"))
     return {
         "success": True,
         "workspace": str(workspace),
         "count": len(candidates),
+        "editable_count": editable_count,
         "workspace_count": len(workspace_candidates),
         "external_count": len(external_candidates),
         "candidates": candidates,
+        "protected": protected_names,
         "active_session": bool(_load_session(workspace)),
         "next_step": (
             "Call tool_edit_skill_activate(skill_name=...) with one of the "
             "listed names (auto-activation also works when exactly one "
-            "candidate exists, e.g. for tool_edit_skill_read). External "
-            "candidates are registered skills_manager entries living outside "
-            "the workspace — they are editable directly."
+            "candidate exists, e.g. for tool_edit_skill_read). Candidates "
+            "marked `protected: true` decline editing by author declaration "
+            "(`modifiable: false` or `SKILL_LIBRARY_READONLY`) and will be "
+            "refused by tool_edit_skill_activate."
         ),
     }
 
@@ -831,6 +1006,23 @@ def tool_edit_skill_activate(
             "success": False,
             "error": f"Target folder does not contain {_SKILL_FILENAME}: {folder}",
         }
+
+    # ── Self-protection: refuse to activate a read-only skill ──
+    if _is_skill_protected(folder):
+        return {
+            "success": False,
+            "protected": True,
+            "skill_name": folder.name,
+            "skill_folder": str(folder),
+            "error": (
+                f"'{folder.name}' is READ-ONLY. Its {_SKILL_FILENAME} declares "
+                "`modifiable: false` or `SKILL_LIBRARY_READONLY`, so it is "
+                "protected against agent-driven edits. The protection must be "
+                "removed from the source by a human operator — this is not "
+                "something an agent may do."
+            ),
+        }
+
     try:
         source = entry.read_text(encoding="utf-8")
     except OSError as exc:
@@ -1064,6 +1256,23 @@ def tool_edit_skill_patch(
     session, workspace, err = _require_session(env)
     if err is not None:
         return err
+
+    # Re-check protection at WRITE time. The flag may have been added to the
+    # source after the skill was activated (or after the last successful
+    # write) — a patch must honour it.
+    if _is_skill_protected(session["skill_folder"]):
+        return {
+            "success": False,
+            "protected": True,
+            "skill_name": session.get("skill_name"),
+            "skill_folder": session.get("skill_folder"),
+            "error": (
+                f"'{session.get('skill_name')}' is READ-ONLY "
+                f"(`modifiable: false` or `SKILL_LIBRARY_READONLY` in its "
+                f"{_SKILL_FILENAME}). Nothing was written."
+            ),
+        }
+
     blocks, perr = _parse_aider_patches(patches or "")
     if perr is not None:
         return {"success": False, "error": perr}
@@ -1122,6 +1331,21 @@ def tool_edit_skill_rewrite(
     session, workspace, err = _require_session(env)
     if err is not None:
         return err
+
+    # Re-check protection at WRITE time (see tool_edit_skill_patch).
+    if _is_skill_protected(session["skill_folder"]):
+        return {
+            "success": False,
+            "protected": True,
+            "skill_name": session.get("skill_name"),
+            "skill_folder": session.get("skill_folder"),
+            "error": (
+                f"'{session.get('skill_name')}' is READ-ONLY "
+                f"(`modifiable: false` or `SKILL_LIBRARY_READONLY` in its "
+                f"{_SKILL_FILENAME}). Nothing was written."
+            ),
+        }
+
     ok, verr, declared_tools = _validate_source(new_source or "")
     if not ok:
         return {

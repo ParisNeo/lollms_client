@@ -19,7 +19,20 @@ import socket
 import subprocess
 from pathlib import Path
 
-import pytest
+try:
+    import pytest
+except ImportError:  # pragma: no cover - linter/standalone environments
+    class _PytestStub:
+        @staticmethod
+        def importorskip(name, *args, **kwargs):
+            import importlib
+            return importlib.import_module(name)
+
+        @staticmethod
+        def skip(reason=""):
+            raise RuntimeError(f"pytest not available: {reason}")
+
+    pytest = _PytestStub()  # type: ignore[assignment]
 
 
 _ISOLATION_ATTRS = [
@@ -62,7 +75,7 @@ def _assert_unchanged(before, after):
 def test_data_query_success_leaves_parent_untouched(tmp_path):
     pytest.importorskip("pandas")
     from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (
-        execute_python_data_query as epdq,
+        TOOLS as epdq,
     )
 
     before = _snapshot_attrs()
@@ -84,7 +97,7 @@ def test_data_query_success_leaves_parent_untouched(tmp_path):
 
 def test_data_query_static_rejection_leaves_parent_untouched(tmp_path):
     from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (
-        execute_python_data_query as epdq,
+        TOOLS as epdq,
     )
 
     before = _snapshot_attrs()
@@ -107,7 +120,7 @@ def test_data_query_static_rejection_leaves_parent_untouched(tmp_path):
 def test_data_query_runtime_error_leaves_parent_untouched(tmp_path):
     pytest.importorskip("pandas")
     from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (
-        execute_python_data_query as epdq,
+        TOOLS as epdq,
     )
 
     before = _snapshot_attrs()
@@ -128,7 +141,7 @@ def test_data_query_runtime_error_leaves_parent_untouched(tmp_path):
 
 
 def test_execute_python_success_leaves_parent_untouched():
-    from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as ep
+    from lollms_client.tools_bindings.lcp.default_tools.execute_python import TOOLS as ep
 
     before = _snapshot_attrs()
     result = ep.tool_execute_python_code(code="print(2+2)")
@@ -138,7 +151,7 @@ def test_execute_python_success_leaves_parent_untouched():
 
 
 def test_execute_python_runtime_error_leaves_parent_untouched():
-    from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as ep
+    from lollms_client.tools_bindings.lcp.default_tools.execute_python import TOOLS as ep
 
     before = _snapshot_attrs()
     result = ep.tool_execute_python_code(code="raise ValueError('boom')")
@@ -148,7 +161,7 @@ def test_execute_python_runtime_error_leaves_parent_untouched():
 
 
 def test_execute_python_static_rejection_leaves_parent_untouched():
-    from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as ep
+    from lollms_client.tools_bindings.lcp.default_tools.execute_python import TOOLS as ep
 
     before = _snapshot_attrs()
     result = ep.tool_execute_python_code(code="import ctypes")
@@ -158,7 +171,7 @@ def test_execute_python_static_rejection_leaves_parent_untouched():
 
 def test_execute_python_still_blocks_exploits_after_isolation():
     """Sandbox invariants survive the move to a child process."""
-    from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as ep
+    from lollms_client.tools_bindings.lcp.default_tools.execute_python import TOOLS as ep
 
     for exploit in (
         "import subprocess\nsubprocess.run(['whoami'])",
@@ -177,7 +190,7 @@ def test_execute_python_still_blocks_exploits_after_isolation():
 def test_data_query_isolation_blocks_escape(tmp_path):
     pytest.importorskip("pandas")
     from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (
-        execute_python_data_query as epdq,
+        TOOLS as epdq,
     )
 
     cwd = os.getcwd()

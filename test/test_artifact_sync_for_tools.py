@@ -68,11 +68,17 @@ class TestArtifactSyncForTools(unittest.TestCase):
         shutil.rmtree(self.tmp_workspace, ignore_errors=True)
 
     def test_workspace_path_verification(self):
-        """Verify that the workspace_data_path is correctly resolved."""
-        expected_path = Path(self.tmp_workspace) / "workspace_data"
-        self.assertEqual(Path(self.discussion.workspace_data_path), expected_path)
-        self.assertTrue(expected_path.exists())
+        """Verify that a CUSTOM workspace_path is used directly.
 
+        Design contract: an explicit ``workspace_path`` is used verbatim as
+        ``workspace_data_path`` — no nested ``workspace_data/`` subfolder is
+        created inside it. Only the auto-generated default workspace keeps the
+        isolated ``workspace_data/`` + ``artefacts_metadata/`` subtree.
+        """
+        expected_path = Path(self.tmp_workspace).resolve()
+        actual_path = Path(self.discussion.workspace_data_path).resolve()
+        self.assertEqual(actual_path, expected_path)
+        self.assertTrue(actual_path.exists())
     def test_all_active_artifacts_synced(self):
         """Test that active artifacts are physically written to disk."""
         ws_path = Path(self.discussion.workspace_data_path)

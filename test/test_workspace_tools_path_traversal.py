@@ -6,11 +6,10 @@ disclosure via grep/find crawling outside the workspace).
 
 Run with:  pytest test/test_workspace_tools_path_traversal.py -v
 """
+import importlib.util
 import os
 import sys
 from pathlib import Path
-
-import pytest
 
 # Make the *inner* `src/` directory importable so `lollms_client` resolves
 # directly. We deliberately do NOT put the repo root on sys.path and do NOT
@@ -23,7 +22,31 @@ _SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from lollms_client.tools_bindings.lcp.default_tools.workspace_tools import workspace_tools as wt
+import pytest  # noqa: E402
+
+
+def _load_workspace_tools_module():
+    """Import ``workspace_tools/TOOLS.py`` directly by file location.
+
+    The lcp default_tools layout has one canonical ``TOOLS.py`` per folder.
+    A normal ``import <folder>`` never resolves — so every default_tools test
+    must load the entrypoint by absolute file path.
+    """
+    entry = (
+        _SRC_DIR
+        / "lollms_client" / "tools_bindings" / "lcp" / "default_tools"
+        / "workspace_tools" / "TOOLS.py"
+    )
+    assert entry.is_file(), f"Expected {entry} to exist."
+    module_name = "_lcp_default_tool_workspace_tools"
+    spec = importlib.util.spec_from_file_location(module_name, str(entry))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+wt = _load_workspace_tools_module()
 
 
 @pytest.fixture
@@ -51,7 +74,7 @@ def sandbox(tmp_path, monkeypatch):
     "subdir/../../../outside/secret.txt",
     "./../../outside/secret.txt",
 ])
-def test_read_file_blocks_relative_traversal(sandbox, payload):
+def test_read_file_blocks_relative_traversal(sandbox, payload):  # noqa: ARG001
     result = wt.tool_read_file(payload)
     assert result["success"] is False, f"Traversal not blocked for payload: {payload!r}"
     assert "escape" in result["error"].lower() or "traversal" in result["error"].lower()
@@ -85,12 +108,12 @@ def test_write_file_blocks_absolute_outside_path(sandbox):
 # 2. Home-expansion & null-byte & device-name rejection.
 # ---------------------------------------------------------------------------
 
-def test_read_file_blocks_home_expansion(sandbox):
+def test_read_file_blocks_home_expansion(sandbox):  # noqa: ARG001
     result = wt.tool_read_file("~/.bashrc")
     assert result["success"] is False
 
 
-def test_read_file_blocks_null_byte(sandbox):
+def test_read_file_blocks_null_byte(sandbox):  # noqa: ARG001
     result = wt.tool_read_file("inside.txt\x00../../outside/secret.txt")
     assert result["success"] is False
     assert "null byte" in result["error"].lower()
@@ -133,7 +156,7 @@ def test_find_files_does_not_escape_via_symlink(sandbox):
 # 4. Positive path: genuine workspace files still reachable.
 # ---------------------------------------------------------------------------
 
-def test_read_inside_workspace_still_works(sandbox):
+def test_read_inside_workspace_still_works(sandbox):  # noqa: ARG001
     result = wt.tool_read_file("inside.txt")
     assert result["success"] is True
     assert "INSIDE_MARKER" in result["output"]
@@ -145,13 +168,13 @@ def test_write_inside_workspace_still_works(sandbox):
     assert (sandbox["workspace"] / "newdir" / "newfile.txt").read_text(encoding="utf-8") == "hello"
 
 
-def test_grep_inside_workspace_still_works(sandbox):
+def test_grep_inside_workspace_still_works(sandbox):  # noqa: ARG001
     result = wt.tool_grep_files(pattern="INSIDE_MARKER", search_mode="case_sensitive")
     assert result["success"] is True
     assert result["matches_count"] >= 1
 
 
-def test_find_inside_workspace_still_works(sandbox):
+def test_find_inside_workspace_still_works(sandbox):  # noqa: ARG001
     result = wt.tool_find_files(pattern="inside.txt", path=".")
     assert result["success"] is True
     assert any("inside.txt" in m for m in result["files"])

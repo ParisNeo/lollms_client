@@ -358,6 +358,33 @@ PROCESS_ESCAPE_OS_ATTRS: frozenset[str] = frozenset({
     "startfile", "abort",
 })
 
+# Columns of `os` that spawn an EXTERNAL PROCESS. Under `authorized` — i.e.
+# AFTER the operator explicitly approved `process_execution` — these are
+# permitted, because they are the exact same class of operation the profile
+# already allows via `subprocess`. Blocking them here while permitting
+# `subprocess` was the source of the PySpice failure: PySpice shells out to the
+# `ngspice` binary through `os.popen`/`os.system`, so a "process execution"
+# grant that only unlocked `subprocess` still left PySpice dead ("BLOCKED BY
+# SANDBOX: this OS operation is not permitted"). These are SPAWN primitives,
+# not ESCAPE primitives.
+AUTHORIZED_PERMITTED_PROCESS_OS_ATTRS: frozenset[str] = frozenset({
+    "system", "popen",
+    "spawnl", "spawnle", "spawnlp", "spawnlpe",
+    "spawnv", "spawnve", "spawnvp", "spawnvpe",
+    "execl", "execle", "execlp", "execlpe",
+    "execv", "execve", "execvp", "execvpe",
+    "startfile",
+})
+
+# The process-escape columns that STAY blocked even under `authorized` — these
+# manipulate the CURRENT process / signals rather than spawning a child, so no
+# consent can make them safe inside the parent sandbox. `os.system`/`popen`/
+# `spawn*`/`exec*` are deliberately EXCLUDED (they belong to
+# AUTHORIZED_PERMITTED_PROCESS_OS_ATTRS above).
+AUTHORIZED_STILL_FORBIDDEN_OS_ATTRS: frozenset[str] = (
+    PROCESS_ESCAPE_OS_ATTRS - AUTHORIZED_PERMITTED_PROCESS_OS_ATTRS
+)
+
 # `os` attributes that MUTATE the filesystem within a bounded path. These are
 # SAFE inside the workspace because the runtime `SandboxContext` wraps them
 # (`_bounded_makedirs`, `_bounded_remove`, `_bounded_rename`, ...) and calls
@@ -887,14 +914,17 @@ def _validate_authorized(tree: ast.AST) -> Optional[SandboxViolation]:
 
     This profile is selected ONLY after the user explicitly authorized a risky
     operation. It permits `subprocess`, `socket`, `urllib`, `requests`, etc. —
-    the classes of operation the user consented to. It STILL blocks:
+    the classes of operation the user consented to. It ALSO permits the
+    process-SPAWN columns of `os` (`os.system`, `os.popen`, `os.spawn*`,
+    `os.exec*`, `os.startfile`) because they are the same "process execution"
+    class the operator approved — this is what unblocks libraries like PySpice
+    that shell out to an external binary (`ngspice`). It STILL blocks:
 
       - `ctypes`, `winreg`, `win32*`, `signal`, `resource` — C-level sandbox
         escapes that consent cannot make safe.
-      - Direct `os.system` / `os.popen` / `os.spawn*` / `os.exec*` / `os.kill*`
-        calls from user code — process-level escapes. (Note: `subprocess.*`
-        is permitted; subprocess internally reaches os.exec* through its own
-        non-user frames, which the runtime layer correctly exempts.)
+      - The process-ESCAPE columns of `os` (`os.kill`, `os.killpg`,
+        `os.fork`, `os.forkpty`, `os.setsid`, `os.abort`) — they act on the
+        CURRENT process/signals, not on a child, so no consent makes them safe.
       - `eval` / `exec` / `compile` / `__import__` — dynamic code execution.
     """
     for node in ast.walk(tree):
@@ -930,12 +960,20 @@ def _validate_authorized(tree: ast.AST) -> Optional[SandboxViolation]:
                 attr = func.attr
                 target = func.value
                 if isinstance(target, ast.Name) and target.id == "os":
-                    if attr in PROCESS_ESCAPE_OS_ATTRS:
+                    # Under `authorized`, spawn/exec primitives (system, popen,
+                    # spawn*, exec*, startfile) are PERMITTED — they are the
+                    # same "process execution" class the operator already
+                    # approved for `subprocess`, and libraries such as PySpice
+                    # shell out to external binaries through `os.popen`/
+                    # `os.system`. Only the true process-ESCAPE columns (kill,
+                    # fork, setsid, ...) remain blocked.
+                    if attr in AUTHORIZED_STILL_FORBIDDEN_OS_ATTRS:
                         return SandboxViolation(
                             reason=(
-                                f"Call to 'os.{attr}' is forbidden even under user "
-                                "authorization — use 'subprocess' for process "
-                                "spawning, which the runtime layer audits."
+                                f"Call to 'os.{attr}' (process-escape primitive) "
+                                "is forbidden even under user authorization. These "
+                                "operate on the CURRENT process/signals and cannot "
+                                "be made safe inside the sandbox."
                             ),
                             snippet=_describe(node),
                             line=getattr(node, "lineno", 0),
@@ -1015,6 +1053,8 @@ __all__ = [
     "MUTATING_OS_ATTRS",
     "DANGEROUS_SHUTIL_ATTRS",
     "FORBIDDEN_SHUTIL_ATTRS",
+    "AUTHORIZED_PERMITTED_PROCESS_OS_ATTRS",
+    "AUTHORIZED_STILL_FORBIDDEN_OS_ATTRS",
     "TRUE_COMPILE",
     "TRUE_EXEC",
     "TRUE_EVAL",
@@ -2447,15 +2487,41 @@ class SandboxContext:
         io.open = _guarded_io_open
 
         # -------- os.* lockdown --------
-        def _blocked(*_a, **_kw):
-            raise SandboxPermissionError(
-                "🛑 BLOCKED BY SANDBOX: this OS operation is not permitted."
-            )
+        def _make_op_blocked(op_label: str, category: str):
+            """Builds a block stub that NAMES the operation and its risk class.
 
-        for attr in ("system", "popen", "kill", "killpg",
-                     "chroot", "setuid", "setgid", "fork", "forkpty", "fchdir"):
+            The old generic message ("this OS operation is not permitted") gave
+            the operator no way to know WHAT was blocked or WHICH consent to
+            grant — a PySpice run that shells out to `ngspice` via `os.popen`
+            and `os.system` died on exactly that anonymous error. Naming the
+            operation + category makes the required consent actionable.
+            """
+            def _named_blocked(*_a, **_kw):
+                raise SandboxPermissionError(
+                    f"🛑 BLOCKED BY SANDBOX: operation '{op_label}' is not "
+                    f"permitted in this profile. Category: '{category}'. "
+                    "To run this, the operator must approve the corresponding "
+                    "risk category at the tool's confirmation prompt (answer "
+                    "'always' to persist the consent)."
+                )
+            return _named_blocked
+
+        # TRUE process-escape columns: manipulate the CURRENT process/signals.
+        # Blocked in EVERY profile (authorization cannot make them safe).
+        for attr in ("kill", "killpg", "chroot", "setuid", "setgid",
+                     "fork", "forkpty", "fchdir"):
             if hasattr(os, attr):
-                setattr(os, attr, _blocked)
+                setattr(os, attr, _make_op_blocked(f"os.{attr}", "process-escape"))
+
+        # Process-SPAWN columns (system/popen): same class as `subprocess`,
+        # which `authorized` already permits. Under `authorized` (operator
+        # approved `process_execution`) they MUST stay callable — that is what
+        # lets PySpice launch `ngspice`. Only non-authorized profiles block
+        # them, and when they do, the error now names the operation.
+        if not is_authorized:
+            for attr in ("system", "popen"):
+                if hasattr(os, attr):
+                    setattr(os, attr, _make_op_blocked(f"os.{attr}", "process-execution"))
 
         # ── FRAME-GATED os.putenv / os.unsetenv ──
         # Blocking these bluntly (the previous behavior) breaks every library
@@ -2711,11 +2777,18 @@ class SandboxContext:
         if not is_authorized:
             for name in ("run", "Popen", "call", "check_output"):
                 if self._originals.get(f"subprocess.{name}") is not None:
-                    setattr(subprocess, name, _blocked)
+                    setattr(
+                        subprocess, name,
+                        _make_op_blocked(f"subprocess.{name}", "process-execution"),
+                    )
             # Also block `subprocess.Popen` alias used internally by other entries.
             try:
-                subprocess.check_call = _blocked
-                subprocess.check_output = _blocked
+                subprocess.check_call = _make_op_blocked(
+                    "subprocess.check_call", "process-execution"
+                )
+                subprocess.check_output = _make_op_blocked(
+                    "subprocess.check_output", "process-execution"
+                )
             except Exception:
                 pass
 

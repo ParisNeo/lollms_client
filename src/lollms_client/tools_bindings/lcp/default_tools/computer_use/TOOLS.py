@@ -22,7 +22,7 @@ import io
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 
 from ascii_colors import ASCIIColors
 

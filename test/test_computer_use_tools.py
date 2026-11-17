@@ -15,8 +15,14 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from lollms_client.lollms_personality.lollms_personality import LollmsPersonality, CapabilityFlags
-import lollms_client.tools_bindings.lcp.default_tools.computer_use.computer_use as cu
+try:
+    from lollms_client.lollms_personality.lollms_personality import LollmsPersonality, CapabilityFlags
+    import lollms_client.tools_bindings.lcp.default_tools.computer_use.TOOLS as cu
+except ImportError as exc:  # pragma: no cover - environment guard
+    raise unittest.SkipTest(
+        f"lollms_client is not importable in this interpreter ({exc}). "
+        "Install the package or select the correct Python interpreter."
+    ) from exc
 
 
 class TestComputerUseGating(unittest.TestCase):

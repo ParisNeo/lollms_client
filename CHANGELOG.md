@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-17 01:06]
+
+- feat: implement toolset staging, sandbox isolation, and update tool bindings
+
 ## [2026-11-16 18:33]
 
 - fix(system_shell): update system shell tool logic

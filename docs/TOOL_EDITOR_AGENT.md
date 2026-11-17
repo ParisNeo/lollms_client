@@ -134,11 +134,22 @@ WORKSPACE      = Path("workspace").resolve()               # ANCESTOR of TARGET_
 editor = LollmsPersonality.from_handbag(
     handbag_path=Path("editor_handbag"),
     lollms_client=client,
-    extra_tools=[STAGING_TOOLSET, TARGET_TOOLSET],   # <-- both
+    extra_tools=[TARGET_TOOLSET],                    # toolsets the agent CALLS
+    extra_tool_staging_paths=[STAGING_TOOLSET],      # the editing surface(s)
     workspace_path=WORKSPACE,                        # <-- must CONTAIN the target
     max_tokens_per_turn=8192,
 )
 ```
+
+`extra_tools` and `extra_tool_staging_paths` are **different intents**: the
+former is what the agent may call, the latter is what it may edit through.
+Both mount in the same LCP binding, but declared separately. Do **not** put
+`toolset_staging` into `extra_tools`.
+
+`extra_tools` and `extra_tool_staging_paths` are **different intents**: the
+former is what the agent may call, the latter is what it may edit through.
+Both are mounted in the same LCP binding, but declared separately. Do **not**
+put `toolset_staging` into `extra_tools`.
 
 Once bound, the agent sees the eight `tool_stage_*` tools alongside the target
 toolset's own `tool_*` functions.

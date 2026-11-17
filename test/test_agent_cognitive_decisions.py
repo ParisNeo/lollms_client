@@ -438,7 +438,7 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
 
         user_message = "Analyze the sales_database and tell me which product generated the highest revenue."
 
-        from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.execute_python_data_query import tool_execute_python_data_query
+        from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.TOOLS import tool_execute_python_data_query
 
         original_tools_binding = getattr(self.client, 'tools', None)
         self.client.tools = None
@@ -509,7 +509,7 @@ class TestAgentCognitiveDecisions(unittest.TestCase):
 
         user_message = "Please calculate the factorial of 5 using Python."
 
-        from lollms_client.tools_bindings.lcp.default_tools.execute_python.execute_python import tool_execute_python_code
+        from lollms_client.tools_bindings.lcp.default_tools.execute_python.TOOLS import tool_execute_python_code
 
         original_tools_binding = getattr(self.client, 'tools', None)
         self.client.tools = None

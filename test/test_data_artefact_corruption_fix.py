@@ -11,7 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from lollms_client.lollms_discussion import LollmsDiscussion, LollmsDataManager
 from lollms_client.lollms_artefact import ArtefactType
-from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.execute_python_data_query import (
+from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.TOOLS import (
     tool_execute_python_data_query,
     _validate_xlsx,
     _validate_office_file,

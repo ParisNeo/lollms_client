@@ -1,21 +1,45 @@
-import pytest
-from unittest.mock import MagicMock, patch
+import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
-import sys
+from unittest.mock import MagicMock
 
 PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
+if str(PROJECT_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-# Import the tool directly
-sys.path.insert(0, str(PROJECT_ROOT / "src" / "lollms_client" / "tools_bindings" / "lcp" / "default_tools" / "vlm_query"))
-from vlm_query import tool_vlm_query
+
+def _load_tool_module(folder: str, tool_fn: str):
+    """Import <default_tools>/<folder>/TOOLS.py directly and return its callable.
+
+    The lcp default_tools layout uses a single canonical entrypoint named
+    ``TOOLS.py`` per folder (not ``<folder>.py``). Every default_tools/ folder
+    defines a ``TOOLS`` module, so a plain ``import <folder>`` never resolves.
+    Loading by absolute file path keeps tests independent of module naming.
+    """
+    entry = (
+        PROJECT_ROOT
+        / "src" / "lollms_client" / "tools_bindings" / "lcp" / "default_tools"
+        / folder / "TOOLS.py"
+    )
+    assert entry.is_file(), f"Expected {entry} to exist."
+    module_name = f"_lcp_default_tool_{folder}"
+    spec = importlib.util.spec_from_file_location(module_name, str(entry))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return getattr(module, tool_fn)
+
+
+tool_vlm_query = _load_tool_module("vlm_query", "tool_vlm_query")
+
 
 def test_vlm_query_no_context():
     """Tests failure when discussion or client instances are missing."""
     result = tool_vlm_query(image_index=0, query="test")
     assert result["success"] is False
     assert "System context not available" in result["error"]
+
 
 def test_vlm_query_no_vlm_mounted():
     """Tests failure when no VLM is found on the client."""
@@ -28,11 +52,11 @@ def test_vlm_query_no_vlm_mounted():
     assert result["success"] is False
     assert "No Vision-Language Model (VLM) is mounted" in result["error"]
 
+
 def test_vlm_query_finds_child_vlm():
     """Tests that the tool finds a VLM among SmartRouter child bindings."""
     mock_client = MagicMock()
 
-    # Mock SmartRouter structure
     mock_text_binding = MagicMock()
     mock_text_binding.vision_enabled = False
 
@@ -42,11 +66,10 @@ def test_vlm_query_finds_child_vlm():
 
     mock_client.llm.child_bindings = {
         "text": mock_text_binding,
-        "vlm": mock_vlm_binding
+        "vlm": mock_vlm_binding,
     }
     mock_client.llm.vision_enabled = False  # Master is router, not VLM itself
 
-    # Mock discussion branch
     mock_discussion = MagicMock()
     mock_msg = MagicMock()
     mock_msg.sender_type = "user"
@@ -54,15 +77,12 @@ def test_vlm_query_finds_child_vlm():
     mock_discussion.get_branch.return_value = [mock_msg]
 
     env = SimpleNamespace(discussion=mock_discussion, client=mock_client)
-    result = tool_vlm_query(
-        image_index=0,
-        query="What is in the image?",
-        env=env
-    )
+    result = tool_vlm_query(image_index=0, query="What is in the image?", env=env)
 
     assert result["success"] is True
     assert "Image shows a cat." in result["output"]
     mock_vlm_binding.generate_from_messages.assert_called_once()
+
 
 def test_vlm_query_finds_master_vlm():
     """Tests that the tool falls back to master if it supports vision and no children exist."""
@@ -78,15 +98,12 @@ def test_vlm_query_finds_master_vlm():
     mock_discussion.get_branch.return_value = [mock_msg]
 
     env = SimpleNamespace(discussion=mock_discussion, client=mock_client)
-    result = tool_vlm_query(
-        image_index=0,
-        query="What is in the image?",
-        env=env
-    )
+    result = tool_vlm_query(image_index=0, query="What is in the image?", env=env)
 
     assert result["success"] is True
     assert "Image shows a dog." in result["output"]
     mock_client.llm.generate_from_messages.assert_called_once()
+
 
 def test_vlm_query_invalid_image_index():
     """Tests out-of-bounds image index."""
@@ -103,11 +120,7 @@ def test_vlm_query_invalid_image_index():
     mock_discussion.get_branch.return_value = [mock_msg]
 
     env = SimpleNamespace(discussion=mock_discussion, client=mock_client)
-    result = tool_vlm_query(
-        image_index=5,  # Out of bounds
-        query="test",
-        env=env
-    )
+    result = tool_vlm_query(image_index=5, query="test", env=env)  # Out of bounds
 
     assert result["success"] is False
     assert "Invalid image_index" in result["error"]

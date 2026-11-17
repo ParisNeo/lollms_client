@@ -1,0 +1,4 @@
+name: Tool Editor Handbag
+version: '1.0'
+description: Handbag for a single-toolset editor persona.
+skills_mode: loadable

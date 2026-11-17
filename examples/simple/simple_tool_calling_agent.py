@@ -1,6 +1,17 @@
 """
 End-to-end test for the binding-level tool-calling lifecycle.
 
+⚠️ SCOPE — this example sits BELOW ``LollmsDiscussion.chat()``.
+
+It demonstrates the raw ``llm_binding.generate_with_tools`` seam: how a
+server-emitted native ``tool_calls`` entry is surfaced to a caller callback
+and how the caller returns ``{"tool_results": [...]}`` to re-invoke the model.
+That is the transport contract ``ChatMixin._execute_native_tool_call`` builds
+on — it is NOT a recommended way to build an agent. For a real agentic loop
+with tool dispatch, ``env`` injection, session-flag semantics, artefact sync,
+context compression and checkpointing, use ``LollmsDiscussion.chat()`` (see
+``examples/simple/tool_editor_agent.py``).
+
 Demonstrates:
     • OpenAI Chat Completions tool schema definition.
     • Native binding-managed loop via ``tools=`` parameter.

@@ -19,16 +19,16 @@ SRC = ROOT / "src"
 # folder for dev checkouts where the package isn't pip-installed. Never use
 # `from src.lollms_client...` — `src` is a valid but hijackable top-level name.
 try:
-    from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as ep
+    from lollms_client.tools_bindings.lcp.default_tools.execute_python import TOOLS as ep
     from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (
-        execute_python_data_query as epdq,
+        TOOLS as epdq,
     )
 except ImportError:
     if str(SRC) not in sys.path:
         sys.path.insert(0, str(SRC))
-    from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as ep
+    from lollms_client.tools_bindings.lcp.default_tools.execute_python import TOOLS as ep
     from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (
-        execute_python_data_query as epdq,
+        TOOLS as epdq,
     )
 
 

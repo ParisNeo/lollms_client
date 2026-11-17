@@ -195,16 +195,25 @@ def build_staged_prompt_block(workspace: Path) -> str:
         return ""
 
     lines: List[str] = [
-        "=== STAGED TOOLSETS (read-only view — edit via tool_stage_* tools) ===",
+        "=== STAGED TOOLSETS (the source below is ALREADY in your context — edit it in place) ===",
         (
-            "These toolset source files are staged for in-place editing. The "
-            "text below is refreshed from disk EVERY TURN: patches applied "
-            "through `tool_stage_patch` / `tool_stage_rewrite` appear here on "
-            "your next round automatically. You cannot write to them by "
-            "emitting an `<artifact>` tag — the only sanctioned flow is "
-            "`tool_stage_patch` (Aider blocks) or `tool_stage_rewrite` (full "
-            "source). Stage just ONE toolset at a time; call "
-            "`tool_stage_unstage` before staging another."
+            "The full current source of the staged toolset is shown BELOW, exactly "
+            "like an unlocked file. You do NOT need to read it — it is already "
+            "here. To change it, call the writer that matches the job:\n"
+            "  • `tool_stage_patch(patches=\"...\")` for targeted edits (one or more "
+            "Aider SEARCH/REPLACE blocks, applied atomically).\n"
+            "  • `tool_stage_rewrite(new_source=\"...\")` to replace the whole file.\n"
+            "Your edit appears here on the next round automatically — no reload.\n"
+            "\n"
+            "FORBIDDEN for editing this toolset: `execute_python` "
+            "(tool_execute_python_code / tool_execute_python_file), any SQL / data "
+            "query tool, `tool_write_file`, and any `<artifact>` tag. Those paths do "
+            "NOT validate `ast.parse` + `def tool_*` and will be rejected or produce "
+            "a broken toolset. The ONLY sanctioned writers are `tool_stage_patch` "
+            "and `tool_stage_rewrite`.\n"
+            "\n"
+            "Only ONE toolset is staged at a time. Call `tool_stage_unstage` before "
+            "staging another."
         ),
     ]
     for entry in staged:

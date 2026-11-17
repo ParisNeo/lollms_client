@@ -1374,7 +1374,7 @@ def run_agent_turn_in_thread(
             client.tools.host_tool_configs.setdefault("system_shell", {})["confirm_handler"] = gui_confirm_handler
 
     try:
-        from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as _ep_mod
+        from lollms_client.tools_bindings.lcp.default_tools.execute_python import TOOLS as _ep_mod
         _ep_mod.set_confirm_handler(gui_confirm_handler)
         _ep_mod._AUTO_APPROVE_PYTHON = getattr(prefs, "auto_approve_python", False)
     except Exception:

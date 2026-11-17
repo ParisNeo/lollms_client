@@ -3,12 +3,10 @@
 # author: ParisNeo
 # description: Real ROS 2 and High-Fidelity simulated interface for TurtleBot3 navigation and nociception.
 
-import os
-import sys
 import math
 import random
 import time
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, Optional
 
 TOOL_LIBRARY_NAME = "ROS_TURTLEBOT"
 TOOL_LIBRARY_DESC = "Interface for TurtleBot3 robot control, navigation, sensor monitoring, and nociceptive pain systems."
@@ -17,12 +15,11 @@ TOOL_LIBRARY_ICON = "🤖"
 # Check for ROS 2 client library availability
 ROS2_AVAILABLE = False
 try:
-    import rclpy
-    from rclpy.node import Node
-    from geometry_msgs.msg import Twist, PoseStamped
-    from nav_msgs.msg import Odometry
-    from sensor_msgs.msg import LaserScan, Imu
-    from rcl_interfaces.msg import Log
+    import rclpy  # type: ignore
+    from rclpy.node import Node  # type: ignore
+    from geometry_msgs.msg import Twist  # type: ignore
+    from nav_msgs.msg import Odometry  # type: ignore
+    from sensor_msgs.msg import LaserScan, Imu  # type: ignore
     ROS2_AVAILABLE = True
 except ImportError:
     pass

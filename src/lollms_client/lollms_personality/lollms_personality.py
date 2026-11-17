@@ -35,24 +35,18 @@ if TYPE_CHECKING:
 
 from ascii_colors import ASCIIColors, trace_exception
 
-from .skills_manager import SkillsManager
-from .handbag import Handbag
 from .doc_navigator import DocNavigator, build_doc_tools, build_docs_scope_block
+from .handbag import Handbag
 from .lollms_agent_state import (
     _AgentStreamState,
+    _collapse_stream_repetition,
     _sanitize_tool_result,
     _ToolsManager,
-    _collapse_stream_repetition,
 )
+from .skills_manager import SkillsManager
 
 from lollms_client.lollms_chat_core import (
     calculate_dynamic_tool_char_limit as _calculate_dynamic_tool_char_limit,
-    repair_llm_json as _repair_llm_tool_json,
-    is_large_base64 as _is_large_base64,
-    sanitize_tool_result as _core_sanitize_tool_result,
-    detect_structural_symbols as _detect_structural_symbols,
-    extract_artefact_meta as _extract_artefact_meta,
-    build_progressive_continuation_prompt as _build_progressive_continuation_prompt,
     inject_tool_images_for_vlm as _inject_tool_images_for_vlm_core,
     dump_error as _core_dump_error,
     take_workspace_snapshot as _core_take_workspace_snapshot,
@@ -77,12 +71,34 @@ if _compile is None or not callable(_compile) or _compile.__module__ != 'builtin
     _compile = None
 
 
-from lollms_client.lollms_types import MSG_TYPE, EventMode, normalize_event_mode
-
-from lollms_client.lollms_memory import FailureMemory, ProjectMemory
-from lollms_client.lollms_artefact import ArtefactVisibility, ArtefactManager
+from lollms_client.lollms_artefact import ArtefactManager, ArtefactVisibility
 from lollms_client.lollms_artefact.lollms_artefact import ArtefactManager as _ArtefactManager
 from lollms_client.lollms_history import HistoryManager
+from lollms_client.lollms_memory import FailureMemory, ProjectMemory
+from lollms_client.lollms_types import MSG_TYPE, EventMode, normalize_event_mode
+
+
+def _notify_staging_paths(pers: Any) -> None:
+    """Push the personality's declared staging folders into the mounted
+    ``toolset_staging`` module, if present.
+
+    Mirrors the ``set_confirm_handler`` injection pattern: the staging toolset
+    exposes ``set_staging_paths(...)`` and we call it against its live module
+    object in ``sys.modules``. Best-effort — the toolset may not be mounted.
+    """
+    import sys as _sys
+    staging_mod = None
+    for mod_name, mod in list(_sys.modules.items()):
+        if mod_name.endswith(".persistent_toolset_staging") and mod is not None:
+            staging_mod = mod
+            break
+    if staging_mod is None or not hasattr(staging_mod, "set_staging_paths"):
+        return
+    try:
+        declared = [str(p) for p in getattr(pers, "_extra_staging_files", []) if Path(p).exists()]
+        staging_mod.set_staging_paths(declared)
+    except Exception:
+        pass
 
 
 _TEXT_RAG_EXTS = {
@@ -103,7 +119,7 @@ _SYNTHETIC_RESPONSE_PREFIXES = (
 # Module-level cache of SafeStoreRAGBinding instances keyed by resolved .db path.
 # Prevents re-instantiating the SentenceTransformer on every tool call while
 # preserving the binding's lazy .get_store() contract.
-_SAFESTORE_BINDING_CACHE: Dict[str, Any] = {}
+_SAFESTORE_BINDING_CACHE: dict[str, Any] = {}
 
 _INTENT_ANNOUNCEMENT_RE = re.compile(
     r'(?im)(?:'
@@ -177,7 +193,7 @@ def _is_synthetic_agent_response(text: str) -> bool:
     return any(stripped.startswith(prefix) for prefix in _SYNTHETIC_RESPONSE_PREFIXES)
 
 
-def _get_or_create_safestore_binding(db_path: Path) -> Optional[Any]:
+def _get_or_create_safestore_binding(db_path: Path) -> Any | None:
     """
     Return a cached SafeStoreRAGBinding for the given .db path, instantiating it
     on first use. The binding stays lazy — .get_store() is only invoked when the
@@ -188,44 +204,32 @@ def _get_or_create_safestore_binding(db_path: Path) -> Optional[Any]:
     """
     try:
         key = str(Path(db_path).resolve())
-    except Exception:
+    except (OSError, ValueError):
         key = str(db_path)
 
     cached = _SAFESTORE_BINDING_CACHE.get(key)
     if cached is not None:
-        try:
-            ASCIIColors.info(f"[RAG-DIAG] SafeStore cache HIT: {key}")
-        except Exception:
-            pass
+        ASCIIColors.info(f"[RAG-DIAG] SafeStore cache HIT: {key}")
         return cached
 
     try:
         from lollms_client.rag_bindings.safe_store import SafeStoreRAGBinding
     except ImportError as imp_err:
-        try:
-            ASCIIColors.error(f"[RAG-DIAG] safe_store package not installed: {imp_err}")
-        except Exception:
-            pass
+        ASCIIColors.error(f"[RAG-DIAG] safe_store package not installed: {imp_err}")
         return None
 
     try:
         binding = SafeStoreRAGBinding(db_path=key)
         _SAFESTORE_BINDING_CACHE[key] = binding
-        try:
-            ASCIIColors.info(f"[RAG-DIAG] SafeStore auto-instantiated: {key}")
-        except Exception:
-            pass
+        ASCIIColors.info(f"[RAG-DIAG] SafeStore auto-instantiated: {key}")
         return binding
     except Exception as inst_err:
-        try:
-            ASCIIColors.error(f"[RAG-DIAG] SafeStore instantiation failed for {key}: {inst_err}")
-        except Exception:
-            pass
+        ASCIIColors.error(f"[RAG-DIAG] SafeStore instantiation failed for {key}: {inst_err}")
         trace_exception(inst_err)
         return None
 
 
-def _make_rag_tool_from_safestore(store: Any, *, name: str, description: str) -> Dict[str, Any]:
+def _make_rag_tool_from_safestore(store: Any, *, name: str, description: str) -> dict[str, Any]:
     """
     Wraps a SafeStoreRAGBinding (as produced by Handbag.extra_safe_stores) into a
     tool dict matching the canonical RAG tool shape used elsewhere in this module:
@@ -250,12 +254,9 @@ def _make_rag_tool_from_safestore(store: Any, *, name: str, description: str) ->
 
             normalised = _normalise_raw(raw, query, str(store_label))
             hits = normalised.get("count", 0)
-            try:
-                ASCIIColors.debug(
-                    f"[RAG-QUERY] store='{store_label}' q='{query[:60]}' top_k={top_k} -> {hits} hit(s)"
-                )
-            except Exception:
-                pass
+            ASCIIColors.debug(
+                f"[RAG-QUERY] store='{store_label}' q='{query[:60]}' top_k={top_k} -> {hits} hit(s)"
+            )
 
             if not normalised.get("sources"):
                 return {"success": True, "output": f"No relevant content found in '{store_label}' for query: '{query}'."}
@@ -2469,6 +2470,116 @@ def _is_null_tool_binding(binding: Any) -> bool:
 # LollmsPersonality
 # ---------------------------------------------------------------------------
 
+def _notify_staging_paths(personality: Any) -> None:
+    """Push declared staging folders to the mounted ``toolset_staging`` module.
+
+    The editing toolset enumerates candidates from workspace ``rglob("TOOLS.py")``
+    plus the live binding. Hosts that wire editing via
+    ``extra_tool_staging_paths`` may keep those folders OUTSIDE ``workspace_path``;
+    this registers the explicit folders with the staging module (via
+    ``set_staging_paths``) so they remain valid edit targets regardless of the
+    workspace. Mirrors the ``set_confirm_handler`` injection pattern.
+
+    The staging module is a process singleton in ``sys.modules`` keyed on the
+    library identity (``persistent_toolset_staging``), so a single registration
+    here stays effective across ``refresh_tools_and_skills()`` calls. No-op when
+    no staging folder was declared or when staging is not mounted.
+    """
+    paths = [str(p) for p in getattr(personality, "_extra_staging_files", [])]
+    if not paths:
+        return
+    for module_name, module in list(sys.modules.items()):
+        if not module_name.endswith("persistent_toolset_staging"):
+            continue
+        setter = getattr(module, "set_staging_paths", None)
+        if callable(setter):
+            try:
+                setter(paths)
+            except Exception:
+                pass
+
+
+def _notify_staging_paths(personality: Any) -> None:
+    """Register declared staging folders with the mounted ``toolset_staging`` module.
+
+    Editing surfaces declared via ``extra_tool_staging_paths`` may live outside
+    ``workspace_path``. This pushes those explicit folders to the staging
+    toolset (``set_staging_paths``) so enumeration does not depend on workspace
+    containment — mirroring the ``set_confirm_handler`` injection pattern.
+
+    The staging module is a ``sys.modules`` singleton keyed on the library
+    identity (``persistent_toolset_staging``), so one registration survives
+    ``refresh_tools_and_skills()``. No-op when nothing was declared or when the
+    staging toolset is not mounted.
+    """
+    paths = [str(p) for p in getattr(personality, "_extra_staging_files", [])]
+    if not paths:
+        return
+    for module_name, module in list(sys.modules.items()):
+        if not module_name.endswith("persistent_toolset_staging"):
+            continue
+        setter = getattr(module, "set_staging_paths", None)
+        if callable(setter):
+            try:
+                setter(paths)
+            except Exception:
+                pass
+
+
+def _notify_staging_paths(personality: Any) -> None:
+    """Register declared staging folders with the mounted ``toolset_staging`` module.
+
+    Editing surfaces declared via ``extra_tool_staging_paths`` may live outside
+    ``workspace_path``. This pushes those explicit folders to the staging
+    toolset (``set_staging_paths``) so enumeration does not depend on workspace
+    containment — mirroring the ``set_confirm_handler`` injection pattern.
+
+    The staging module is a ``sys.modules`` singleton keyed on the library
+    identity (``persistent_toolset_staging``), so one registration survives
+    ``refresh_tools_and_skills()``. No-op when nothing was declared or when the
+    staging toolset is not mounted.
+    """
+    paths = [str(p) for p in getattr(personality, "_extra_staging_files", [])]
+    if not paths:
+        return
+    for module_name, module in list(sys.modules.items()):
+        if not module_name.endswith("persistent_toolset_staging"):
+            continue
+        setter = getattr(module, "set_staging_paths", None)
+        if callable(setter):
+            try:
+                setter(paths)
+            except Exception:
+                pass
+
+
+def _notify_staging_paths(personality: Any) -> None:
+    """Register declared staging folders with the mounted ``toolset_staging`` module.
+
+    Editing surfaces declared via ``extra_tool_staging_paths`` may live outside
+    ``workspace_path``. This pushes those explicit folders to the staging
+    toolset (``set_staging_paths``) so enumeration does not depend on workspace
+    containment — mirroring the ``set_confirm_handler`` injection pattern.
+
+    The staging module is a ``sys.modules`` singleton keyed on the library
+    identity (``persistent_toolset_staging``), so one registration survives
+    ``refresh_tools_and_skills()``. No-op when nothing was declared or when the
+    staging toolset is not mounted.
+    """
+    paths = [str(p) for p in getattr(personality, "_extra_staging_files", [])]
+    if not paths:
+        return
+    for module_name, module in list(sys.modules.items()):
+        if not module_name.endswith("persistent_toolset_staging"):
+            continue
+        setter = getattr(module, "set_staging_paths", None)
+        if callable(setter):
+            try:
+                setter(paths)
+            except Exception:
+                pass
+
+
 class LollmsPersonality:
     """
     The universal execution unit. Scales from a simple system prompt to a 
@@ -2565,6 +2676,13 @@ class LollmsPersonality:
         self.mcp_tool_names: List[str] = []
         self._tool_binding: Any = _NULL_TOOL_BINDING
         self._has_explicit_allowlist: bool = False
+        # ``_extra_tool_files`` / ``_extra_staging_files`` are populated by
+        # ``from_handbag`` and consumed by ``refresh_tools_and_skills`` and
+        # ``_notify_staging_paths``. Initialise both here so a directly-built
+        # persona (``LollmsPersonality(...)`` without ``from_handbag``) never
+        # relies on ``getattr`` defaults and stays consistent across refreshes.
+        object.__setattr__(self, '_extra_tool_files', [])
+        object.__setattr__(self, '_extra_staging_files', [])
         self._init_tools(tools)
 
         self._raw_data_source = data_source
@@ -2946,6 +3064,7 @@ class LollmsPersonality:
         lollms_client: Optional[Any] = None,
         extra_skills_dirs: Optional[List[Union[str, Path]]] = None,
         extra_tools: Optional[List[Union[str, Path]]] = None,
+        extra_tool_staging_paths: Optional[List[Union[str, Path]]] = None,
         extra_knowledge_bases: Optional[List[Union[str, Path]]] = None,
         extra_safe_stores: Optional[List[Any]] = None,
         workspace_path: Optional[Union[str, Path]] = None,
@@ -2966,7 +3085,12 @@ class LollmsPersonality:
             extra_skills_dirs: Extra skill directories to load in addition to
                 the handbag's native ``skills/``.
             extra_tools: Extra tool files to load in addition to the handbag's
-                native tool files.
+                native tool files. These are toolsets the agent may CALL.
+            extra_tool_staging_paths: Editing-surface toolsets (e.g.
+                ``toolset_staging``) mounted alongside ``extra_tools`` but
+                tracked separately as ``_extra_staging_files``. Declaring a
+                folder here registers it with the staging toolset so it is a
+                valid edit target even outside ``workspace_path``.
             extra_knowledge_bases: Caller-supplied knowledge-base paths. ``.db``
                 paths are auto-promoted into ``extra_safe_stores`` by the
                 personality constructor.
@@ -3011,7 +3135,7 @@ class LollmsPersonality:
 
         # Initialize Skills
         skills_mode = meta.get("skills_mode") or hb.manifest.get("skills_mode", "loadable")
-        
+
         # Merge handbag skills and extra skills directories
         all_skills_dirs = []
         if hb.skills_dir.exists():
@@ -3021,8 +3145,6 @@ class LollmsPersonality:
                 resolved = Path(d).resolve()
                 if resolved.exists() and resolved not in all_skills_dirs:
                     all_skills_dirs.append(resolved)
-            
-
 
         # Initialize RAG data sources from handbag rag/ folder.
         #
@@ -3073,7 +3195,25 @@ class LollmsPersonality:
                 resolved_t = Path(t).resolve()
                 if resolved_t.exists() and resolved_t not in all_tool_files:
                     all_tool_files.append(resolved_t)
-        
+
+        # Editing surfaces are a SEPARATE, first-class intent from callable
+        # toolsets. Declaring one in ``extra_tool_staging_paths`` mounts it in
+        # the SAME LCP binding (so its tool_* functions are callable) but also
+        # registers it on ``resolved_staging`` (persisted as
+        # ``_extra_staging_files``), giving the staging context builder an
+        # explicit "surfaces I edit through" list independent of
+        # ``workspace_path`` containment.
+        resolved_staging: List[Path] = []
+        if extra_tool_staging_paths:
+            for t in extra_tool_staging_paths:
+                resolved_t = Path(t).resolve()
+                if not resolved_t.exists():
+                    continue
+                if resolved_t not in all_tool_files:
+                    all_tool_files.append(resolved_t)
+                if resolved_t not in resolved_staging:
+                    resolved_staging.append(resolved_t)
+
         if all_tool_files:
             try:
                 from lollms_client.tools_bindings.lcp import LCPBinding
@@ -3185,11 +3325,23 @@ class LollmsPersonality:
             extra_safe_stores=merged_safe_stores,
         )
 
-
-
-        # Persist extra tools and skills for inline refresh capability
+        # Persist extra tools and skills for inline refresh capability.
+        # Two distinct lists, two distinct intents:
+        #   _extra_tool_files    -> toolsets the agent CALLS (extra_tools)
+        #   _extra_staging_files -> editing surfaces (extra_tool_staging_paths)
+        # refresh_tools_and_skills() re-mounts BOTH (it merges the staging list
+        # into the binding independently), so the lists stay semantically clean.
         object.__setattr__(pers, '_extra_tool_files', [Path(t).resolve() for t in (extra_tools or []) if Path(t).resolve().exists()])
+        object.__setattr__(pers, '_extra_staging_files', resolved_staging)
         object.__setattr__(pers, '_extra_skills_dirs', [Path(d).resolve() for d in (extra_skills_dirs or []) if Path(d).resolve().exists()])
+
+        # Tell the mounted toolset_staging surface which folders the host
+        # declared as editing targets, so enumeration no longer depends on
+        # workspace_path containment. Best-effort; no-op if staging is absent.
+        try:
+            _notify_staging_paths(pers)
+        except Exception:
+            pass
 
         # Parse Coworkers (Crew Handbag)
         if hb.coworkers_dir.exists():
@@ -3234,16 +3386,28 @@ class LollmsPersonality:
     def tools(self, value: Optional[Any]) -> None:
         self._init_tools(value)
 
-    def attach_tool_binding(self, binding: Any) -> None:
-        if not _is_tool_binding(binding):
-            raise TypeError(
-                f"attach_tool_binding expects a LollmsToolBinding, "
-                f"got {type(binding).__name__!r}"
-            )
-        self._tool_binding = binding
-        ASCIIColors.info(
-            f"[{self.name}] Tool binding attached: {binding.binding_name!r}"
-        )
+    def _notify_staging_paths(self) -> None:
+        """Push declared staging folders to the mounted toolset_staging surface.
+
+        The editing toolset enumerates candidates from workspace rglob + the
+        live binding. Hosts that wire editing via ``extra_tool_staging_paths``
+        may keep those folders OUTSIDE ``workspace_path``; this notifies the
+        staging toolset of the explicit folders so they remain valid targets.
+        Best-effort and idempotent — a no-op when staging is not mounted.
+        """
+        paths = [str(p) for p in getattr(self, "_extra_staging_files", [])]
+        if not paths:
+            return
+        import sys as _sys
+        for module_name, module in list(_sys.modules.items()):
+            if not module_name.endswith("persistent_toolset_staging"):
+                continue
+            setter = getattr(module, "set_staging_paths", None)
+            if callable(setter):
+                try:
+                    setter(paths)
+                except Exception:
+                    pass
 
     def tool_specs(self, client_binding=None, **discover_kwargs) -> Dict[str, Dict[str, Any]]:
         if self._has_explicit_allowlist and not self.mcp_tool_names:
@@ -6975,7 +7139,7 @@ JSON:"""
         # 1. Refresh Tools
         hb = Handbag(self.handbag_path)
         native_tool_files = hb.tool_files
-        
+
         # Filter existing extra tool entries (in case some were deleted).
         # ``_extra_tool_files`` may contain FOLDERS (preferred) or single-file
         # tools; the resolver handles both shapes at load time.
@@ -6983,8 +7147,16 @@ JSON:"""
         for f in getattr(self, '_extra_tool_files', []):
             if f.exists():
                 extra_tool_files.append(f)
-        
-        all_tool_files = native_tool_files + extra_tool_files
+
+        # Editing surfaces are tracked on their own list but MUST be re-mounted
+        # on refresh — otherwise a post-edit reload (which rebuilds the binding
+        # here) would silently drop the staging toolset from the registry.
+        staging_tool_files = []
+        for f in getattr(self, '_extra_staging_files', []):
+            if f.exists() and f not in extra_tool_files:
+                staging_tool_files.append(f)
+
+        all_tool_files = native_tool_files + extra_tool_files + staging_tool_files
 
         if all_tool_files:
             try:
@@ -7006,7 +7178,7 @@ JSON:"""
         for d in getattr(self, '_extra_skills_dirs', []):
             if d.exists():
                 extra_skills_dirs.append(d)
-        
+
         all_skills_dirs = native_skills_dirs + extra_skills_dirs
 
         if all_skills_dirs:
@@ -7027,6 +7199,13 @@ JSON:"""
                 self.skills_manager._skills_dirs = []
                 self.skills_manager.reload()
             ASCIIColors.info(f"[{self.name}] 📚 No handbag or extra skills found.")
+
+        # Re-register declared staging folders so they remain valid edit targets
+        # after a refresh. Best-effort / no-op when nothing was declared.
+        try:
+            _notify_staging_paths(self)
+        except Exception:
+            pass
 
     def _get_doc_navigator(self) -> Optional[DocNavigator]:
         """Returns a DocNavigator over the handbag's docs/ library, or None when absent/empty."""

@@ -2,12 +2,14 @@ name: toolset_staging
 description: >-
   Discover, stage, and edit ONE toolset source at a time. Staging registers a
   single target folder; its current TOOLS.py source is re-rendered into a
-  mutable STAGED TOOLSETS region of the system prompt EVERY TURN, so the LLM
-  sees its own edits on the very next round. Edits flow through
-  tool_stage_patch (atomic Aider SEARCH/REPLACE blocks) or tool_stage_rewrite
-  (full source), both validated by ast.parse + "def tool_*" guardrails before
-  writing. tool_stage_unstage removes the prompt view; the on-disk TOOLS.py
-  remains the deliverable.
+  mutable STAGED TOOLSETS region of the system prompt EVERY TURN, exactly like
+  an unlocked file. The LLM sees the full source directly in its context and
+  edits it with tool_stage_patch (atomic Aider SEARCH/REPLACE blocks) or
+  tool_stage_rewrite (full source) — there is no separate read call, because
+  reading is redundant when the source is already present. Both write paths are
+  validated by ast.parse + "def tool_*" guardrails before writing.
+  tool_stage_unstage removes the prompt view; the on-disk TOOLS.py remains the
+  deliverable.
 
   SINGLE-TARGET INVARIANT: tool_stage refuses to stage a second toolset while
   another is already staged — the reply names the currently staged toolset and
@@ -24,19 +26,17 @@ description: >-
   binding so the edited tool_* function is immediately callable.
 icon: "🗂️"
 author: lollms-client
-version: "0.1.0"
+version: "0.2.0"
 category: developer
 tools:
   - name: tool_stage_list_stageable
     description: Enumerate every toolset folder the agent may stage (workspace + live binding). Call this first.
   - name: tool_stage
-    description: Stage ONE toolset for editing. Refuses to stage a second toolset while another is already staged.
+    description: Stage ONE toolset for editing. Its full TOOLS.py source then appears in the prompt every turn, like an unlocked file. Refuses to stage a second toolset while another is already staged.
   - name: tool_stage_unstage
     description: Remove one (or all) staged toolsets from the prompt region. The edited TOOLS.py remains on disk.
-  - name: tool_stage_read
-    description: Return the staged toolset's full TOOLS.py source on demand (also injected into the prompt every turn).
   - name: tool_stage_patch
-    description: Apply one or more Aider SEARCH/REPLACE blocks atomically to the staged toolset's TOOLS.py; validates + hot-reloads.
+    description: Apply one or more Aider SEARCH/REPLACE blocks atomically to the staged toolset's TOOLS.py (visible in-context); validates + hot-reloads.
   - name: tool_stage_rewrite
     description: Replace the entire staged toolset's TOOLS.py with validated source; hot-reloads.
   - name: tool_stage_test

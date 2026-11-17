@@ -1048,13 +1048,15 @@ sub-attributes must be feature-checked for None.
             )
         ]
 
-        # 2. Purge the cached toolset module(s).
+        # 2. Purge the cached toolset module(s). The module key is derived from
+        #    the library identity (see _get_or_load_tool_module), NOT from the
+        #    file stem — otherwise every ``TOOLS.py`` toolset collides on
+        #    ``persistent_TOOLS`` and a hot-edit evicts the wrong module.
         entry = resolve_library_entry(lib_dir)
-        stem = entry.stem if entry else clean
+        module_key = f"lollms_client.tools_bindings.lcp.persistent_{clean}"
         stale_module_names = [
             m_name for m_name in list(sys.modules.keys())
-            if m_name == f"lollms_client.tools_bindings.lcp.persistent_{stem}"
-            or m_name.startswith(f"lollms_client.tools_bindings.lcp.persistent_{clean}")
+            if m_name == module_key
         ]
         for mod_name in stale_module_names:
             try:
@@ -1402,7 +1404,16 @@ sub-attributes must be feature-checked for None.
                         pass
 
     def _get_or_load_tool_module(self, python_file_path: Path) -> Optional[types.ModuleType]:
-        module_name = f"lollms_client.tools_bindings.lcp.persistent_{python_file_path.stem}"
+        # Module identity MUST be collision-proof. The canonical layout puts
+        # every toolset entry point at ``<toolset>/TOOLS.py``, so ``.stem`` is
+        # ``"TOOLS"`` for ALL of them. Keying ``sys.modules`` on the stem alone
+        # makes two mounted toolsets (e.g. ``unit_converter`` and
+        # ``toolset_editor``) collide on ``persistent_TOOLS``: the first loaded
+        # wins, and every call into the second returns
+        # "Function '<name>' not found in module." Derive the key from the
+        # library identity (parent folder for TOOLS.py, stem otherwise) so each
+        # toolset owns a distinct module object.
+        module_name = f"lollms_client.tools_bindings.lcp.persistent_{self._library_identity(python_file_path)}"
         if module_name in sys.modules:
             tool_mod = sys.modules[module_name]
             if self.confirm_handler and hasattr(tool_mod, "set_confirm_handler") and callable(tool_mod.set_confirm_handler):
@@ -1427,7 +1438,10 @@ sub-attributes must be feature-checked for None.
             spec.loader.exec_module(tool_module)
 
             # ── 🛡️ HOST CONFIGURATION & CONFIRMATION INJECTION ──
-            library_name = python_file_path.stem
+            # Use the library identity (folder name for TOOLS.py layouts), NOT
+            # the file stem — otherwise every toolset's host config collapses
+            # onto the shared key "TOOLS" and per-toolset settings are lost.
+            library_name = self._library_identity(python_file_path)
             host_config = self.host_tool_configs.get(library_name, {})
             if self.confirm_handler and "confirm_handler" not in host_config:
                 host_config["confirm_handler"] = self.confirm_handler
@@ -1480,7 +1494,7 @@ sub-attributes must be feature-checked for None.
                     ASCIIColors.debug(f"[LCP Lazy Init] ✅ Initialized library for '{library_name}' with host configs.")
             return tool_module
         except Exception as init_ex:
-            ASCIIColors.error(f"[LCP] ❌ Toolset '{python_file_path.stem}' FAILED lazy init: {init_ex}")
+            ASCIIColors.error(f"[LCP] ❌ Toolset '{self._library_identity(python_file_path)}' FAILED lazy init: {init_ex}")
             if module_name in sys.modules:
                 del sys.modules[module_name]
             return None

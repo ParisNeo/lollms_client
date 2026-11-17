@@ -11,12 +11,18 @@ conversation into a mutation risk.
 When the host wires ``toolset_staging`` alongside ``extra_tools``, the agent
 gets a *separate*, opt-in editing surface:
 
-    list_stageable  →  stage(name)  →  read / patch / rewrite  →  unstage
+    list_stageable  →  stage(name)  →  patch / rewrite  →  unstage
 
 The staged toolset's current source is re-rendered into a mutable prompt
 region (see ``lollms_personality/toolset_staging_state.py``) EVERY turn. So
 after ``tool_stage_patch`` the very next reasoning round sees the updated
 source — no manual reload, no personality restart, no editor/target split.
+
+Crucially, the staged source is *visible to the LLM in context* exactly like
+an unlocked file: the prompt region carries the full ``TOOLS.py`` text, so
+the agent edits using the standard patch/rewrite tools. There is deliberately
+**no** ``tool_stage_read`` — reading the source is redundant when the source
+is already in the prompt.
 
 Only ONE toolset is staged at a time
 ------------------------------------
@@ -37,7 +43,6 @@ What the tools DO and DO NOT do
 * ``stage``: register one folder in ``<workspace>/.toolset_staging/
   staged.json``. **Reads nothing, writes nothing.** The prompt region is
   populated by the personality on the next turn.
-* ``read``: return the full ``TOOLS.py`` source of the staged toolset.
 * ``patch``: apply one or more Aider SEARCH/REPLACE blocks atomically to the
   staged toolset's ``TOOLS.py``. Validates with ``ast.parse`` + ``def tool_*``.
   Refreshes the personality binding on success so the edited function is
@@ -46,6 +51,20 @@ What the tools DO and DO NOT do
 * ``unstage``: remove the staging entry. **The edited file remains on disk**
   — it was always the deliverable.
 * ``status``: non-mutating view.
+
+Self-protection (author opt-out)
+--------------------------------
+A toolset may declare itself read-only by adding a top-level constant to its
+``TOOLS.py``::
+
+    TOOL_LIBRARY_READONLY = True
+
+``tool_stage`` will refuse to stage it, and ``tool_stage_patch`` /
+``tool_stage_rewrite`` re-check the flag at write time and refuse as well. The
+flag protects library toolsets (e.g. the LCP defaults, skill_editor,
+toolset_staging itself) from accidental or malicious agent edits. It is an
+author intent declaration, NOT a sandbox boundary — a tool with filesystem
+access can bypass it.
 
 Invariants
 ----------
@@ -66,7 +85,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from lollms_client.lollms_personality.toolset_staging_state import (
     add_staged,
@@ -190,7 +209,7 @@ def _utc_now() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Toolset discovery — workspace + live binding
+# Toolset discovery — workspace + live binding + host-declared staging
 # ---------------------------------------------------------------------------
 
 def _list_workspace_toolsets(workspace: Path) -> List[Dict[str, Any]]:
@@ -276,8 +295,76 @@ def _list_external_toolsets(env: Any, workspace: Path) -> List[Dict[str, Any]]:
     return sorted(external.values(), key=lambda c: c["name"])
 
 
+# Host-declared staging folders (set by LollmsPersonality via set_staging_paths).
+# These are first-class editing targets even when they live outside workspace.
+_DECLARED_STAGING_PATHS: List[str] = []
+
+
+def set_staging_paths(paths: Optional[List[str]]) -> None:
+    """Register host-declared editing-surface folders (the folders themselves).
+
+    Called by ``LollmsPersonality`` after mount so that a toolset declared via
+    ``extra_tool_staging_paths=[...]`` is a valid edit target even when it is
+    not reachable through ``workspace.rglob("TOOLS.py")``. Accepts a list of
+    *folders* (or TOOLS.py paths); each folder is scanned for a ``TOOLS.py``
+    entry point.
+    """
+    global _DECLARED_STAGING_PATHS
+    cleaned: List[str] = []
+    for raw in (paths or []):
+        try:
+            p = Path(str(raw))
+            if p.is_file() and p.name == _ENTRYPOINT:
+                p = p.parent
+            p = p.resolve()
+        except (OSError, ValueError):
+            continue
+        if p.is_dir():
+            key = str(p)
+            if key not in cleaned:
+                cleaned.append(key)
+    _DECLARED_STAGING_PATHS = cleaned
+
+
+def _list_declared_staging_toolsets() -> List[Dict[str, Any]]:
+    """Enumerate toolsets from host-declared staging folders.
+
+    Each declared folder is either the toolset folder itself (contains
+    ``TOOLS.py``) or a parent whose immediate children are toolset folders.
+    """
+    candidates: List[Dict[str, Any]] = []
+    seen: set = set()
+    for raw in _DECLARED_STAGING_PATHS:
+        folder = Path(raw)
+        if not folder.is_dir():
+            continue
+        if (folder / _ENTRYPOINT).is_file():
+            entry_dirs = [folder]
+        else:
+            entry_dirs = [
+                p for p in folder.iterdir()
+                if p.is_dir() and (p / _ENTRYPOINT).is_file()
+            ]
+        for toolset_dir in entry_dirs:
+            try:
+                resolved = str(toolset_dir.resolve())
+            except (OSError, ValueError):
+                continue
+            if resolved in seen or toolset_dir.name == "toolset_staging":
+                continue
+            seen.add(resolved)
+            candidates.append({
+                "name": toolset_dir.name,
+                "folder": resolved,
+                "relative_path": toolset_dir.name,
+                "source": "staging",
+            })
+    return candidates
+
+
 def _list_candidate_toolsets(workspace: Path, env: Any = None) -> List[Dict[str, Any]]:
-    candidates = _list_workspace_toolsets(workspace)
+    candidates = _list_declared_staging_toolsets()
+    candidates.extend(_list_workspace_toolsets(workspace))
     if env is not None:
         candidates.extend(_list_external_toolsets(env, workspace))
     return candidates
@@ -312,9 +399,13 @@ def _resolve_toolset_folder(
     target = name.strip()
 
     matches: List[Path] = []
-    for candidate in _list_workspace_toolsets(workspace):
+    for candidate in _list_declared_staging_toolsets():
         if candidate["name"] == target:
             matches.append(Path(candidate["folder"]))
+    if not matches:
+        for candidate in _list_workspace_toolsets(workspace):
+            if candidate["name"] == target:
+                matches.append(Path(candidate["folder"]))
     if not matches and env is not None:
         for candidate in _list_external_toolsets(env, workspace):
             if candidate["name"] == target:
@@ -365,6 +456,47 @@ def _validate_source(source: str) -> Tuple[bool, str, List[str]]:
             [],
         )
     return True, "", tool_names
+
+
+_READONLY_FLAG_RE = re.compile(
+    r"^\s*TOOL_LIBRARY_READONLY\s*=\s*(?:True|1|'true'|\"true\"|'True'|\"True\")\s*$",
+    re.MULTILINE,
+)
+
+
+def _is_toolset_protected(folder: Union[str, Path]) -> bool:
+    """Return True when a toolset's TOOLS.py declares itself read-only.
+
+    A toolset opts out of agent-driven editing by declaring a top-level
+    constant in its ``TOOLS.py``::
+
+        TOOL_LIBRARY_READONLY = True
+
+    This is an author-controlled guard rail, not a security boundary — a tool
+    with filesystem access can bypass it. Its purpose is to protect library
+    toolsets (e.g. the LCP default tools, the staging toolset itself) from
+    well-intentioned but destructive LLM edits.
+
+    The read is cheap (one file read + regex); the check is re-run at WRITE
+    time so a protection added after staging still blocks a patch.
+
+    Args:
+        folder: Toolset folder, or the TOOLS.py path itself.
+
+    Returns:
+        True when the flag is present; False when absent, when the file is
+        missing, or when it cannot be read.
+    """
+    try:
+        entry = Path(folder)
+        if entry.is_dir():
+            entry = entry / _ENTRYPOINT
+        if not entry.is_file():
+            return False
+        head = entry.read_text(encoding="utf-8", errors="ignore")
+    except (OSError, ValueError):
+        return False
+    return bool(_READONLY_FLAG_RE.search(head))
 
 
 def _parse_aider_patches(
@@ -429,7 +561,8 @@ def _load_module_from_path(entry: Path) -> Any:
 def tool_stage_list_stageable(env: Optional[Any] = None) -> Dict[str, Any]:
     """Enumerate every toolset the agent may stage for editing.
 
-    Combines two sources:
+    Combines three sources:
+      * host-declared staging folders (``source: "staging"``),
       * toolsets under the workspace (``source: "workspace"``),
       * toolsets mounted on the live binding but outside the workspace
         (``source: "external"``) — this is how ``extra_tools`` entries are
@@ -451,17 +584,26 @@ def tool_stage_list_stageable(env: Optional[Any] = None) -> Dict[str, Any]:
     reg = load_registry(workspace)
     staged_names = [s["name"] for s in reg["staged"]]
 
+    # ── Read-only stamping ─────────────────────────────────────────────────
+    # Each candidate is annotated with `protected: bool`. Protected toolsets
+    # are still LISTED (so the agent understands why they cannot be edited)
+    # but they are also surfaced under `protected` for easy filtering.
+    protected_names: List[str] = []
+    for cand in candidates:
+        try:
+            is_protected = _is_toolset_protected(cand.get("folder", ""))
+        except Exception:
+            is_protected = False
+        cand["protected"] = is_protected
+        if is_protected:
+            protected_names.append(cand["name"])
+
     # ── Zero-candidate diagnostic ──────────────────────────────────────────
     # An empty `candidates` list is NOT benign: it means the agent has no
     # target and will fall back to improvising (doing the edit by hand, which
     # then trips the execute_python sandbox and looks like a "block after
-    # spawning a test agent"). Two causes, and the agent cannot tell them
-    # apart from a bare `count: 0`:
-    #   (a) the toolset lives OUTSIDE `workspace` and its host binding is not
-    #       visible on `env` (e.g. this tool runs inside a sub-agent child
-    #       process whose `env` carries no client/`discovered_tools`), or
-    #   (b) nothing containing TOOLS.py exists under the workspace at all.
-    # Return the precise reason so the caller can act instead of retrying.
+    # spawning a test agent"). Return the precise reason so the caller can act
+    # instead of retrying.
     if not candidates:
         external_hint = None
         client = getattr(env, "client", None) if env is not None else None
@@ -509,16 +651,21 @@ def tool_stage_list_stageable(env: Optional[Any] = None) -> Dict[str, Any]:
             ),
         }
 
+    editable_count = sum(1 for c in candidates if not c.get("protected"))
     return {
         "success": True,
         "workspace": str(workspace),
         "count": len(candidates),
+        "editable_count": editable_count,
         "candidates": candidates,
+        "protected": protected_names,
         "staged": staged_names,
         "next_step": (
             "Call tool_stage(name=\"<candidate>\") — ONE toolset only. If you "
             "already have one staged and want another, call tool_stage_unstage "
-            "first."
+            "first. Candidates marked `protected: true` decline editing by "
+            "author declaration (`TOOL_LIBRARY_READONLY = True`) and will be "
+            "refused by tool_stage."
         ),
     }
 
@@ -534,6 +681,9 @@ def tool_stage(
     Staging pins the target folder in ``<workspace>/.toolset_staging/
     staged.json``. It reads nothing and writes nothing — the personality
     populates the STAGED TOOLSETS prompt region on the NEXT turn from disk.
+    From that point the full source is present in your context (like an
+    unlocked file), so you edit it directly with ``tool_stage_patch`` or
+    ``tool_stage_rewrite`` — no separate read call is needed.
 
     Single-target invariant: if a different toolset is already staged, this
     call returns an error asking the caller to ``tool_stage_unstage`` first.
@@ -573,6 +723,20 @@ def tool_stage(
         }
 
     target_name = resolved.name
+    if _is_toolset_protected(resolved):
+        return {
+            "success": False,
+            "protected": True,
+            "name": target_name,
+            "folder": str(resolved),
+            "error": (
+                f"'{target_name}' is READ-ONLY. Its {_ENTRYPOINT} declares "
+                "`TOOL_LIBRARY_READONLY = True`, so it is protected against "
+                "agent-driven edits. If you genuinely need to modify it, "
+                "the protection must be removed from the source by a human "
+                "operator — this is not something an agent may do."
+            ),
+        }
     if reg["staged"]:
         already = reg["staged"][0]
         if already["name"] == target_name and already["folder"] == str(resolved):
@@ -583,8 +747,9 @@ def tool_stage(
                 "already_staged": True,
                 "staged": [already],
                 "message": (
-                    f"'{target_name}' is already staged. Use tool_stage_read / "
-                    "tool_stage_patch / tool_stage_rewrite."
+                    f"'{target_name}' is already staged and its source is "
+                    "already in your context. Use tool_stage_patch or "
+                    "tool_stage_rewrite to edit it."
                 ),
             }
         return {
@@ -606,11 +771,11 @@ def tool_stage(
         "folder": entry["folder"],
         "staged": [entry],
         "next_step": (
-            f"'{target_name}' is staged. Its full TOOLS.py source will appear "
-            "in your next round's STAGED TOOLSETS prompt region. Use "
-            "tool_stage_read to inspect it now, tool_stage_patch (Aider "
-            "blocks) or tool_stage_rewrite to modify it, and tool_stage_unstage "
-            "to release it."
+            f"'{target_name}' is staged. Its full TOOLS.py source is injected "
+            "into your context as a STAGED TOOLSETS region on the next round "
+            "(exactly like an unlocked file). Edit it directly with "
+            "tool_stage_patch (Aider blocks) or tool_stage_rewrite (full "
+            "source), or release it with tool_stage_unstage."
         ),
     }
 
@@ -655,56 +820,15 @@ def tool_stage_unstage(
     }
 
 
-def tool_stage_read(env: Optional[Any] = None) -> Dict[str, Any]:
-    """Return the full source of the currently staged toolset's TOOLS.py.
-
-    The same text is injected into the STAGED TOOLSETS prompt region every
-    turn — this tool exists so the LLM can pull it on demand too (e.g. right
-    after ``tool_stage``, before the next round has been assembled).
-
-    Args:
-        env: Host tool-context handle (injected by LCP).
-
-    Returns:
-        A dict with success, name, folder, tools, source — or an error dict.
-    """
-    workspace = _workspace_root(env)
-    reg = load_registry(workspace)
-    if not reg["staged"]:
-        return {
-            "success": False,
-            "error": (
-                "Nothing is staged. Call tool_stage(name=\"...\") first. "
-                "Use tool_stage_list_stageable to enumerate candidates."
-            ),
-        }
-    entry = reg["staged"][0]
-    source = read_toolset_source(entry["folder"])
-    if source is None:
-        return {
-            "success": False,
-            "error": (
-                f"Staged toolset '{entry['name']}' has no {_ENTRYPOINT} on disk "
-                f"at: {entry['folder']}. Call tool_stage_unstage to clear it."
-            ),
-        }
-    ok, verr, tool_names = _validate_source(source)
-    return {
-        "success": True,
-        "name": entry["name"],
-        "folder": entry["folder"],
-        "valid": ok,
-        "validation_error": verr or None,
-        "tools": tool_names,
-        "source": source,
-    }
-
-
 def tool_stage_patch(
     patches: str,
     env: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Apply one or more Aider SEARCH/REPLACE blocks to the staged toolset.
+
+    The staged toolset's current source is already present in your context as
+    the STAGED TOOLSETS region, so build SEARCH blocks directly from what you
+    see there.
 
     Atomic: all blocks apply or none. Validates with ``ast.parse`` + ``def
     tool_*`` guardrails. On success, writes ``TOOLS.py`` and refreshes the
@@ -738,6 +862,21 @@ def tool_stage_patch(
         return {
             "success": False,
             "error": f"Staged toolset's TOOLS.py is missing on disk: {target}",
+        }
+
+    # Re-check protection at WRITE time. The flag may have been added to the
+    # source after the toolset was staged — a patch must honour it.
+    if _is_toolset_protected(entry["folder"]):
+        return {
+            "success": False,
+            "protected": True,
+            "name": entry["name"],
+            "folder": entry["folder"],
+            "error": (
+                f"'{entry['name']}' is READ-ONLY (`TOOL_LIBRARY_READONLY = True` "
+                f"in its {_ENTRYPOINT}). Nothing was written. This toolset "
+                "cannot be edited by an agent."
+            ),
         }
 
     blocks, perr = _parse_aider_patches(patches or "")
@@ -805,6 +944,20 @@ def tool_stage_rewrite(
         }
     entry = reg["staged"][0]
     target = Path(entry["folder"]) / _ENTRYPOINT
+
+    # Re-check protection at WRITE time (see tool_stage_patch).
+    if _is_toolset_protected(entry["folder"]):
+        return {
+            "success": False,
+            "protected": True,
+            "name": entry["name"],
+            "folder": entry["folder"],
+            "error": (
+                f"'{entry['name']}' is READ-ONLY (`TOOL_LIBRARY_READONLY = True` "
+                f"in its {_ENTRYPOINT}). Nothing was written. This toolset "
+                "cannot be edited by an agent."
+            ),
+        }
 
     ok, verr, tool_names = _validate_source(new_source or "")
     if not ok:
@@ -878,7 +1031,9 @@ def tool_stage_test(
 
     func = getattr(module, tool_name, None)
     if not callable(func):
-        available = sorted(_TOOL_FUNC_RE.findall(target.read_text(encoding="utf-8", errors="ignore")))
+        available = sorted(
+            _TOOL_FUNC_RE.findall(target.read_text(encoding="utf-8", errors="ignore"))
+        )
         return {
             "success": False,
             "error": (
@@ -938,7 +1093,6 @@ __all__ = [
     "tool_stage_list_stageable",
     "tool_stage",
     "tool_stage_unstage",
-    "tool_stage_read",
     "tool_stage_patch",
     "tool_stage_rewrite",
     "tool_stage_test",

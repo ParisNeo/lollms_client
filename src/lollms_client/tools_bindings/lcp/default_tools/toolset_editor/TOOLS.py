@@ -74,6 +74,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+__all__ = [
+    "init_tools_library",
+    "tool_edit_toolset_activate",
+    "tool_edit_toolset_read",
+    "tool_edit_toolset_patch",
+    "tool_edit_toolset_rewrite",
+    "tool_edit_toolset_reload",
+    "tool_edit_toolset_test",
+    "tool_edit_toolset_list",
+    "tool_edit_toolset_status",
+    "tool_edit_toolset_close",
+]
+
 TOOL_LIBRARY_NAME = "Toolset Editor"
 TOOL_LIBRARY_DESC = (
     "In-place live editor for a single LCP toolset: Aider patches, full "

@@ -26,7 +26,7 @@ capabilities, and conflating them is the root cause of the most common
 | Capability        | Provided by                                   |
 |-------------------|-----------------------------------------------|
 | Call `X`'s tools  | `extra_tools=[X]`                             |
-| Edit `X`'s source | `extra_tools=[X, toolset_staging]` **and** a workspace that contains `X` |
+| Edit `X`'s source | `extra_tool_staging_paths=[toolset_staging]` **and** the target exposed via `workspace_path` or a declared staging path |
 
 If you mount only `X` and ask the agent to change it, the agent has no legal
 write path. It will typically improvise: it reads the source through some
@@ -40,24 +40,36 @@ and **blocks**. That is the "blocks after spawning a test agent" symptom.
 There are exactly three things that must be true. Miss any one and staging
 yields zero candidates.
 
-### 2.1 Mount BOTH toolsets in `extra_tools`
+### 2.1 Declare the toolsets you CALL and the surfaces you EDIT separately
+
+`extra_tools` means exactly one thing: **the toolsets the agent may call**. Do
+not smuggle the editing surface into it — that conflates two intents and can
+mount `toolset_staging` in contexts that never edit. The editing surface is a
+first-class, parallel parameter: **`extra_tool_staging_paths`**.
 
 ```python
 from lollms_client import LollmsPersonality
-from lollms_client.tools_bindings.lcp.default_tools.toolset_staging.TOOLS import *  # noqa
-# ... plus your target toolset
 
 agent = LollmsPersonality.from_handbag(
     handbag,
-    extra_tools=[
-        TARGET_TOOLSET,      # the toolset you want to EDIT
-        STAGING_TOOLSET,     # toolset_staging — the editing surface
-    ],
-    workspace_path=PARENT_FOLDER,   # see 2.2
+    extra_tools=[TARGET_TOOLSET],                  # toolsets the agent CALLS
+    extra_tool_staging_paths=[STAGING_TOOLSET],    # editing surface(s) the agent EDITS through
+    workspace_path=PARENT_FOLDER,                  # see 2.2
 )
 ```
 
-### 2.2 `workspace_path` must **contain** the target toolset
+Both lists are mounted in the **same** single LCP binding (so the staging tool
+is callable), but they are tracked separately on the personality:
+
+- `_extra_tool_files` — callable toolsets (`extra_tools`),
+- `_extra_staging_files` — editing surfaces (`extra_tool_staging_paths`).
+
+Declaring a folder in `extra_tool_staging_paths` also registers it with the
+staging toolset via `set_staging_paths(...)`, so those folders are valid edit
+targets **even when they live outside `workspace_path`** (see 2.2 for why that
+matters). You may pass several staging paths; each entry is one editing surface.
+
+### 2.2 `workspace_path` (or a declared staging path) must expose the target
 
 `tool_stage_list_stageable` enumerates candidates from two sources:
 
@@ -85,9 +97,9 @@ toolset, staging will report `count: 0` **in the sub-agent** even though the
 parent sees the toolset fine.
 
 Do the editing on the agent constructed with
-`from_handbag(extra_tools=[..., toolset_staging])`. If a sub-agent genuinely
-needs to edit, the target must live **under that sub-agent's `workspace_path`**
-so the filesystem scan finds it.
+`from_handbag(extra_tool_staging_paths=[toolset_staging])`. If a sub-agent
+genuinely needs to edit, the target must live **under that sub-agent's
+`workspace_path`** so the filesystem scan finds it.
 
 ---
 
@@ -237,8 +249,13 @@ tool callers.
 
 Before asking an agent to edit a toolset, verify:
 
-- [ ] `extra_tools` contains **both** the target toolset and `toolset_staging`.
-- [ ] `workspace_path` is an **ancestor** of the target toolset's folder.
+- [ ] `extra_tools` contains the target toolset(s) the agent **calls**;
+      `extra_tool_staging_paths` contains the editing surface(s)
+      (e.g. `toolset_staging`). They are two different intents — never put
+      `toolset_staging` into `extra_tools`.
+- [ ] The target toolset is reachable either because `workspace_path` is an
+      **ancestor** of it, OR because its folder is listed in
+      `extra_tool_staging_paths`.
 - [ ] The work happens on the agent that owns the binding (not a sub-agent
       whose `env` lacks `client.tools`) — or the target is inside the
       sub-agent's `workspace_path`.
@@ -246,6 +263,9 @@ Before asking an agent to edit a toolset, verify:
       returns 0).
 - [ ] The target is a **folder-layout** toolset (`<name>/TOOLS.py`), not a
       single-file toolset.
+- [ ] The target does **not** declare `TOOL_LIBRARY_READONLY = True` — a
+      protected toolset refuses `tool_stage` and re-checks the flag at write
+      time, so edits are blocked even if it was staged earlier.
 
 Before authorizing Python that mutates the environment:
 

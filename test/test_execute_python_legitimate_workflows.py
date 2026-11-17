@@ -36,17 +36,17 @@ from pathlib import Path
 import pytest
 
 try:
-    from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as ep
+    from lollms_client.tools_bindings.lcp.default_tools.execute_python import TOOLS as ep
     from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (
-        execute_python_data_query as epdq,
+        TOOLS as epdq,
     )
 except ImportError:  # pragma: no cover - dev checkout fallback
     _SRC = Path(__file__).resolve().parents[1] / "src"
     if str(_SRC) not in sys.path:
         sys.path.insert(0, str(_SRC))
-    from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as ep
+    from lollms_client.tools_bindings.lcp.default_tools.execute_python import TOOLS as ep
     from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (
-        execute_python_data_query as epdq,
+        TOOLS as epdq,
     )
 
 

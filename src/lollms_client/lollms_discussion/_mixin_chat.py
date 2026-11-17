@@ -63,6 +63,37 @@ _OFFICE_XLSX_TOOL_NAMES = {
     "tool_excel_from_markdown",
 }
 
+# ── Skill-editing (skill_editor) admission ──
+# Exact-name set for the `skill_editor` library. A tool is admitted into
+# this turn ONLY when its name is in this set — matching the per-family
+# isolation the office and staging mounts already enforce.
+_SKILL_EDITOR_TOOL_NAMES = {
+    "tool_edit_skill_list",
+    "tool_edit_skill_activate",
+    "tool_edit_skill_read",
+    "tool_edit_skill_load_status",
+    "tool_edit_skill_patch",
+    "tool_edit_skill_rewrite",
+    "tool_edit_skill_reload",
+    "tool_edit_skill_test",
+    "tool_edit_skill_status",
+    "tool_edit_skill_close",
+}
+
+# ── Toolset-editing (staging) admission ──
+# Exact-name set for the `toolset_staging` library. A tool is admitted into
+# this turn ONLY when its name is in this set — anything else the staging
+# library might later add stays invisible to the LLM unless we say so here.
+_TOOLSET_STAGING_TOOL_NAMES = {
+    "tool_stage_list_stageable",
+    "tool_stage",
+    "tool_stage_unstage",
+    "tool_stage_patch",
+    "tool_stage_rewrite",
+    "tool_stage_test",
+    "tool_stage_status",
+}
+
 # ── 🤫 VERBOSE TELEMETRY GATE ──
 # Per-turn verbose logging flag. chat() sets this from its `debug` parameter;
 # telemetry helpers below log ONLY when it is True. Actionable warnings
@@ -7406,6 +7437,270 @@ class ChatMixin:
 
         return active_tools
 
+    def _mount_skill_editor(
+        self,
+        lcp_binding: Any,
+        active_tools: Dict[str, Any],
+        skill_paths: List[str],
+        discussion_instance: Any,
+        client: Any,
+    ) -> List[str]:
+        """Mount the `skill_editor` library and admit its `tool_edit_skill_*` tools.
+
+        Returns the list of admitted tool names (empty on any failure). Never
+        raises: every failure path logs an actionable diagnostic and returns
+        `[]`, so the surrounding chat() turn proceeds with the tools it has.
+
+        CONTRACT (mirrors the toolset-staging mount in this file):
+          1. Pre-authorize the `enable_skill_editing` flag in BOTH gate
+             containers (`tools_binding_config` + `host_tool_configs[stem]`)
+             and via `set_session_flags` — the LCP gate is fail-closed and
+             does NOT read chat() kwargs.
+          2. Mount-if-absent, then push `skill_paths` into the freshly imported
+             module via `set_skill_paths(...)` if the module defines it (the
+             skill_editor reads candidate skill folders from the workspace +
+             declared paths + live manager; `set_skill_paths` extends the
+             declared set — silently absent is acceptable when the editor does
+             not need it).
+          3. Enumerate specs and admit ONLY names in
+             `_SKILL_EDITOR_TOOL_NAMES` (per-family isolation).
+          4. Post-condition: at least one tool landed AND a READ tool exists,
+             because every downstream write needs a source inspection.
+        """
+        if lcp_binding is None or not hasattr(lcp_binding, "mount_tool_library_if_absent"):
+            ASCIIColors.info(
+                "[ChatMixin] enable_skill_editing=True but no LCP tools "
+                "binding is available — skill_editor NOT mounted. Configure a "
+                "tools binding (e.g. 'lcp') via create_tools=True to enable it."
+            )
+            return []
+
+        # ── 1. Flag pre-authorization (fail-closed gate) ──
+        try:
+            _cfg = getattr(lcp_binding, "tools_binding_config", None)
+            if isinstance(_cfg, dict):
+                _cfg["enable_skill_editing"] = True
+            _htc = getattr(lcp_binding, "host_tool_configs", None)
+            if isinstance(_htc, dict):
+                _htc.setdefault("skill_editor", {})["enable_skill_editing"] = True
+        except Exception:
+            pass
+        try:
+            if hasattr(lcp_binding, "set_session_flags"):
+                lcp_binding.set_session_flags({"enable_skill_editing": True})
+        except Exception:
+            pass
+
+        # ── 2. Mount-if-absent ──
+        try:
+            lcp_binding.mount_tool_library_if_absent("skill_editor")
+        except Exception as _mount_ex:
+            trace_exception(_mount_ex)
+            ASCIIColors.error(
+                f"[ChatMixin] Failed to mount 'skill_editor': {_mount_ex}"
+            )
+            return []
+
+        # ── 2b. Push declared skill paths into the loaded module ──
+        # `skill_editor` may expose a `set_skill_paths` setter — if it does,
+        # use it so out-of-workspace declared paths become editable targets.
+        # If it does not, the workspace scan + live manager still expose the
+        # skills the agent already holds, so editing remains functional.
+        if skill_paths:
+            _actuated = False
+            _loader = getattr(lcp_binding, "_get_or_load_tool_module", None)
+            if callable(_loader):
+                try:
+                    _module = _loader("skill_editor")
+                except Exception:
+                    _module = None
+                _setter = getattr(_module, "set_skill_paths", None) if _module else None
+                if callable(_setter):
+                    try:
+                        _setter(list(skill_paths))
+                        _actuated = True
+                        ASCIIColors.info(
+                            f"[ChatMixin] Declared {len(skill_paths)} skill "
+                            f"editing path(s) to 'skill_editor': {skill_paths}"
+                        )
+                    except Exception as _set_ex:
+                        trace_exception(_set_ex)
+            if not _actuated:
+                ASCIIColors.info(
+                    "[ChatMixin] skill_editing_paths declared, but "
+                    "'skill_editor' has no set_skill_paths seam — the workspace "
+                    "scan and the live skills_manager still expose editable "
+                    "skills (including ones the agent already holds)."
+                )
+
+        # ── 3. Enumerate specs, admit ONLY the skill-editor family ──
+        try:
+            _specs = lcp_binding.to_chat_tool_specs(
+                discussion_instance=discussion_instance,
+                lollms_client_instance=client,
+            )
+        except Exception as _spec_ex:
+            trace_exception(_spec_ex)
+            ASCIIColors.error(
+                f"[ChatMixin] 'skill_editor' mounted but produced no specs: {_spec_ex}"
+            )
+            return []
+
+        _admitted: List[str] = []
+        for _name, _spec in _specs.items():
+            if _name in _SKILL_EDITOR_TOOL_NAMES:
+                active_tools[_name] = _spec
+                _admitted.append(_name)
+
+        # ── 4. Post-condition: a READ tool must be present ──
+        if "tool_edit_skill_read" not in _admitted:
+            ASCIIColors.error(
+                "[ChatMixin] 'skill_editor' mounted but did not admit "
+                "'tool_edit_skill_read'. The LLM will NOT be taught "
+                "skill-editing doctrine. Check the mount log above this message."
+            )
+            return []
+
+        ASCIIColors.success(
+            f"[ChatMixin] Mounted 'skill_editor' "
+            f"({len(_admitted)} tool(s): {sorted(_admitted)})."
+        )
+        return _admitted
+
+    def _mount_toolset_staging(
+        self,
+        lcp_binding: Any,
+        active_tools: Dict[str, Any],
+        staging_paths: List[str],
+        discussion_instance: Any,
+        client: Any,
+    ) -> List[str]:
+        """Mount the `toolset_staging` library and admit its `tool_stage_*` tools.
+
+        Returns the list of admitted tool names (empty on any failure). Never
+        raises: every failure path logs an actionable diagnostic and returns
+        `[]`, so the surrounding chat() turn proceeds with the tools it has.
+
+        CONTRACT (mirrors the office-mount doctrine in this file):
+          1. Pre-authorize the library flag in BOTH gate containers
+             (`tools_binding_config` + `host_tool_configs[stem]`) and via
+             `set_session_flags`, because the LCP gate is fail-closed and
+             does NOT read chat() kwargs.
+          2. Mount-if-absent, then push `staging_paths` into the freshly
+             imported module via `set_staging_paths(...)`.
+          3. Enumerate specs and admit ONLY names in
+             `_TOOLSET_STAGING_TOOL_NAMES` (per-family isolation, matching
+             the office-mount pattern).
+          4. Verify the mount actually honours the paths by checking that
+             `tool_stage_list_stageable` is callable — the runtime gate is
+             a live tool, not a config assertion.
+        """
+        if lcp_binding is None or not hasattr(lcp_binding, "mount_tool_library_if_absent"):
+            ASCIIColors.info(
+                "[ChatMixin] enable_toolset_editing=True but no LCP tools "
+                "binding is available — toolset_staging NOT mounted. Configure a "
+                "tools binding (e.g. 'lcp') via create_tools=True to enable it."
+            )
+            return []
+
+        # ── 1. Flag pre-authorization (fail-closed gate) ──
+        try:
+            _cfg = getattr(lcp_binding, "tools_binding_config", None)
+            if isinstance(_cfg, dict):
+                _cfg["enable_toolset_editing"] = True
+            _htc = getattr(lcp_binding, "host_tool_configs", None)
+            if isinstance(_htc, dict):
+                _htc.setdefault("toolset_staging", {})["enable_toolset_editing"] = True
+        except Exception:
+            # Best-effort; the mount below will surface a clear refusal log
+            # if the gate blocked, which is the actionable signal we want.
+            pass
+        try:
+            if hasattr(lcp_binding, "set_session_flags"):
+                lcp_binding.set_session_flags({"enable_toolset_editing": True})
+        except Exception:
+            pass
+
+        # ── 2. Mount-if-absent ──
+        try:
+            lcp_binding.mount_tool_library_if_absent("toolset_staging")
+        except Exception as _mount_ex:
+            trace_exception(_mount_ex)
+            ASCIIColors.error(
+                f"[ChatMixin] Failed to mount 'toolset_staging': {_mount_ex}"
+            )
+            return []
+
+        # ── 2b. Push declared staging paths into the loaded module ──
+        # `set_staging_paths` lives at module scope in the staging TOOLS.py.
+        # Reaching it requires the LOADED module, not the binding surface.
+        # `_get_or_load_tool_module` is the documented seam for exactly this.
+        if staging_paths:
+            _actuated = False
+            _loader = getattr(lcp_binding, "_get_or_load_tool_module", None)
+            if callable(_loader):
+                try:
+                    _module = _loader("toolset_staging")
+                except Exception:
+                    _module = None
+                _setter = getattr(_module, "set_staging_paths", None) if _module else None
+                if callable(_setter):
+                    try:
+                        _setter(list(staging_paths))
+                        _actuated = True
+                        ASCIIColors.info(
+                            f"[ChatMixin] Declared {len(staging_paths)} staging "
+                            f"path(s) to 'toolset_staging': {staging_paths}"
+                        )
+                    except Exception as _set_ex:
+                        trace_exception(_set_ex)
+            if not _actuated:
+                # Non-fatal: workspace-resident toolsets remain visible; only
+                # out-of-workspace declared targets depend on this push.
+                ASCIIColors.warning(
+                    "[ChatMixin] toolset_editing_paths requested but "
+                    "'set_staging_paths' could not be reached on the loaded "
+                    "toolset_staging module — out-of-workspace targets may not be "
+                    "stageable. Workspace-resident toolsets still work."
+                )
+
+        # ── 3. Enumerate specs, admit ONLY the staging family ──
+        try:
+            _specs = lcp_binding.to_chat_tool_specs(
+                discussion_instance=discussion_instance,
+                lollms_client_instance=client,
+            )
+        except Exception as _spec_ex:
+            trace_exception(_spec_ex)
+            ASCIIColors.error(
+                f"[ChatMixin] 'toolset_staging' mounted but produced no specs: {_spec_ex}"
+            )
+            return []
+
+        _admitted: List[str] = []
+        for _name, _spec in _specs.items():
+            if _name in _TOOLSET_STAGING_TOOL_NAMES:
+                active_tools[_name] = _spec
+                _admitted.append(_name)
+
+        # ── 4. Post-condition: the runtime gate must be callable ──
+        if "tool_stage_list_stageable" not in _admitted:
+            ASCIIColors.error(
+                "[ChatMixin] 'toolset_staging' mounted but did not admit "
+                "'tool_stage_list_stageable' (admitted: "
+                f"{sorted(_admitted)}). The LLM will NOT be taught staging "
+                "doctrine. This usually means the LCP 'toolset_editing' flag "
+                "was refused by the fail-closed gate — inspect the mount log "
+                "immediately above this message."
+            )
+            return []
+
+        ASCIIColors.success(
+            f"[ChatMixin] Mounted 'toolset_staging' "
+            f"({len(_admitted)} tool(s): {sorted(_admitted)})."
+        )
+        return _admitted
+
     def chat(
         self,
         user_message: str,
@@ -7472,6 +7767,12 @@ class ChatMixin:
         enforce_end_tag:              bool = False,
         builtin_tools_activation_list: Optional[List[str]] = None,
         compact_workspace_tree:       bool = False,
+
+        enable_toolset_editing:       bool = False,
+        toolset_editing_paths:        Optional[List[str]] = None,
+
+        enable_skill_editing:         bool = False,
+        skill_editing_paths:          Optional[List[str]] = None,
 
         **kwargs
     ) -> Dict[str, Any]:
@@ -7560,6 +7861,34 @@ class ChatMixin:
             reasoning_effort (Optional[str]): Level of reasoning effort for reasoning/thinking models ('low', 'medium', 'high', 'max'). Overrides `think`. Default None.
             reasoning_summary (Optional[str]): Format of reasoning summary for thinking models ('auto', 'concise', 'detailed'). Default None.
             enable_code_execution (bool): Enable arbitrary Python code execution tool. Default False.
+            enable_toolset_editing (bool): Mount the `toolset_staging` toolset and admit its
+                `tool_stage_*` tools (list/read/patch/rewrite/test/stage/unstage/status).
+                This is the CALLABLE editing surface: the agent can inspect and modify
+                LCP toolsets inside the turn. Staging only targets folder-layout toolsets
+                (`<name>/TOOLS.py`); single-file toolsets are not editable. The mount is
+                refused (with a diagnostic log) when no LCP tools binding is available.
+                Default False.
+            toolset_editing_paths (Optional[List[str]]): Additional folders explicitly
+                declared as editing surfaces. Each entry is a toolset folder OR a parent
+                whose immediate children are toolset folders. These paths are pushed into
+                the staging toolset via `set_staging_paths(...)` AFTER the library mounts,
+                so a target living OUTSIDE `workspace_path` is still a valid edit target.
+                Only consulted when `enable_toolset_editing=True`. Default None.
+            enable_skill_editing (bool): Mount the `skill_editor` toolset and admit its
+                `tool_edit_skill_*` tools (list/activate/read/load_status/patch/rewrite/
+                reload/test/status/close). This is the CALLABLE SKILL-editing surface:
+                the agent can inspect, patch, and validate `SKILL.md` files inside the
+                turn. The `skill_editor` toolset's auto-activation means that when the
+                agent has exactly ONE editable skill candidate, its write tools operate
+                on that skill WITHOUT an explicit activate call — allowing an agent to
+                update a skill it already holds. A skill may protect itself against
+                agent edits by declaring `SKILL_LIBRARY_READONLY: true` in its
+                frontmatter or `SKILL_LIBRARY_READONLY = True` in its body; the editors
+                re-check the flag at write time. Default False.
+            skill_editing_paths (Optional[List[str]]): Additional folders declared as
+                skill editing surfaces. Each entry is a skill folder (contains
+                `SKILL.md`) or a parent whose immediate children are skill folders.
+                Only consulted when `enable_skill_editing=True`. Default None.
             **kwargs: Additional generation parameters passed to the LLM binding.
 
         Returns:
@@ -7575,6 +7904,85 @@ class ChatMixin:
         resolved_max_rounds = max_nb_rounds if max_nb_rounds is not None else max_reasoning_steps
         if resolved_max_rounds is None:
             resolved_max_rounds = 20
+
+        # ── TOOLSET-EDITING (STAGING) PATH VALIDATION ──
+        # Mirrors the `builtin_tools_activation_list` seam: strings only,
+        # deduplicated, order-preserved, resolved to absolute paths so the
+        # caller's relative paths resolve against the process CWD ONCE —
+        # not per-round inside the staging toolset (whose CWD is the
+        # workspace). Entries are stored on `self` so the mount helper (and
+        # the staging module via `set_staging_paths`) can read them without
+        # threading another parameter.
+        _validated_staging_paths: List[str] = []
+        if toolset_editing_paths:
+            if not isinstance(toolset_editing_paths, (list, tuple)):
+                ASCIIColors.warning(
+                    "[ChatMixin] toolset_editing_paths must be a list of strings — ignored."
+                )
+            else:
+                for _entry in toolset_editing_paths:
+                    if not isinstance(_entry, str) or not _entry.strip():
+                        ASCIIColors.warning(
+                            f"[ChatMixin] toolset_editing_paths entry {_entry!r} is not a "
+                            "non-empty string — skipped."
+                        )
+                        continue
+                    try:
+                        _resolved = str(Path(_entry.strip()).expanduser().resolve())
+                    except (OSError, ValueError) as _path_ex:
+                        ASCIIColors.warning(
+                            f"[ChatMixin] toolset_editing_paths entry {_entry!r} could not "
+                            f"be resolved ({_path_ex}) — skipped."
+                        )
+                        continue
+                    if not Path(_resolved).is_dir():
+                        ASCIIColors.warning(
+                            f"[ChatMixin] toolset_editing_paths entry {_entry!r} is not a "
+                            "directory — skipped."
+                        )
+                        continue
+                    _validated_staging_paths.append(_resolved)
+        object.__setattr__(
+            self, "_turn_staging_paths", list(dict.fromkeys(_validated_staging_paths))
+        )
+
+        # ── SKILL-EDITING PATH VALIDATION ──
+        # Mirrors `toolset_editing_paths`: strings only, deduplicated,
+        # resolved once at turn start (never per-round), directory-checked,
+        # stored on `self` so the skill-editor mount helper reads the same
+        # list without another parameter.
+        _validated_skill_paths: List[str] = []
+        if skill_editing_paths:
+            if not isinstance(skill_editing_paths, (list, tuple)):
+                ASCIIColors.warning(
+                    "[ChatMixin] skill_editing_paths must be a list of strings — ignored."
+                )
+            else:
+                for _entry in skill_editing_paths:
+                    if not isinstance(_entry, str) or not _entry.strip():
+                        ASCIIColors.warning(
+                            f"[ChatMixin] skill_editing_paths entry {_entry!r} is not a "
+                            "non-empty string — skipped."
+                        )
+                        continue
+                    try:
+                        _resolved_skill = str(Path(_entry.strip()).expanduser().resolve())
+                    except (OSError, ValueError) as _skill_path_ex:
+                        ASCIIColors.warning(
+                            f"[ChatMixin] skill_editing_paths entry {_entry!r} could not "
+                            f"be resolved ({_skill_path_ex}) — skipped."
+                        )
+                        continue
+                    if not Path(_resolved_skill).is_dir():
+                        ASCIIColors.warning(
+                            f"[ChatMixin] skill_editing_paths entry {_entry!r} is not a "
+                            "directory — skipped."
+                        )
+                        continue
+                    _validated_skill_paths.append(_resolved_skill)
+        object.__setattr__(
+            self, "_turn_skill_editing_paths", list(dict.fromkeys(_validated_skill_paths))
+        )
 
         # ── BUILTIN TOOLS ACTIVATION LIST (PER-TURN, DEDUPLICATED) ──
         # Caller-supplied list of built-in native tool names to force-load when
@@ -8509,6 +8917,144 @@ class ChatMixin:
                     "(no tools binding configured) — office doctrine withheld by design."
                 )
 
+        # ── 🧰 TOOLSET-EDITING (STAGING) MOUNT ──
+        # Mirrors the office-mount contract: pre-authorize the library flag,
+        # mount-if-absent, enumerate specs, admit ONLY the `tool_stage_*`
+        # family, and emit an actionable diagnostic when nothing landed.
+        #
+        # DELIBERATE ORDERING: staging paths are pushed into the staging module
+        # AFTER the mount completes. The module's `set_staging_paths` is a
+        # module-level function — reaching it before the import means the
+        # paths are dropped silently. `_mount_toolset_staging` handles this
+        # by calling `set_staging_paths` on the loaded module (see below).
+        _staging_mounted_tools: List[str] = []
+        if enable_toolset_editing and not orchestrator_persona:
+            _staging_mounted_tools = self._mount_toolset_staging(
+                lcp_binding=lcp_binding,
+                active_tools=active_tools,
+                staging_paths=getattr(self, "_turn_staging_paths", []),
+                discussion_instance=self,
+                client=self.lollmsClient,
+            )
+            if _staging_mounted_tools:
+                extra_instructions += (
+                    "\n=== TOOLSET EDITING PROTOCOL (toolset_staging) ===\n"
+                    "You can inspect and modify LCP toolsets INSIDE this turn using the "
+                    "`tool_stage_*` tools. The workflow is a strict focus cycle:\n"
+                    "1. **DISCOVER**: `tool_stage_list_stageable()` — enumerate candidate "
+                    "toolsets. Each entry carries `source` (workspace|staging|external) "
+                    "and, when the count is 0, a `diagnosis` string naming the cause. "
+                    "Read the diagnosis before improvising.\n"
+                    "2. **STAGE ONE**: `tool_stage(name=\"<toolset_name>\")` — exactly ONE "
+                    "toolset is staged at a time; multi-staging is refused by design "
+                    "(two sources corrupt the model's file focus).\n"
+                    "3. **THE SOURCE IS ALREADY IN YOUR CONTEXT**: once staged, the full "
+                    "current TOOLS.py appears in the STAGED TOOLSETS region of this very "
+                    "prompt — exactly like an unlocked file. There is NO separate read "
+                    "call: do not look for one, and do not use a file-reading tool.\n"
+                    "4. **EDIT DIRECTLY**: `tool_stage_patch(patches=\"<<<<<<< SEARCH\\n...\\n"
+                    "=======\\n...\\n>>>>>>> REPLACE\")` applies one or more Aider blocks "
+                    "ATOMICALLY (all succeed or none). Use `tool_stage_rewrite(new_source=...)` "
+                    "for a full-file replacement. Both validate via `ast.parse` and "
+                    "require at least one top-level `def tool_*(`. A broken source never "
+                    "reaches disk.\n"
+                    "5. **TEST**: `tool_stage_test(tool_name=\"tool_x\", arguments_json='{...}')` "
+                    "runs the edited `tool_*` from the on-disk source to confirm the fix.\n"
+                    "6. **RELEASE**: `tool_stage_unstage()` frees the focus slot; the file "
+                    "stays on disk.\n"
+                    "\n"
+                    "HARD RULES:\n"
+                    "- There is ONE focus slot. Stage, edit, test, unstage — do not try to "
+                    "edit two toolsets concurrently.\n"
+                    "- Only FOLDER-LAYOUT toolsets (`<name>/TOOLS.py`) are editable; "
+                    "single-file toolsets are not.\n"
+                    "- The STAGED TOOLSETS region is refreshed from disk every round: an "
+                    "edit made via `tool_stage_patch`/`tool_stage_rewrite` is visible on "
+                    "the next round WITHOUT a reload. Never re-stage to see your change.\n"
+                    "- **FORBIDDEN WRITERS**: never edit a staged toolset with "
+                    "`execute_python` (tool_execute_python_code / tool_execute_python_file "
+                    "/ tool_create_and_execute_python_file), any SQL or data-query tool, "
+                    "`tool_write_file`, or an `<artifact>` tag. These bypass the "
+                    "`ast.parse` + `def tool_*` guardrails and will either be rejected or "
+                    "corrupt the toolset. The ONLY sanctioned writers are "
+                    "`tool_stage_patch` and `tool_stage_rewrite`.\n"
+                    "- Do NOT spin up a sub-agent to edit a toolset — edit it yourself with "
+                    "the tools above.\n"
+                    "=== END TOOLSET EDITING PROTOCOL ===\n"
+                )
+            else:
+                ASCIIColors.warning(
+                    "[ChatMixin] enable_toolset_editing=True but the "
+                    "'toolset_staging' toolset produced 0 tool specs — no "
+                    "editing doctrine was injected. Check that an LCP tools "
+                    "binding is available and the toolset is discoverable."
+                )
+
+        # ── 🎓 SKILL-EDITING (skill_editor) MOUNT ──
+        # Mirrors the toolset mount: pre-authorize, mount-if-absent, admit
+        # ONLY the `tool_edit_skill_*` family, inject doctrine on success.
+        # Auto-activation in `skill_editor` means an agent that already HOLDS
+        # a skill can update it by naming it once (or with zero activation
+        # when there is exactly one candidate) — no separate staging
+        # registry is required. `skill_editing_paths` extends the candidate
+        # set to folders outside `workspace_path`.
+        _skill_editor_mounted_tools: List[str] = []
+        if enable_skill_editing and not orchestrator_persona:
+            _skill_editor_mounted_tools = self._mount_skill_editor(
+                lcp_binding=lcp_binding,
+                active_tools=active_tools,
+                skill_paths=getattr(self, "_turn_skill_editing_paths", []),
+                discussion_instance=self,
+                client=self.lollmsClient,
+            )
+            if _skill_editor_mounted_tools:
+                extra_instructions += (
+                    "\n=== SKILL EDITING PROTOCOL (skill_editor) ===\n"
+                    "You can inspect and modify SKILL.md files INSIDE this turn "
+                    "using the `tool_edit_skill_*` tools. The workflow is:\n"
+                    "1. **DISCOVER**: `tool_edit_skill_list()` — enumerate editable "
+                    "skills. Each entry carries `source` (workspace|external|manager) "
+                    "and, when `count` is 0, a `diagnosis` string. Read it before "
+                    "improvising.\n"
+                    "2. **ACTIVATE** (optional): `tool_edit_skill_activate(skill_name=...)`. "
+                    "When exactly ONE skill is a candidate, every editing tool "
+                    "auto-activates against it — this makes it possible to update a "
+                    "skill you ALREADY HOLD without an explicit activation step.\n"
+                    "3. **READ**: `tool_edit_skill_read()` — returns the current "
+                    "SKILL.md source (frontmatter + body). You do NOT need a "
+                    "file-reading tool for this.\n"
+                    "4. **EDIT**: `tool_edit_skill_patch(patches=\"<<<<<<< SEARCH\\n...\\n"
+                    "=======\\n...\\n>>>>>>> REPLACE\")` applies one or more Aider "
+                    "blocks ATOMICALLY. Use `tool_edit_skill_rewrite(new_source=...)` "
+                    "for a full replacement. Both validate the frontmatter and the "
+                    "body; a broken SKILL.md never reaches disk.\n"
+                    "5. **TEST**: `tool_edit_skill_test(...)` exercises the edited "
+                    "skill against a scripted input to confirm the fix.\n"
+                    "6. **RELEASE**: `tool_edit_skill_close()` frees the session; the "
+                    "file stays on disk.\n"
+                    "\n"
+                    "HARD RULES:\n"
+                    "- A skill is READ-ONLY and will REFUSE activate/patch/rewrite "
+                    "when its SKILL.md declares `modifiable: false` (the canonical "
+                    "SkillsManager flag — also the default when the key is absent) "
+                    "OR `SKILL_LIBRARY_READONLY: true` (frontmatter) / "
+                    "`SKILL_LIBRARY_READONLY = True` (body). Report the refusal; do "
+                    "NOT attempt to bypass it.\n"
+                    "- You may edit ANY skill you can list, including ones you already "
+                    "hold — no staging registry is required for that path.\n"
+                    "- Never write a broken SKILL.md; the editor rejects invalid "
+                    "frontmatter/body.\n"
+                    "- The edited SKILL.md on disk IS the deliverable; do not copy it "
+                    "elsewhere.\n"
+                    "=== END SKILL EDITING PROTOCOL ===\n"
+                )
+            else:
+                ASCIIColors.warning(
+                    "[ChatMixin] enable_skill_editing=True but the "
+                    "'skill_editor' toolset produced 0 tool specs — no "
+                    "skill-editing doctrine was injected. Check that an LCP "
+                    "tools binding is available and the toolset is discoverable."
+                )
 
         # ── 🎯 WORKER-TIER EXECUTION DOCTRINE ──
         # chat() always runs the worker persona here. The orchestrator persona

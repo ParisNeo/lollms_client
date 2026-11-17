@@ -582,7 +582,7 @@ def _render_slides_to_pngs(deck_path: Path, slide_numbers: List[int]) -> Optiona
     if soffice is None:
         return None
     try:
-        import pypdfium2 as pdfium  # noqa: F401
+        import pypdfium2 as pdfium  # type: ignore[import-not-found]  # noqa: F401
     except ImportError:
         return None
 
@@ -599,7 +599,7 @@ def _render_slides_to_pngs(deck_path: Path, slide_numbers: List[int]) -> Optiona
         if completed.returncode != 0 or not pdf_path.exists():
             return None
 
-        import pypdfium2 as pdfium
+        import pypdfium2 as pdfium  # type: ignore[import-not-found]
         png_bytes: List[bytes] = []
         pdf = pdfium.PdfDocument(str(pdf_path))
         try:

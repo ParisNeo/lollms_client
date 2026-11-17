@@ -34,7 +34,7 @@ import pytest
 
 try:
     from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (
-        execute_python_data_query as epdq,
+        TOOLS as epdq,
     )
     from lollms_client.tools_bindings.lcp.default_tools.execute_python import sandbox_kernel as sk
 except ImportError:  # pragma: no cover - dev checkout fallback
@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover - dev checkout fallback
     if str(_SRC_ROOT) not in sys.path:
         sys.path.insert(0, str(_SRC_ROOT))
     from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (
-        execute_python_data_query as epdq,
+        TOOLS as epdq,
     )
     from lollms_client.tools_bindings.lcp.default_tools.execute_python import sandbox_kernel as sk
 

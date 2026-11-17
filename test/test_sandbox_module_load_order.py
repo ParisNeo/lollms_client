@@ -23,7 +23,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-import pytest
+import pytest  # type: ignore[import-not-found]
 
 
 @pytest.fixture
@@ -109,7 +109,7 @@ def test_data_query_tool_survives_module_load_order_corruption(fresh_workspace):
     """End-to-end: after the corruption scenario, data_query tool still runs."""
     pytest.importorskip("pandas")
     from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query import (
-        execute_python_data_query as epdq,
+        TOOLS as epdq,
     )
 
     # Force a corrupted TRUE_EXEC on the data-query module (simulates the
@@ -129,7 +129,7 @@ def test_data_query_tool_survives_module_load_order_corruption(fresh_workspace):
 
 def test_execute_python_tool_survives_module_load_order_corruption(fresh_workspace):
     """Same end-to-end sanity for the standard profile tool."""
-    from lollms_client.tools_bindings.lcp.default_tools.execute_python import execute_python as ep
+    from lollms_client.tools_bindings.lcp.default_tools.execute_python import TOOLS as ep
     from lollms_client.tools_bindings.lcp.default_tools.execute_python import sandbox_kernel as sk
 
     ep._TRUE_COMPILE = sk._make_block_stub()

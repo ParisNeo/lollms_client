@@ -259,7 +259,7 @@ class TestLollmsArtifactTools(unittest.TestCase):
         import os
         original_cwd = os.getcwd()
         os.chdir(self.discussion.workspace_data_path)
-        from lollms_client.tools_bindings.lcp.default_tools.execute_sql_query.execute_sql_query import tool_execute_sql_query
+        from lollms_client.tools_bindings.lcp.default_tools.execute_sql_query.TOOLS import tool_execute_sql_query
         sql_res = tool_execute_sql_query(
             sql_query="SELECT name FROM employees WHERE role = 'Architect'",
             file_name="my_external_db.sqlconn"
@@ -269,7 +269,7 @@ class TestLollmsArtifactTools(unittest.TestCase):
         self.assertIn("Eve", sql_res["output"])
 
         # 6. Test LCP Python Sandbox on .sqlconn
-        from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.execute_python_data_query import tool_execute_python_data_query
+        from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.TOOLS import tool_execute_python_data_query
 
         py_code = (
             "import pandas as pd\n"
@@ -326,7 +326,7 @@ class TestLollmsArtifactTools(unittest.TestCase):
         ai_msg = self.discussion.add_message(sender="assistant", content="Analyzing")
 
         # 3. Test LCP SQL Query Tool
-        from lollms_client.tools_bindings.lcp.default_tools.execute_sql_query.execute_sql_query import tool_execute_sql_query
+        from lollms_client.tools_bindings.lcp.default_tools.execute_sql_query.TOOLS import tool_execute_sql_query
 
         import os
         original_cwd = os.getcwd()
@@ -341,7 +341,7 @@ class TestLollmsArtifactTools(unittest.TestCase):
         self.assertIn("Charlie", sql_res["output"])
 
         # 4. Test LCP Python Data Query Tool
-        from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.execute_python_data_query import tool_execute_python_data_query
+        from lollms_client.tools_bindings.lcp.default_tools.execute_python_data_query.TOOLS import tool_execute_python_data_query
 
         original_cwd = os.getcwd()
         os.chdir(self.discussion.workspace_data_path)

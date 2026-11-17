@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 openpyxl = pytest.importorskip("openpyxl")
 
 
-from lollms_client.tools_bindings.lcp.default_tools.excel_tools.excel_tools import (
+from lollms_client.tools_bindings.lcp.default_tools.excel_tools.TOOLS import (
     tool_build_excel,
     tool_read_excel,
 )
@@ -107,6 +107,7 @@ class TestExcelToolBuild(unittest.TestCase):
 
         read_result = tool_read_excel(
             file="inventory_source.xlsx",
+            mode="inventory",
             discussion_instance=self.discussion,
         )
         self.assertTrue(read_result.get("success"), f"read failed: {read_result.get('error')}")

@@ -35,7 +35,7 @@ import pytest
 def _import_modules():
     try:
         from lollms_client.tools_bindings.lcp.default_tools.execute_python import (
-            execute_python as ep,
+            TOOLS as ep,
         )
         from lollms_client.tools_bindings.lcp.default_tools.execute_python import (
             sandbox_kernel as sk,
@@ -47,7 +47,7 @@ def _import_modules():
         if str(repo_src) not in sys.path:
             sys.path.insert(0, str(repo_src))
         from lollms_client.tools_bindings.lcp.default_tools.execute_python import (  # type: ignore
-            execute_python as ep,
+            TOOLS as ep,
         )
         from lollms_client.tools_bindings.lcp.default_tools.execute_python import (  # type: ignore
             sandbox_kernel as sk,
