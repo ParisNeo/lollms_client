@@ -8358,11 +8358,31 @@ class ChatMixin:
         # that are guaranteed to fail at dispatch time. The gate therefore
         # requires a LIVE binding with the required callable(s).
         _tti_binding = getattr(self.lollmsClient, 'tti', None)
-        _has_tti = (
+        _tti_live = (
             _tti_binding is not None
             and callable(getattr(_tti_binding, 'generate_image', None))
         )
-        _has_tti_edit = _has_tti and callable(getattr(_tti_binding, 'edit_image', None))
+        # ── 🖼️ TTI AVAILABILITY GATE (PROFILE-AWARE, FAIL-CLOSED ON CAPABILITY) ──
+        # A registered TTI model profile in `tti_model_profiles_registry` is the
+        # user's explicit declaration that image generation is configured. The
+        # `client.tti` binding is created LAZILY and may legitimately be None on
+        # the first turn (or when the profile is present but the binding factory
+        # has not yet materialized it). Gating doctrine solely on a live callable
+        # therefore SILENTLY WITHHOLDS the image-generation/editing instructions
+        # even though the user configured a TTI model — the model never learns
+        # the tag vocabulary and image tools "disappear" from the discussion.
+        # We therefore treat EITHER signal as sufficient:
+        #   • a live binding with a callable generate_image (strongest), OR
+        #   • a non-empty TTI model profile registry (user-declared intent).
+        # The dispatcher in _StreamState remains authoritative at dispatch time:
+        # if the binding is truly unusable it degrades to a warning, never a crash.
+        _tti_registry = getattr(self.lollmsClient, 'tti_model_profiles_registry', None)
+        _tti_profile_configured = bool(_tti_registry)
+        _has_tti = _tti_live or _tti_profile_configured
+        _has_tti_edit = _has_tti and (
+            not _tti_live
+            or callable(getattr(_tti_binding, 'edit_image', None))
+        )
         if (enable_image_generation or (enable_image_editing and _has_tti_edit)) and _has_tti and not orchestrator_persona:
             extra_instructions += self._build_image_generation_instructions()
             # ── 🖼️ IMAGE EDIT DOCTRINE (EDIT vs GENERATE DECISION) ──
@@ -13838,9 +13858,17 @@ class ChatMixin:
         # Report capability only when a live, callable binding exists —
         # mirrors the fail-closed doctrine used for context injection.
         _tti_binding_final = getattr(self.lollmsClient, 'tti', None)
-        _has_tti = (
+        _tti_live_final = (
             _tti_binding_final is not None
             and callable(getattr(_tti_binding_final, 'generate_image', None))
+        )
+        # Return-value capability report mirrors the injection gate: a
+        # registered TTI profile is a first-class signal that image generation
+        # is configured, so callers relying on `tti_available` to build their UI
+        # (or to enable the tag buttons) are not misled when the lazy binding
+        # has not yet materialized.
+        _has_tti = _tti_live_final or bool(
+            getattr(self.lollmsClient, 'tti_model_profiles_registry', None)
         )
 
         all_turn_artefacts = []
