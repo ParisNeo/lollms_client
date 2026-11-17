@@ -171,7 +171,8 @@ _TAG_STARTS = [
     "<tool>",
     "</arg_key>", "<think ",
     "<artifact", "<artefact",
-    "<generate_image", "<edit_image", "<generate_video",
+    "<generate_image", "<edit_image", "<generate_video", "<edit_video",
+    "<generate_music", "<edit_music", "<synthesize_speech",
     "<note", "<skill", "<toolset", "<scratchpad",
     "<lollms_inline",
     "<lollms_form",
@@ -203,6 +204,16 @@ _SECONDARY_TAG_MAP = {
     "<toolset":       ("toolset_start",       MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</toolset>"),
     "<lollms_inline": ("inline_widget_start", MSG_TYPE.MSG_TYPE_WIDGET_CHUNK,   MSG_TYPE.MSG_TYPE_WIDGET_DONE,       "</lollms_inline>"),
     "<lollms_form":   ("form_start",          MSG_TYPE.MSG_TYPE_FORM_READY,     MSG_TYPE.MSG_TYPE_FORM_READY,        "</lollms_form>"),
+    "<generate_video": ("video_start",        MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</generate_video>"),
+    "<edit_video":     ("video_start",        MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</edit_video>"),
+    "<generate_music": ("music_start",        MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</generate_music>"),
+    "<edit_music":     ("music_start",        MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</edit_music>"),
+    "<synthesize_speech": ("speech_start",    MSG_TYPE.MSG_TYPE_ARTEFACT_CHUNK, MSG_TYPE.MSG_TYPE_ARTEFACT_DONE,    "</synthesize_speech>"),
+    "<generate_video": ("video_generation_start", MSG_TYPE.MSG_TYPE_INFO, MSG_TYPE.MSG_TYPE_INFO,                "</generate_video>"),
+    "<edit_video":    ("video_editing_start", MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</edit_video>"),
+    "<generate_music": ("music_generation_start", MSG_TYPE.MSG_TYPE_INFO,       MSG_TYPE.MSG_TYPE_INFO,              "</generate_music>"),
+    "<edit_music":    ("music_editing_start", MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</edit_music>"),
+    "<synthesize_speech": ("speech_synthesis_start", MSG_TYPE.MSG_TYPE_INFO,    MSG_TYPE.MSG_TYPE_INFO,              "</synthesize_speech>"),
     "<mem_new":       ("memory_new",          MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</mem_new>"),
     "<mem_update":    ("memory_update",       MSG_TYPE.MSG_TYPE_INFO,           MSG_TYPE.MSG_TYPE_INFO,              "</mem_update>"),
     "<think>":        ("thought_start",       MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK,  MSG_TYPE.MSG_TYPE_INFO,              "</think>"),
@@ -218,7 +229,12 @@ _NO_PROCESSING_BLOCK_TAGS = {
     "hide_file",
     "agent",
     "lollms_form",
-    "lollms_inline"
+    "lollms_inline",
+    "generate_video",
+    "edit_video",
+    "generate_music",
+    "edit_music",
+    "synthesize_speech",
 }
 
 
@@ -1816,7 +1832,7 @@ class _StreamState:
         if not is_inside_thoughts and not self._is_accumulating_tool and not self.artefact_tracker.is_inside_artefact and not self._is_accumulating_secondary and not self._in_code_fence:
             inline_tag_found = False
             line_start_tag_found = False
-            for tag_prefix in ("<artifact", "<artefact", "<tool", "<note", "<skill", "<toolset", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<generate_video", "<unlock_file", "<lock_file", "<hide_file"):
+            for tag_prefix in ("<artifact", "<artefact", "<tool", "<note", "<skill", "<toolset", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<generate_video", "<edit_video", "<generate_music", "<edit_music", "<synthesize_speech", "<unlock_file", "<lock_file", "<hide_file"):
                 idx = self._pending_buffer.find(tag_prefix)
                 if idx == -1:
                     continue
@@ -2393,7 +2409,7 @@ class _StreamState:
                         full_match_text
                     )
 
-                if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image", "generate_video", "lollms_form", "lollms_inline"):
+                if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image", "generate_video", "edit_video", "generate_music", "edit_music", "synthesize_speech", "lollms_form", "lollms_inline"):
                         if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                             proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
                             self.ai_message.content += proc_close_tag
@@ -2421,7 +2437,7 @@ class _StreamState:
         if not is_inside_thoughts and not self._is_accumulating_secondary:
             lower_buffer = self._pending_buffer.lower()
             secondary_entered = False
-            for tag_prefix in ("<agent", "<delegate", "<skill", "<toolset", "<note", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<generate_video"):
+            for tag_prefix in ("<agent", "<delegate", "<skill", "<toolset", "<note", "<scratchpad", "<lollms_form", "<generate_image", "<edit_image", "<generate_video", "<edit_video", "<generate_music", "<edit_music", "<synthesize_speech"):
                 pattern = r'(?m)^\s*(?!`)(?!.*\|)' + re.escape(tag_prefix)
                 open_match = re.search(pattern, lower_buffer)
                 if open_match:
@@ -2595,10 +2611,12 @@ class _StreamState:
             # leak this parser gate exists to prevent.
             tags_to_check = [
                 "<artifact", "<artefact", "<tool", "<think", "<note", "<skill", "<toolset", "<scratchpad", 
-                "<generate_image", "<edit_image", "<generate_video", "<lollms_form", "<unlock_file", "<lock_file", "<hide_file",
+                "<generate_image", "<edit_image", "<generate_video", "<edit_video",
+                "<generate_image", "<edit_image", "<generate_video", "<edit_video", "<generate_music", "<edit_music", "<synthesize_speech", "<lollms_form", "<unlock_file", "<lock_file", "<hide_file",
                 "<mem_new", "<mem_update", "<mem_tag", "<mem_load", "<mem_delete", "<mem_search",
                 "</artifact", "</artefact", "</tool", "</note", "</skill", "</toolset", "</scratchpad",
-                "</lollms_form", "</lollms_inline", "</generate_image", "</edit_image", "</generate_video",
+                "</lollms_form", "</lollms_inline", "</generate_image", "</edit_image", "</generate_video", "</edit_video", "</generate_music", "</edit_music", "</synthesize_speech",
+                "</edit_video", "</generate_music", "</edit_music", "</synthesize_speech",
                 "</unlock_file", "</lock_file", "</hide_file",
                 "</mem_new", "</mem_update", "</mem_tag", "</mem_load", "</mem_delete", "</mem_search", "</mem_rel",
             ]
@@ -3919,6 +3937,38 @@ class _StreamState:
                 return True
             return self._handle_generate_video_tag(attrs_str, body)
 
+        elif tag_name == "edit_video":
+            if not self.enable_artefacts:
+                return True
+            return self._handle_edit_video_tag(attrs_str, body)
+
+        elif tag_name == "generate_music":
+            if not self.enable_artefacts:
+                return True
+            return self._handle_generate_music_tag(attrs_str, body)
+
+        elif tag_name == "edit_music":
+            if not self.enable_artefacts:
+                return True
+            return self._handle_edit_music_tag(attrs_str, body)
+
+        elif tag_name == "synthesize_speech":
+            if not self.enable_artefacts:
+                return True
+            return self._handle_synthesize_speech_tag(attrs_str, body)
+
+        # 5c. Video Editing / Music / Speech Synthesis (Intercepted during streaming)
+        elif tag_name in ("edit_video", "generate_music", "edit_music", "synthesize_speech"):
+            if not self.enable_artefacts:
+                return True
+            if tag_name == "edit_video":
+                return self._handle_edit_video_tag(attrs_str, body)
+            if tag_name == "generate_music":
+                return self._handle_generate_music_tag(attrs_str, body)
+            if tag_name == "edit_music":
+                return self._handle_edit_music_tag(attrs_str, body)
+            return self._handle_synthesize_speech_tag(attrs_str, body)
+
         # 6. Image Generation / Editing (Intercepted during streaming)
         elif tag_name in ("generate_image", "edit_image"):
             if not self.enable_artefacts:
@@ -4797,6 +4847,987 @@ class _StreamState:
             ASCIIColors.error(f"[generate_video] Failed to create video artefact: {ex}")
             return True
 
+    def _decode_media_bytes(self, result: Any, media_prefix: str) -> Optional[bytes]:
+        """Normalizes a media engine result (bytes / base64 str / dict) to raw bytes.
+
+        Returns None when the payload is absent or undecodable. Never raises.
+        """
+        try:
+            if isinstance(result, (bytes, bytearray)):
+                return bytes(result)
+            if isinstance(result, str) and result.strip():
+                return base64.b64decode(
+                    re.sub(rf'^data:{media_prefix}/[^;]+;base64,', '', result.strip())
+                )
+            if isinstance(result, dict):
+                for key in ("video", "video_bytes", "audio", "audio_bytes", "bytes", "data", "b64"):
+                    value = result.get(key)
+                    if isinstance(value, (bytes, bytearray)):
+                        return bytes(value)
+                    if isinstance(value, str) and value.strip():
+                        return base64.b64decode(
+                            re.sub(rf'^data:{media_prefix}/[^;]+;base64,', '', value.strip())
+                        )
+        except Exception:
+            return None
+        return None
+
+    def _persist_media_artifact(
+        self,
+        media_bytes: bytes,
+        rel_name: str,
+        media_kind: str,
+        default_ext: str,
+        prompt_summary: str,
+        anchor_label: str,
+    ) -> bool:
+        """Writes media bytes to the workspace, registers a metadata-card artefact,
+        and emits the processing/UI events. Returns True on success."""
+        safe_name = (rel_name or "").replace("\\", "/").strip().lstrip("/")
+        if not safe_name:
+            safe_name = f"{media_kind}_{uuid.uuid4().hex[:8]}{default_ext}"
+        if not Path(safe_name).suffix:
+            safe_name = f"{safe_name}{default_ext}"
+
+        ws_root = _resolve_tool_workspace_root(self.discussion)
+        disk_path = ws_root / safe_name
+        disk_write_error = None
+        try:
+            disk_path.parent.mkdir(parents=True, exist_ok=True)
+            disk_path.write_bytes(media_bytes)
+        except Exception as write_ex:
+            disk_write_error = _sanitize_host_paths(str(write_ex))
+            ASCIIColors.warning(
+                f"[StreamState] Failed to write {media_kind} '{safe_name}' to disk: {disk_write_error}"
+            )
+
+        meta_card = (
+            f"### {media_kind.capitalize()}: `{safe_name}`\n\n"
+            f"Generated via the {media_kind} engine.\n"
+            f"- **Type**: {media_kind.capitalize()} (AS-IS physical artefact)\n"
+            f"- **Prompt**: {(prompt_summary or '')[:200]}\n"
+            f"- **Location**: `./{safe_name}`\n\n"
+            f"> **Action**: Reference this file in your answer with `./{safe_name}`."
+        )
+        try:
+            art = self.discussion.artefacts.add(
+                title=safe_name,
+                artefact_type=("video" if media_kind == "video" else "audio"),
+                content=meta_card,
+                file_ext=Path(safe_name).suffix,
+                version=1,
+                read_only=False,
+                physical_data=(media_bytes if disk_write_error is None else None),
+                logical_content=meta_card,
+            )
+        except Exception as persist_ex:
+            ASCIIColors.warning(
+                f"[StreamState] {media_kind.capitalize()} file '{safe_name}' was written to disk "
+                f"but artefact registration failed: {persist_ex}"
+            )
+            art = None
+
+        if disk_write_error is None:
+            self._bump_workspace_revision()
+        if art:
+            if not hasattr(self, "affected_artefacts"):
+                self.affected_artefacts = []
+            self.affected_artefacts.append(art)
+            turn_arts = getattr(self.discussion, "_affected_artefacts_this_turn", None)
+            if isinstance(turn_arts, list):
+                turn_arts.append(art)
+            if getattr(self.discussion, "_turn_actions_log", None) is not None:
+                self.discussion._turn_actions_log.append({
+                    "action": "artifact_created",
+                    "title": safe_name,
+                    "type": media_kind,
+                    "round": getattr(self.discussion, "_current_round", 0),
+                })
+            if getattr(self.discussion, "_is_db_backed", False):
+                try:
+                    self.discussion.commit()
+                except Exception:
+                    pass
+
+        if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+            saved_to = f"`./{safe_name}`" if disk_write_error is None else "the artefact store (disk write failed)"
+            result_block = (
+                f"* ✅ {media_kind.capitalize()} '{safe_name}' generated and saved to {saved_to}.\n"
+                f"<!-- status:success -->\n</processing>\n"
+            )
+            self.ai_message.content += result_block
+            _cb(self.callback, result_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            self._processing_block_open = False
+
+        anchor = f"[{anchor_label} {Path(safe_name).stem}](./{safe_name})"
+        self.ai_message.content += f"\n\n{anchor}\n"
+        _cb(self.callback, f"\n\n{anchor}\n", MSG_TYPE.MSG_TYPE_CHUNK)
+
+        if self.event_mode.has_callbacks:
+            _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                "type": "artifact_created",
+                "title": safe_name,
+                "art_type": media_kind,
+            })
+        return disk_write_error is None
+
+    def _emit_media_failure(self, media_label: str, rel_name: str, reason: str) -> None:
+        """Emits a failure processing block for a media dispatch. Never raises."""
+        if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+            failure_block = (
+                f"\n* ❌ {media_label} '{rel_name}' could not be generated. Reason: {reason}\n"
+                f"<!-- status:failure -->\n</processing>\n"
+            )
+            self.ai_message.content += failure_block
+            _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+            self._processing_block_open = False
+
+    def _handle_edit_video_tag(self, tag_str: str, body: str) -> bool:
+        """Handles a closed <edit_video> tag: TTV edit → artefact persistence."""
+        try:
+            attrs = {m.group(1): m.group(2) for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', tag_str)}
+            source = (attrs.get("source") or attrs.get("sources") or "").strip()
+            raw_name = attrs.get("name") or attrs.get("title") or f"edited_video_{uuid.uuid4().hex[:8]}.mp4"
+            prompt = (body or "").strip()
+
+            client = getattr(self.discussion, "lollmsClient", None) or getattr(self.discussion, "lollms_client", None)
+            ttv = getattr(client, "ttv", None)
+            if ttv is None or not callable(getattr(ttv, "edit_video", None)):
+                self._emit_media_failure(
+                    "Video edit", raw_name,
+                    "no video editing engine is available in this session.",
+                )
+                return True
+            if not source:
+                self._emit_media_failure("Video edit", raw_name, "no `source` video was specified.")
+                return True
+            if not prompt:
+                self._emit_media_failure("Video edit", raw_name, "no editing instructions were provided.")
+                return True
+
+            ws_root = _resolve_tool_workspace_root(self.discussion)
+            source_path = ws_root / source.replace("\\", "/").strip().lstrip("/")
+            if not source_path.is_file():
+                self._emit_media_failure(
+                    "Video edit", raw_name,
+                    f"source video '{source}' was not found in the workspace.",
+                )
+                return True
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                status_line = f"* 🎬 Editing video '{raw_name}' from '{source}'...\nPrompt:{prompt}\n"
+                self.ai_message.content += status_line
+                _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = True
+
+            generation_error = None
+            video_bytes: Optional[bytes] = None
+            try:
+                result = ttv.edit_video(source_path.read_bytes(), prompt)
+                video_bytes = self._decode_media_bytes(result, "video")
+            except Exception as edit_ex:
+                trace_exception(edit_ex)
+                generation_error = _sanitize_host_paths(str(edit_ex))
+
+            if not video_bytes:
+                self._emit_media_failure(
+                    "Video edit", raw_name,
+                    generation_error or "the video editor returned no usable data.",
+                )
+                return True
+
+            self._persist_media_artifact(video_bytes, raw_name, "video", ".mp4", prompt, "🎬")
+            return True
+        except Exception as ex:
+            trace_exception(ex)
+            ASCIIColors.error(f"[edit_video] Failed to create video artefact: {ex}")
+            return True
+
+    def _handle_generate_music_tag(self, tag_str: str, body: str) -> bool:
+        """Handles a closed <generate_music> tag: TTM generate → artefact persistence."""
+        try:
+            attrs = {m.group(1): m.group(2) for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', tag_str)}
+            raw_name = attrs.get("name") or attrs.get("title") or f"music_{uuid.uuid4().hex[:8]}.mp3"
+            prompt = (body or "").strip()
+
+            client = getattr(self.discussion, "lollmsClient", None) or getattr(self.discussion, "lollms_client", None)
+            ttm = getattr(client, "ttm", None)
+            if ttm is None or not callable(getattr(ttm, "generate_music", None)):
+                self._emit_media_failure(
+                    "Music generation", raw_name,
+                    "no music engine is available in this session.",
+                )
+                return True
+
+            gen_kwargs: Dict[str, Any] = {}
+            for int_key in ("duration", "seed", "num_inference_steps"):
+                if int_key in attrs:
+                    try:
+                        gen_kwargs[int_key] = int(attrs[int_key])
+                    except (TypeError, ValueError):
+                        pass
+            if attrs.get("instrumental", "").lower() in ("true", "1", "yes"):
+                gen_kwargs["instrumental"] = True
+            if attrs.get("negative_prompt"):
+                gen_kwargs["negative_prompt"] = attrs["negative_prompt"]
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                status_line = f"* 🎵 Generating music '{raw_name}'...\nPrompt:{prompt}\n"
+                self.ai_message.content += status_line
+                _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = True
+
+            generation_error = None
+            audio_bytes: Optional[bytes] = None
+            try:
+                result = ttm.generate_music(prompt, **gen_kwargs)
+                audio_bytes = self._decode_media_bytes(result, "audio")
+            except Exception as gen_ex:
+                trace_exception(gen_ex)
+                generation_error = _sanitize_host_paths(str(gen_ex))
+
+            if not audio_bytes:
+                self._emit_media_failure(
+                    "Music generation", raw_name,
+                    generation_error or "the music engine returned no usable data.",
+                )
+                return True
+
+            self._persist_media_artifact(audio_bytes, raw_name, "audio", ".mp3", prompt, "🎵")
+            return True
+        except Exception as ex:
+            trace_exception(ex)
+            ASCIIColors.error(f"[generate_music] Failed to create audio artefact: {ex}")
+            return True
+
+    def _handle_edit_music_tag(self, tag_str: str, body: str) -> bool:
+        """Handles a closed <edit_music> tag: TTM edit → artefact persistence."""
+        try:
+            attrs = {m.group(1): m.group(2) for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', tag_str)}
+            source = (attrs.get("source") or attrs.get("sources") or "").strip()
+            raw_name = attrs.get("name") or attrs.get("title") or f"edited_music_{uuid.uuid4().hex[:8]}.mp3"
+            prompt = (body or "").strip()
+
+            client = getattr(self.discussion, "lollmsClient", None) or getattr(self.discussion, "lollms_client", None)
+            ttm = getattr(client, "ttm", None)
+            if ttm is None or not callable(getattr(ttm, "edit_music", None)):
+                self._emit_media_failure(
+                    "Music edit", raw_name,
+                    "no music editing engine is available in this session.",
+                )
+                return True
+            if not source:
+                self._emit_media_failure("Music edit", raw_name, "no `source` audio was specified.")
+                return True
+            if not prompt:
+                self._emit_media_failure("Music edit", raw_name, "no editing instructions were provided.")
+                return True
+
+            ws_root = _resolve_tool_workspace_root(self.discussion)
+            source_path = ws_root / source.replace("\\", "/").strip().lstrip("/")
+            if not source_path.is_file():
+                self._emit_media_failure(
+                    "Music edit", raw_name,
+                    f"source audio '{source}' was not found in the workspace.",
+                )
+                return True
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                status_line = f"* 🎵 Editing music '{raw_name}' from '{source}'...\nPrompt:{prompt}\n"
+                self.ai_message.content += status_line
+                _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = True
+
+            generation_error = None
+            audio_bytes: Optional[bytes] = None
+            try:
+                result = ttm.edit_music(source_path.read_bytes(), prompt)
+                audio_bytes = self._decode_media_bytes(result, "audio")
+            except Exception as edit_ex:
+                trace_exception(edit_ex)
+                generation_error = _sanitize_host_paths(str(edit_ex))
+
+            if not audio_bytes:
+                self._emit_media_failure(
+                    "Music edit", raw_name,
+                    generation_error or "the music editor returned no usable data.",
+                )
+                return True
+
+            self._persist_media_artifact(audio_bytes, raw_name, "audio", ".mp3", prompt, "🎵")
+            return True
+        except Exception as ex:
+            trace_exception(ex)
+            ASCIIColors.error(f"[edit_music] Failed to create audio artefact: {ex}")
+            return True
+
+    def _handle_synthesize_speech_tag(self, tag_str: str, body: str) -> bool:
+        """Handles a closed <synthesize_speech> tag: TTS call → artefact persistence."""
+        try:
+            attrs = {m.group(1): m.group(2) for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', tag_str)}
+            raw_name = attrs.get("name") or attrs.get("title") or f"speech_{uuid.uuid4().hex[:8]}.mp3"
+            text = (body or "").strip()
+
+            client = getattr(self.discussion, "lollmsClient", None) or getattr(self.discussion, "lollms_client", None)
+            tts = getattr(client, "tts", None)
+            if tts is None or not callable(getattr(tts, "generate_speech", None)):
+                self._emit_media_failure(
+                    "Speech synthesis", raw_name,
+                    "no speech synthesis engine is available in this session.",
+                )
+                return True
+            if not text:
+                self._emit_media_failure("Speech synthesis", raw_name, "no text to speak was provided.")
+                return True
+
+            gen_kwargs: Dict[str, Any] = {}
+            voice = (attrs.get("voice") or "").strip()
+            if voice:
+                gen_kwargs["voice"] = voice
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                status_line = f"* 🔊 Synthesizing speech '{raw_name}'...\n"
+                self.ai_message.content += status_line
+                _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = True
+
+            generation_error = None
+            audio_bytes: Optional[bytes] = None
+            try:
+                result = tts.generate_speech(text, **gen_kwargs)
+                audio_bytes = self._decode_media_bytes(result, "audio")
+            except Exception as gen_ex:
+                trace_exception(gen_ex)
+                generation_error = _sanitize_host_paths(str(gen_ex))
+
+            if not audio_bytes:
+                self._emit_media_failure(
+                    "Speech synthesis", raw_name,
+                    generation_error or "the speech engine returned no usable data.",
+                )
+                return True
+
+            self._persist_media_artifact(audio_bytes, raw_name, "audio", ".mp3", text, "🔊")
+            return True
+        except Exception as ex:
+            trace_exception(ex)
+            ASCIIColors.error(f"[synthesize_speech] Failed to create audio artefact: {ex}")
+            return True
+
+    def _handle_edit_video_tag(self, tag_str: str, body: str) -> bool:
+        """Handles a closed <edit_video> tag: TTV edit_video call → artefact persistence.
+
+        Defensive by contract: never raises. TTV absence/failure degrades to a
+        warning + return.
+        """
+        try:
+            attrs = {m.group(1): m.group(2) for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', tag_str)}
+            raw_name = attrs.get("name") or attrs.get("title")
+            if not raw_name:
+                sanitized_body = re.sub(r'[^a-zA-Z0-9_-]+', '_', (body or "").strip())[:24].strip('_')
+                raw_name = (sanitized_body or f"edited_video_{uuid.uuid4().hex[:8]}") + ".mp4"
+            if not raw_name.lower().endswith((".mp4", ".webm", ".mov", ".gif")):
+                raw_name = raw_name + ".mp4"
+            prompt = (body or "").strip()
+
+            disc = self.discussion
+            client = getattr(disc, "lollmsClient", None) or getattr(disc, "lollms_client", None)
+            ttv = getattr(client, "ttv", None)
+            if ttv is None or not callable(getattr(ttv, "edit_video", None)):
+                ASCIIColors.warning(
+                    "[edit_video] No usable TTV binding with edit_video — video editing skipped."
+                )
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    failure_block = (
+                        f"\n* ⚠️ Video edit requested ('{raw_name}'), but no video editor is "
+                        f"available in this session. Nothing was modified.\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += failure_block
+                    _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                return True
+
+            if not prompt:
+                failure_block = (
+                    f"\n* ⚠️ Video edit requested ('{raw_name}'), but no editing instructions were "
+                    f"provided inside the tag. Nothing was modified.\n"
+                    f"<!-- status:failure -->\n</processing>\n"
+                )
+                self.ai_message.content += failure_block
+                _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = False
+                return True
+
+            # Resolve source video reference (path or attribute)
+            source_ref = (attrs.get("source") or attrs.get("sources") or attrs.get("video") or "").strip()
+            ws_root = _resolve_tool_workspace_root(disc)
+            source_path: Optional[str] = None
+            if source_ref:
+                candidate = (ws_root / source_ref.replace("\\", "/").lstrip("/")).resolve()
+                if str(candidate).startswith(str(ws_root)) and candidate.is_file():
+                    source_path = str(candidate)
+            if source_path is None:
+                failure_block = (
+                    f"\n* ⚠️ Video edit requested ('{raw_name}'), but the source video "
+                    f"'{source_ref or '<not specified>'}' was not found in the workspace.\n"
+                    f"<!-- status:failure -->\n</processing>\n"
+                )
+                self.ai_message.content += failure_block
+                _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = False
+                return True
+
+            gen_kwargs: Dict[str, Any] = {}
+            for int_key in ("duration", "width", "height", "fps", "seed"):
+                if int_key in attrs:
+                    try:
+                        gen_kwargs[int_key] = int(attrs[int_key])
+                    except (TypeError, ValueError):
+                        pass
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                status_line = (
+                    f"* 🎬 Editing video '{raw_name}' from '{source_ref}' via the video engine...\n"
+                    f"Prompt:{prompt}\n"
+                )
+                self.ai_message.content += status_line
+                _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = True
+
+            video_bytes: Optional[bytes] = None
+            generation_error: Optional[str] = None
+            try:
+                result = ttv.edit_video(video=source_path, prompt=prompt, **gen_kwargs)
+                if isinstance(result, (bytes, bytearray)):
+                    video_bytes = bytes(result)
+                elif isinstance(result, str) and result.strip():
+                    video_bytes = base64.b64decode(re.sub(r'^data:video/[^;]+;base64,', '', result.strip()))
+                elif isinstance(result, dict):
+                    for key in ("video", "video_bytes", "bytes", "data", "b64"):
+                        value = result.get(key)
+                        if isinstance(value, (bytes, bytearray)):
+                            video_bytes = bytes(value)
+                            break
+                        if isinstance(value, str) and value.strip():
+                            video_bytes = base64.b64decode(
+                                re.sub(r'^data:video/[^;]+;base64,', '', value.strip())
+                            )
+                            break
+            except Exception as gen_ex:
+                trace_exception(gen_ex)
+                generation_error = _sanitize_host_paths(str(gen_ex))
+
+            if not video_bytes:
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    reason = generation_error or "The video engine returned no data."
+                    failure_block = (
+                        f"\n* ❌ Edited video '{raw_name}' could not be produced. Reason: {reason}\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += failure_block
+                    _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                return True
+
+            video_rel_path = raw_name.replace("\\", "/").strip().lstrip("/")
+            video_disk_path = ws_root / video_rel_path
+            disk_write_error = None
+            try:
+                video_disk_path.parent.mkdir(parents=True, exist_ok=True)
+                video_disk_path.write_bytes(video_bytes)
+            except Exception as write_ex:
+                disk_write_error = _sanitize_host_paths(str(write_ex))
+                ASCIIColors.warning(
+                    f"[edit_video] Failed to write video '{video_rel_path}' to disk: {disk_write_error}"
+                )
+
+            meta_card = (
+                f"### Video: `{video_rel_path}`\n\n"
+                f"Edited via the video engine from `{source_ref}`.\n"
+                f"- **Type**: Video (AS-IS physical artefact)\n"
+                f"- **Prompt**: {prompt[:200]}\n"
+                f"- **Location**: `./{video_rel_path}`\n\n"
+                f"> **Action**: The video is saved in the workspace. Reference it directly in your "
+                f"answer with `[video](./{video_rel_path})` or `./{video_rel_path}` (plain path)."
+            )
+
+            art = disc.artefacts.add(
+                title=video_rel_path,
+                artefact_type="video",
+                content=meta_card,
+                file_ext=Path(video_rel_path).suffix or ".mp4",
+                version=1,
+                read_only=False,
+                physical_data=video_bytes if disk_write_error is None else None,
+                logical_content=meta_card,
+            )
+            if disk_write_error is None:
+                self._bump_workspace_revision()
+            if art:
+                if not hasattr(self, "affected_artefacts"):
+                    self.affected_artefacts = []
+                self.affected_artefacts.append(art)
+                turn_arts = getattr(disc, "_affected_artefacts_this_turn", None)
+                if isinstance(turn_arts, list):
+                    turn_arts.append(art)
+                if getattr(disc, "_turn_actions_log", None) is not None:
+                    disc._turn_actions_log.append({
+                        "action": "artifact_created",
+                        "title": video_rel_path,
+                        "type": "video",
+                        "round": getattr(disc, "_current_round", 0),
+                    })
+                if getattr(disc, "_is_db_backed", False):
+                    try:
+                        disc.commit()
+                    except Exception:
+                        pass
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                saved_to = f"`./{video_rel_path}`" if disk_write_error is None else "the artefact store (disk write failed)"
+                result_block = (
+                    f"* ✅ Edited video '{video_rel_path}' saved to {saved_to}.\n"
+                    f"<!-- status:success -->\n</processing>\n"
+                )
+                self.ai_message.content += result_block
+                _cb(self.callback, result_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = False
+
+            anchor = f"[🎬 {Path(video_rel_path).stem}](./{video_rel_path})"
+            self.ai_message.content += f"\n\n{anchor}\n"
+            _cb(self.callback, f"\n\n{anchor}\n", MSG_TYPE.MSG_TYPE_CHUNK)
+
+            if self.event_mode.has_callbacks:
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                    "type": "artifact_created",
+                    "title": video_rel_path,
+                    "art_type": "video",
+                })
+            return True
+        except Exception as ex:
+            trace_exception(ex)
+            ASCIIColors.error(f"[edit_video] Failed to create video artefact: {ex}")
+            return True
+
+    def _handle_generate_music_tag(self, tag_str: str, body: str) -> bool:
+        """Handles a closed <generate_music> tag: TTM call → artefact persistence."""
+        return self._persist_music_tag(
+            tag_str, body, kind="generate",
+            default_stem="generated_music", verb_present="music", verb_past="generated",
+        )
+
+    def _handle_edit_music_tag(self, tag_str: str, body: str) -> bool:
+        """Handles a closed <edit_music> tag: TTM edit call → artefact persistence."""
+        return self._persist_music_tag(
+            tag_str, body, kind="edit",
+            default_stem="edited_music", verb_present="music editor", verb_past="edited",
+        )
+
+    def _persist_music_tag(
+        self,
+        tag_str: str,
+        body: str,
+        kind: str,
+        default_stem: str,
+        verb_present: str,
+        verb_past: str,
+    ) -> bool:
+        """Shared handler for <generate_music>/<edit_music>.
+
+        `kind` selects the TTM callable: `generate` → generate_music,
+        `edit` → edit_music. Both follow the AS-IS doctrine (disk is the
+        source of truth; DB record is a metadata card). Defensive: never raises.
+        """
+        try:
+            attrs = {m.group(1): m.group(2) for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', tag_str)}
+            raw_name = attrs.get("name") or attrs.get("title")
+            if not raw_name:
+                sanitized_body = re.sub(r'[^a-zA-Z0-9_-]+', '_', (body or "").strip())[:24].strip('_')
+                raw_name = (sanitized_body or f"{default_stem}_{uuid.uuid4().hex[:8]}") + ".wav"
+            if not raw_name.lower().endswith((".wav", ".mp3", ".flac", ".ogg", ".m4a")):
+                raw_name = raw_name + ".wav"
+            prompt = (body or "").strip()
+
+            disc = self.discussion
+            client = getattr(disc, "lollmsClient", None) or getattr(disc, "lollms_client", None)
+            ttm = getattr(client, "ttm", None)
+            method_name = "generate_music" if kind == "generate" else "edit_music"
+            callable_method = getattr(ttm, method_name, None) if ttm is not None else None
+
+            if not callable(callable_method):
+                ASCIIColors.warning(
+                    f"[{kind}_music] No usable TTM binding with {method_name} — {verb_present} "
+                    f"operation skipped."
+                )
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    failure_block = (
+                        f"\n* ⚠️ Music {verb_present} requested ('{raw_name}'), but no music engine "
+                        f"is available in this session. Nothing was {verb_past}.\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += failure_block
+                    _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                return True
+
+            if kind == "edit":
+                if not prompt:
+                    failure_block = (
+                        f"\n* ⚠️ Music edit requested ('{raw_name}'), but no editing instructions "
+                        f"were provided inside the tag. Nothing was modified.\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += failure_block
+                    _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                    return True
+                source_ref = (attrs.get("source") or attrs.get("sources") or attrs.get("audio") or "").strip()
+                ws_root = _resolve_tool_workspace_root(disc)
+                source_path: Optional[str] = None
+                if source_ref:
+                    candidate = (ws_root / source_ref.replace("\\", "/").lstrip("/")).resolve()
+                    if str(candidate).startswith(str(ws_root)) and candidate.is_file():
+                        source_path = str(candidate)
+                if source_path is None:
+                    failure_block = (
+                        f"\n* ⚠️ Music edit requested ('{raw_name}'), but the source audio "
+                        f"'{source_ref or '<not specified>'}' was not found in the workspace.\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += failure_block
+                    _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                    return True
+            else:
+                source_path = None
+
+            gen_kwargs: Dict[str, Any] = {}
+            for int_key in ("duration", "seed", "num_inference_steps"):
+                if int_key in attrs:
+                    try:
+                        gen_kwargs[int_key] = int(attrs[int_key])
+                    except (TypeError, ValueError):
+                        pass
+            for str_key in ("genre", "mood", "negative_prompt"):
+                if str_key in attrs:
+                    gen_kwargs[str_key] = attrs[str_key]
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                if kind == "generate":
+                    status_line = (
+                        f"* 🎵 Generating music '{raw_name}' via the music engine...\nPrompt:{prompt}\n"
+                    )
+                else:
+                    status_line = (
+                        f"* 🎵 Editing music '{raw_name}' from '{source_ref}' via the music engine...\n"
+                        f"Prompt:{prompt}\n"
+                    )
+                self.ai_message.content += status_line
+                _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = True
+
+            audio_bytes: Optional[bytes] = None
+            generation_error: Optional[str] = None
+            try:
+                if kind == "generate":
+                    result = callable_method(prompt, **gen_kwargs)
+                else:
+                    result = callable_method(audio=source_path, prompt=prompt, **gen_kwargs)
+
+                if isinstance(result, (bytes, bytearray)):
+                    audio_bytes = bytes(result)
+                elif isinstance(result, str) and result.strip():
+                    audio_bytes = base64.b64decode(
+                        re.sub(r'^data:audio/[^;]+;base64,', '', result.strip())
+                    )
+                elif isinstance(result, dict):
+                    for key in ("audio", "audio_bytes", "bytes", "data", "b64"):
+                        value = result.get(key)
+                        if isinstance(value, (bytes, bytearray)):
+                            audio_bytes = bytes(value)
+                            break
+                        if isinstance(value, str) and value.strip():
+                            audio_bytes = base64.b64decode(
+                                re.sub(r'^data:audio/[^;]+;base64,', '', value.strip())
+                            )
+                            break
+            except Exception as gen_ex:
+                trace_exception(gen_ex)
+                generation_error = _sanitize_host_paths(str(gen_ex))
+
+            if not audio_bytes:
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    reason = generation_error or "The music engine returned no data."
+                    failure_block = (
+                        f"\n* ❌ Music '{raw_name}' could not be {verb_past}. Reason: {reason}\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += failure_block
+                    _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                return True
+
+            ws_root = _resolve_tool_workspace_root(disc)
+            audio_rel_path = raw_name.replace("\\", "/").strip().lstrip("/")
+            audio_disk_path = ws_root / audio_rel_path
+            disk_write_error = None
+            try:
+                audio_disk_path.parent.mkdir(parents=True, exist_ok=True)
+                audio_disk_path.write_bytes(audio_bytes)
+            except Exception as write_ex:
+                disk_write_error = _sanitize_host_paths(str(write_ex))
+                ASCIIColors.warning(
+                    f"[{kind}_music] Failed to write audio '{audio_rel_path}' to disk: {disk_write_error}"
+                )
+
+            meta_card = (
+                f"### Music: `{audio_rel_path}`\n\n"
+                f"{'Generated' if kind == 'generate' else 'Edited'} via the music engine.\n"
+                f"- **Type**: Audio (AS-IS physical artefact)\n"
+                f"- **Prompt**: {prompt[:200]}\n"
+                f"- **Location**: `./{audio_rel_path}`\n\n"
+                f"> **Action**: The audio file is saved in the workspace. Reference it directly in "
+                f"your answer with `[audio](./{audio_rel_path})` or `./{audio_rel_path}` (plain path)."
+            )
+
+            art = disc.artefacts.add(
+                title=audio_rel_path,
+                artefact_type="audio",
+                content=meta_card,
+                file_ext=Path(audio_rel_path).suffix or ".wav",
+                version=1,
+                read_only=False,
+                physical_data=audio_bytes if disk_write_error is None else None,
+                logical_content=meta_card,
+            )
+            if disk_write_error is None:
+                self._bump_workspace_revision()
+            if art:
+                if not hasattr(self, "affected_artefacts"):
+                    self.affected_artefacts = []
+                self.affected_artefacts.append(art)
+                turn_arts = getattr(disc, "_affected_artefacts_this_turn", None)
+                if isinstance(turn_arts, list):
+                    turn_arts.append(art)
+                if getattr(disc, "_turn_actions_log", None) is not None:
+                    disc._turn_actions_log.append({
+                        "action": "artifact_created",
+                        "title": audio_rel_path,
+                        "type": "audio",
+                        "round": getattr(disc, "_current_round", 0),
+                    })
+                if getattr(disc, "_is_db_backed", False):
+                    try:
+                        disc.commit()
+                    except Exception:
+                        pass
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                saved_to = f"`./{audio_rel_path}`" if disk_write_error is None else "the artefact store (disk write failed)"
+                result_block = (
+                    f"* ✅ Music '{audio_rel_path}' {verb_past} and saved to {saved_to}.\n"
+                    f"<!-- status:success -->\n</processing>\n"
+                )
+                self.ai_message.content += result_block
+                _cb(self.callback, result_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = False
+
+            anchor = f"[🎵 {Path(audio_rel_path).stem}](./{audio_rel_path})"
+            self.ai_message.content += f"\n\n{anchor}\n"
+            _cb(self.callback, f"\n\n{anchor}\n", MSG_TYPE.MSG_TYPE_CHUNK)
+
+            if self.event_mode.has_callbacks:
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                    "type": "artifact_created",
+                    "title": audio_rel_path,
+                    "art_type": "audio",
+                })
+            return True
+        except Exception as ex:
+            trace_exception(ex)
+            ASCIIColors.error(f"[{kind}_music] Failed to create audio artefact: {ex}")
+            return True
+
+    def _handle_synthesize_speech_tag(self, tag_str: str, body: str) -> bool:
+        """Handles a closed <synthesize_speech> tag: TTS generate_speech → artefact persistence."""
+        try:
+            attrs = {m.group(1): m.group(2) for m in re.finditer(r'(\w+)=["\']([^"\']*)["\']', tag_str)}
+            raw_name = attrs.get("name") or attrs.get("title")
+            if not raw_name:
+                sanitized_body = re.sub(r'[^a-zA-Z0-9_-]+', '_', (body or "").strip())[:24].strip('_')
+                raw_name = (sanitized_body or f"speech_{uuid.uuid4().hex[:8]}") + ".wav"
+            if not raw_name.lower().endswith((".wav", ".mp3", ".flac", ".ogg", ".m4a")):
+                raw_name = raw_name + ".wav"
+            text = (body or "").strip()
+
+            disc = self.discussion
+            client = getattr(disc, "lollmsClient", None) or getattr(disc, "lollms_client", None)
+            tts = getattr(client, "tts", None)
+            if tts is None or not callable(getattr(tts, "generate_speech", None)):
+                ASCIIColors.warning(
+                    "[synthesize_speech] No usable TTS binding available — speech synthesis skipped."
+                )
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    failure_block = (
+                        f"\n* ⚠️ Speech synthesis requested ('{raw_name}'), but no TTS engine is "
+                        f"available in this session. Nothing was synthesized.\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += failure_block
+                    _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                return True
+
+            if not text:
+                failure_block = (
+                    f"\n* ⚠️ Speech synthesis requested ('{raw_name}'), but no text was provided "
+                    f"inside the tag. Nothing was synthesized.\n"
+                    f"<!-- status:failure -->\n</processing>\n"
+                )
+                self.ai_message.content += failure_block
+                _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = False
+                return True
+
+            gen_kwargs: Dict[str, Any] = {}
+            for str_key in ("voice", "language", "speaker", "voice_id"):
+                if str_key in attrs:
+                    gen_kwargs[str_key] = attrs[str_key]
+            for float_key in ("speed", "rate", "pitch"):
+                if float_key in attrs:
+                    try:
+                        gen_kwargs[float_key] = float(attrs[float_key])
+                    except (TypeError, ValueError):
+                        pass
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                status_line = (
+                    f"* 🗣️ Synthesizing speech '{raw_name}' via the TTS engine...\nText:{text[:120]}\n"
+                )
+                self.ai_message.content += status_line
+                _cb(self.callback, status_line, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = True
+
+            audio_bytes: Optional[bytes] = None
+            generation_error: Optional[str] = None
+            try:
+                result = tts.generate_speech(text, **gen_kwargs)
+                if isinstance(result, (bytes, bytearray)):
+                    audio_bytes = bytes(result)
+                elif isinstance(result, str) and result.strip():
+                    audio_bytes = base64.b64decode(
+                        re.sub(r'^data:audio/[^;]+;base64,', '', result.strip())
+                    )
+                elif isinstance(result, dict):
+                    for key in ("audio", "audio_bytes", "bytes", "data", "b64"):
+                        value = result.get(key)
+                        if isinstance(value, (bytes, bytearray)):
+                            audio_bytes = bytes(value)
+                            break
+                        if isinstance(value, str) and value.strip():
+                            audio_bytes = base64.b64decode(
+                                re.sub(r'^data:audio/[^;]+;base64,', '', value.strip())
+                            )
+                            break
+            except Exception as gen_ex:
+                trace_exception(gen_ex)
+                generation_error = _sanitize_host_paths(str(gen_ex))
+
+            if not audio_bytes:
+                if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                    reason = generation_error or "The TTS engine returned no data."
+                    failure_block = (
+                        f"\n* ❌ Speech '{raw_name}' could not be synthesized. Reason: {reason}\n"
+                        f"<!-- status:failure -->\n</processing>\n"
+                    )
+                    self.ai_message.content += failure_block
+                    _cb(self.callback, failure_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                    self._processing_block_open = False
+                return True
+
+            ws_root = _resolve_tool_workspace_root(disc)
+            audio_rel_path = raw_name.replace("\\", "/").strip().lstrip("/")
+            audio_disk_path = ws_root / audio_rel_path
+            disk_write_error = None
+            try:
+                audio_disk_path.parent.mkdir(parents=True, exist_ok=True)
+                audio_disk_path.write_bytes(audio_bytes)
+            except Exception as write_ex:
+                disk_write_error = _sanitize_host_paths(str(write_ex))
+                ASCIIColors.warning(
+                    f"[synthesize_speech] Failed to write audio '{audio_rel_path}' to disk: {disk_write_error}"
+                )
+
+            meta_card = (
+                f"### Speech: `{audio_rel_path}`\n\n"
+                f"Synthesized via the TTS engine.\n"
+                f"- **Type**: Audio (AS-IS physical artefact)\n"
+                f"- **Text**: {text[:200]}\n"
+                f"- **Location**: `./{audio_rel_path}`\n\n"
+                f"> **Action**: The audio file is saved in the workspace. Reference it directly in "
+                f"your answer with `[audio](./{audio_rel_path})` or `./{audio_rel_path}` (plain path)."
+            )
+
+            art = disc.artefacts.add(
+                title=audio_rel_path,
+                artefact_type="audio",
+                content=meta_card,
+                file_ext=Path(audio_rel_path).suffix or ".wav",
+                version=1,
+                read_only=False,
+                physical_data=audio_bytes if disk_write_error is None else None,
+                logical_content=meta_card,
+            )
+            if disk_write_error is None:
+                self._bump_workspace_revision()
+            if art:
+                if not hasattr(self, "affected_artefacts"):
+                    self.affected_artefacts = []
+                self.affected_artefacts.append(art)
+                turn_arts = getattr(disc, "_affected_artefacts_this_turn", None)
+                if isinstance(turn_arts, list):
+                    turn_arts.append(art)
+                if getattr(disc, "_turn_actions_log", None) is not None:
+                    disc._turn_actions_log.append({
+                        "action": "artifact_created",
+                        "title": audio_rel_path,
+                        "type": "audio",
+                        "round": getattr(disc, "_current_round", 0),
+                    })
+                if getattr(disc, "_is_db_backed", False):
+                    try:
+                        disc.commit()
+                    except Exception:
+                        pass
+
+            if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
+                saved_to = f"`./{audio_rel_path}`" if disk_write_error is None else "the artefact store (disk write failed)"
+                result_block = (
+                    f"* ✅ Speech '{audio_rel_path}' synthesized and saved to {saved_to}.\n"
+                    f"<!-- status:success -->\n</processing>\n"
+                )
+                self.ai_message.content += result_block
+                _cb(self.callback, result_block, MSG_TYPE.MSG_TYPE_CHUNK, {"was_processed": True})
+                self._processing_block_open = False
+
+            anchor = f"[🗣️ {Path(audio_rel_path).stem}](./{audio_rel_path})"
+            self.ai_message.content += f"\n\n{anchor}\n"
+            _cb(self.callback, f"\n\n{anchor}\n", MSG_TYPE.MSG_TYPE_CHUNK)
+
+            if self.event_mode.has_callbacks:
+                _cb(self.callback, "", MSG_TYPE.MSG_TYPE_ARTEFACTS_STATE_CHANGED, {
+                    "type": "artifact_created",
+                    "title": audio_rel_path,
+                    "art_type": "audio",
+                })
+            return True
+        except Exception as ex:
+            trace_exception(ex)
+            ASCIIColors.error(f"[synthesize_speech] Failed to create audio artefact: {ex}")
+            return True
+
+
     def _hydrate_image_unlock(self, t_file: str, art: Dict[str, Any], file_ext: str, processed_files: List[str]) -> None:
         """Self-heals pixel hydration for an image artifact targeted by <unlock_file>."""
         images = list(art.get("images") or [])
@@ -5067,7 +6098,7 @@ class _StreamState:
             # Context visibility tags and image tags close their own
             # <processing> block with a status meta inside the dispatcher;
             # do not emit a duplicate close.
-            if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image", "generate_video", "lollms_form", "lollms_inline"):
+            if self._secondary_tag_name not in ("unlock_file", "lock_file", "hide_file", "agent", "generate_image", "edit_image", "generate_video", "edit_video", "generate_music", "edit_music", "synthesize_speech", "lollms_form", "lollms_inline"):
                 if self.event_mode in (EventMode.PROCESSING_TAG_MODE, EventMode.MIXED_MODE):
                     proc_close_tag = f'\n<!-- status:finished -->\n</processing>\n'
                     self.ai_message.content += proc_close_tag
@@ -5152,7 +6183,7 @@ class _StreamState:
                 self._pending_buffer = complete_tag_re.sub('', self._pending_buffer)
 
             self._pending_buffer = re.sub(
-                r'(?ms)^[ \t]*<(?:artifact|artefact|skill|note|scratchpad|lollms_inline|lollms_form|generate_image|edit_image|tool|effort)\b[^>]*$',
+                r'(?ms)^[ \t]*<(?:artifact|artefact|skill|note|scratchpad|lollms_inline|lollms_form|generate_image|edit_image|generate_video|edit_video|generate_music|edit_music|synthesize_speech|tool|effort)\b[^>]*$',
                 '',
                 self._pending_buffer,
                 flags=re.IGNORECASE,
@@ -7204,6 +8235,527 @@ class ChatMixin:
                     f"'{getattr(_rag_doc_tools_seed_binding, 'store_name', '?')}'."
                 )
 
+        # ── 🎬🎵🔊 MEDIA CALLABLE TOOLS (PER-TURN ADMISSION) ──
+        # Tool registration for the three media modalities the chat() flags opt
+        # into. Registration is admission, not execution: each callable resolves
+        # the LIVE binding at call time and degrades to a structured failure
+        # when the binding is absent, so a lazily-materialised binding cannot
+        # produce a crash mid-turn.
+        #
+        # Gating contract (mirrors the TTI doctrine gate):
+        #   • the caller asked for the tool (enable_* kwarg), AND
+        #   • the modality is configured (live binding OR profile registry).
+        # The orchestrator persona never holds executable grammar, so it is
+        # excluded from every branch.
+        if not _persona_active:
+            _client_for_media = getattr(self, "lollmsClient", None)
+
+            def _media_configured(binding_attr: str, registry_attr: str, method_name: str) -> bool:
+                binding = getattr(_client_for_media, binding_attr, None) if _client_for_media else None
+                if binding is not None and callable(getattr(binding, method_name, None)):
+                    return True
+                return bool(getattr(_client_for_media, registry_attr, None)) if _client_for_media else False
+
+            def _media_resolve_binding(binding_attr: str) -> Any:
+                return getattr(_client_for_media, binding_attr, None) if _client_for_media else None
+
+            def _media_missing_error(binding_attr: str, registry_attr: str, action_label: str) -> Dict[str, Any]:
+                has_profiles = bool(getattr(_client_for_media, registry_attr, None)) if _client_for_media else False
+                reason = (
+                    "the binding failed to initialize (profiles are configured — check the "
+                    "model profile configuration)"
+                    if has_profiles else
+                    "no model profiles are configured for this modality"
+                )
+                return {
+                    "success": False,
+                    "error": f"{action_label} is unavailable: {reason}.",
+                }
+
+            def _media_persist_artifact(
+                output_bytes: bytes,
+                file_name: str,
+                media_kind: str,
+                default_ext: str,
+                prompt_summary: str,
+            ) -> Dict[str, Any]:
+                """Writes bytes to the workspace and registers a metadata-card artefact.
+
+                AS-IS doctrine: the physical file is the source of truth; the DB
+                record carries only a metadata card (no embedded bytes). The
+                workspace write is the success criterion — a DB failure degrades
+                to a warning so the file is never lost.
+                """
+                safe_name = (file_name or "").replace("\\", "/").strip().lstrip("/")
+                if not safe_name:
+                    safe_name = f"{media_kind}_{uuid.uuid4().hex[:8]}{default_ext}"
+                ext = Path(safe_name).suffix.lower()
+                if not ext:
+                    safe_name = f"{safe_name}{default_ext}"
+                    ext = default_ext
+
+                ws_root = _resolve_tool_workspace_root(self)
+                disk_path = ws_root / safe_name
+                try:
+                    disk_path.parent.mkdir(parents=True, exist_ok=True)
+                    disk_path.write_bytes(output_bytes)
+                except Exception as write_ex:
+                    trace_exception(write_ex)
+                    return {
+                        "success": False,
+                        "error": _sanitize_host_paths(
+                            f"Failed to write '{safe_name}' to the workspace: {write_ex}"
+                        ),
+                    }
+
+                meta_card = (
+                    f"### {media_kind.capitalize()}: `{safe_name}`\n\n"
+                    f"Generated via the {media_kind} engine.\n"
+                    f"- **Type**: {media_kind.capitalize()} (AS-IS physical artefact)\n"
+                    f"- **Prompt**: {(prompt_summary or '')[:200]}\n"
+                    f"- **Location**: `./{safe_name}`\n\n"
+                    f"> **Action**: Reference this file directly in your answer with "
+                    f"`./{safe_name}`."
+                )
+                artefact_type = (
+                    "video" if media_kind == "video"
+                    else "audio"
+                )
+                try:
+                    self.artefacts.add(
+                        title=safe_name,
+                        artefact_type=artefact_type,
+                        content=meta_card,
+                        file_ext=ext,
+                        version=1,
+                        read_only=False,
+                    )
+                except Exception as persist_ex:
+                    ASCIIColors.warning(
+                        f"[ChatMixin] {media_kind.capitalize()} file '{safe_name}' was written to disk "
+                        f"but artefact registration failed: {persist_ex}"
+                    )
+                try:
+                    object.__setattr__(
+                        self, "_workspace_write_revision",
+                        int(getattr(self, "_workspace_write_revision", 0)) + 1,
+                    )
+                except Exception:
+                    pass
+                return {
+                    "success": True,
+                    "file_name": safe_name,
+                    "workspace_path": safe_name,
+                    "size_bytes": len(output_bytes),
+                }
+
+            # ── VIDEO TOOLS ──
+            if kwargs.get("enable_generate_video") and _media_configured(
+                "ttv", "ttv_model_profiles_registry", "generate_video"
+            ):
+                def tool_generate_video(prompt: str, name: str = "", duration: int = 0,
+                                        width: int = 0, height: int = 0, fps: int = 0,
+                                        seed: int = -1, negative_prompt: str = "") -> Dict[str, Any]:
+                    """Generates a video from a text prompt and saves it to the workspace.
+
+                    Parameters
+                    ----------
+                    prompt : str
+                        Vivid description of the video (subject, motion, camera style).
+                    name : str
+                        Optional output file name (`.mp4` appended when omitted).
+                    duration : int
+                        Optional length in seconds (0 → engine default).
+                    width, height, fps, seed : int
+                        Optional engine-specific overrides (0/-1 → engine default).
+                    negative_prompt : str
+                        Optional description of what to avoid.
+                    """
+                    binding = _media_resolve_binding("ttv")
+                    if binding is None or not callable(getattr(binding, "generate_video", None)):
+                        return _media_missing_error("ttv", "ttv_model_profiles_registry", "Video generation")
+                    gen_kwargs: Dict[str, Any] = {}
+                    for key, value in (("duration", duration), ("width", width),
+                                       ("height", height), ("fps", fps), ("seed", seed)):
+                        if isinstance(value, int) and value > 0:
+                            gen_kwargs[key] = value
+                    if negative_prompt and negative_prompt.strip():
+                        gen_kwargs["negative_prompt"] = negative_prompt.strip()
+                    try:
+                        result = binding.generate_video(prompt, **gen_kwargs)
+                    except Exception as gen_ex:
+                        trace_exception(gen_ex)
+                        return {"success": False, "error": _sanitize_host_paths(str(gen_ex))}
+                    if isinstance(result, (bytes, bytearray)):
+                        video_bytes = bytes(result)
+                    elif isinstance(result, str) and result.strip():
+                        try:
+                            video_bytes = base64.b64decode(
+                                re.sub(r'^data:video/[^;]+;base64,', '', result.strip())
+                            )
+                        except Exception:
+                            return {"success": False, "error": "The video engine returned an undecodable payload."}
+                    elif isinstance(result, dict):
+                        video_bytes = b""
+                        for key in ("video", "video_bytes", "bytes", "data", "b64"):
+                            value = result.get(key)
+                            if isinstance(value, (bytes, bytearray)):
+                                video_bytes = bytes(value)
+                                break
+                            if isinstance(value, str) and value.strip():
+                                video_bytes = base64.b64decode(
+                                    re.sub(r'^data:video/[^;]+;base64,', '', value.strip())
+                                )
+                                break
+                        if not video_bytes:
+                            return {"success": False, "error": "The video engine returned no usable data."}
+                    else:
+                        return {"success": False, "error": "The video engine returned an unsupported payload type."}
+                    return _media_persist_artifact(video_bytes, name, "video", ".mp4", prompt)
+
+                active_tools["tool_generate_video"] = {
+                    "name": "tool_generate_video",
+                    "description": (
+                        "Generates a video from a text prompt and saves it to the "
+                        "workspace. Use this for any new video/clip/animation request. "
+                        "Returns the workspace-relative file path."
+                    ),
+                    "parameters": [
+                        {"name": "prompt", "type": "string",
+                         "description": "Vivid description of the video to generate."},
+                        {"name": "name", "type": "string", "optional": True, "default": "",
+                         "description": "Optional output file name (extension appended when omitted)."},
+                        {"name": "duration", "type": "integer", "optional": True, "default": 0,
+                         "description": "Optional length in seconds (0 → engine default)."},
+                        {"name": "width", "type": "integer", "optional": True, "default": 0,
+                         "description": "Optional width in pixels (0 → engine default)."},
+                        {"name": "height", "type": "integer", "optional": True, "default": 0,
+                         "description": "Optional height in pixels (0 → engine default)."},
+                        {"name": "fps", "type": "integer", "optional": True, "default": 0,
+                         "description": "Optional frames per second (0 → engine default)."},
+                        {"name": "seed", "type": "integer", "optional": True, "default": -1,
+                         "description": "Optional deterministic seed (-1 → engine default)."},
+                        {"name": "negative_prompt", "type": "string", "optional": True, "default": "",
+                         "description": "Optional description of what to avoid."},
+                    ],
+                    "callable": tool_generate_video,
+                }
+                _dbg("[ChatMixin] Registered media tool 'tool_generate_video'.")
+
+            if kwargs.get("enable_edit_video") and _media_configured(
+                "ttv", "ttv_model_profiles_registry", "edit_video"
+            ):
+                def tool_edit_video(source: str, prompt: str, name: str = "") -> Dict[str, Any]:
+                    """Applies a content modification to an existing workspace video.
+
+                    Parameters
+                    ----------
+                    source : str
+                        Exact workspace file name of the video to modify.
+                    prompt : str
+                        Instructions describing the modification.
+                    name : str
+                        Optional output file name.
+                    """
+                    binding = _media_resolve_binding("ttv")
+                    if binding is None or not callable(getattr(binding, "edit_video", None)):
+                        return _media_missing_error("ttv", "ttv_model_profiles_registry", "Video editing")
+                    if not source or not str(source).strip():
+                        return {"success": False, "error": "`source` is required (workspace file name of the video to edit)."}
+                    if not prompt or not str(prompt).strip():
+                        return {"success": False, "error": "`prompt` is required (describe the modification)."}
+                    ws_root = _resolve_tool_workspace_root(self)
+                    source_path = ws_root / str(source).replace("\\", "/").strip().lstrip("/")
+                    if not source_path.is_file():
+                        return {"success": False, "error": f"Source video '{source}' was not found in the workspace."}
+                    source_bytes = source_path.read_bytes()
+                    try:
+                        result = binding.edit_video(source_bytes, prompt.strip())
+                    except Exception as edit_ex:
+                        trace_exception(edit_ex)
+                        return {"success": False, "error": _sanitize_host_paths(str(edit_ex))}
+                    if isinstance(result, (bytes, bytearray)):
+                        video_bytes = bytes(result)
+                    elif isinstance(result, str) and result.strip():
+                        try:
+                            video_bytes = base64.b64decode(
+                                re.sub(r'^data:video/[^;]+;base64,', '', result.strip())
+                            )
+                        except Exception:
+                            return {"success": False, "error": "The video editor returned an undecodable payload."}
+                    elif isinstance(result, dict):
+                        video_bytes = b""
+                        for key in ("video", "video_bytes", "bytes", "data", "b64"):
+                            value = result.get(key)
+                            if isinstance(value, (bytes, bytearray)):
+                                video_bytes = bytes(value)
+                                break
+                            if isinstance(value, str) and value.strip():
+                                video_bytes = base64.b64decode(
+                                    re.sub(r'^data:video/[^;]+;base64,', '', value.strip())
+                                )
+                                break
+                        if not video_bytes:
+                            return {"success": False, "error": "The video editor returned no usable data."}
+                    else:
+                        return {"success": False, "error": "The video editor returned an unsupported payload type."}
+                    out_name = name or f"{Path(str(source)).stem}_edited.mp4"
+                    return _media_persist_artifact(video_bytes, out_name, "video", ".mp4", prompt)
+
+                active_tools["tool_edit_video"] = {
+                    "name": "tool_edit_video",
+                    "description": (
+                        "Modifies an existing workspace video (trim, extend, restyle, "
+                        "add subtitles, change pacing). Returns the workspace-relative "
+                        "path of the edited file."
+                    ),
+                    "parameters": [
+                        {"name": "source", "type": "string",
+                         "description": "Exact workspace file name of the video to modify."},
+                        {"name": "prompt", "type": "string",
+                         "description": "Instructions describing the modification."},
+                        {"name": "name", "type": "string", "optional": True, "default": "",
+                         "description": "Optional output file name."},
+                    ],
+                    "callable": tool_edit_video,
+                }
+                _dbg("[ChatMixin] Registered media tool 'tool_edit_video'.")
+
+            # ── MUSIC TOOLS ──
+            if kwargs.get("enable_generate_music") and _media_configured(
+                "ttm", "ttm_model_profiles_registry", "generate_music"
+            ):
+                def tool_generate_music(prompt: str, name: str = "", duration: int = 0,
+                                        instrumental: bool = False) -> Dict[str, Any]:
+                    """Generates a music track from a text brief and saves it to the workspace.
+
+                    Parameters
+                    ----------
+                    prompt : str
+                        Musical brief (genre, mood, instrumentation, tempo, structure,
+                        and — when vocals are wanted — the lyrics).
+                    name : str
+                        Optional output file name (`.mp3` appended when omitted).
+                    duration : int
+                        Optional clip length in seconds (0 → engine default).
+                    instrumental : bool
+                        True to request an instrumental (no vocals).
+                    """
+                    binding = _media_resolve_binding("ttm")
+                    if binding is None or not callable(getattr(binding, "generate_music", None)):
+                        return _media_missing_error("ttm", "ttm_model_profiles_registry", "Music generation")
+                    gen_kwargs: Dict[str, Any] = {}
+                    if isinstance(duration, int) and duration > 0:
+                        gen_kwargs["duration"] = duration
+                    if instrumental:
+                        gen_kwargs["instrumental"] = True
+                    try:
+                        result = binding.generate_music(prompt, **gen_kwargs)
+                    except Exception as gen_ex:
+                        trace_exception(gen_ex)
+                        return {"success": False, "error": _sanitize_host_paths(str(gen_ex))}
+                    if isinstance(result, (bytes, bytearray)):
+                        audio_bytes = bytes(result)
+                    elif isinstance(result, str) and result.strip():
+                        try:
+                            audio_bytes = base64.b64decode(
+                                re.sub(r'^data:audio/[^;]+;base64,', '', result.strip())
+                            )
+                        except Exception:
+                            return {"success": False, "error": "The music engine returned an undecodable payload."}
+                    elif isinstance(result, dict):
+                        audio_bytes = b""
+                        for key in ("audio", "audio_bytes", "bytes", "data", "b64"):
+                            value = result.get(key)
+                            if isinstance(value, (bytes, bytearray)):
+                                audio_bytes = bytes(value)
+                                break
+                            if isinstance(value, str) and value.strip():
+                                audio_bytes = base64.b64decode(
+                                    re.sub(r'^data:audio/[^;]+;base64,', '', value.strip())
+                                )
+                                break
+                        if not audio_bytes:
+                            return {"success": False, "error": "The music engine returned no usable data."}
+                    else:
+                        return {"success": False, "error": "The music engine returned an unsupported payload type."}
+                    return _media_persist_artifact(audio_bytes, name, "audio", ".mp3", prompt)
+
+                active_tools["tool_generate_music"] = {
+                    "name": "tool_generate_music",
+                    "description": (
+                        "Generates a music track from a text brief and saves it to the "
+                        "workspace. Use for any new song/score/background-music request. "
+                        "Returns the workspace-relative file path."
+                    ),
+                    "parameters": [
+                        {"name": "prompt", "type": "string",
+                         "description": "Musical brief (genre, mood, instrumentation, lyrics when vocals are wanted)."},
+                        {"name": "name", "type": "string", "optional": True, "default": "",
+                         "description": "Optional output file name (extension appended when omitted)."},
+                        {"name": "duration", "type": "integer", "optional": True, "default": 0,
+                         "description": "Optional clip length in seconds (0 → engine default)."},
+                        {"name": "instrumental", "type": "boolean", "optional": True, "default": False,
+                         "description": "True to request an instrumental (no vocals)."},
+                    ],
+                    "callable": tool_generate_music,
+                }
+                _dbg("[ChatMixin] Registered media tool 'tool_generate_music'.")
+
+            if kwargs.get("enable_edit_music") and _media_configured(
+                "ttm", "ttm_model_profiles_registry", "edit_music"
+            ):
+                def tool_edit_music(source: str, prompt: str, name: str = "") -> Dict[str, Any]:
+                    """Applies a content modification to an existing workspace audio track.
+
+                    Parameters
+                    ----------
+                    source : str
+                        Exact workspace file name of the audio to modify.
+                    prompt : str
+                        Instructions describing the modification.
+                    name : str
+                        Optional output file name.
+                    """
+                    binding = _media_resolve_binding("ttm")
+                    if binding is None or not callable(getattr(binding, "edit_music", None)):
+                        return _media_missing_error("ttm", "ttm_model_profiles_registry", "Music editing")
+                    if not source or not str(source).strip():
+                        return {"success": False, "error": "`source` is required (workspace file name of the audio to edit)."}
+                    if not prompt or not str(prompt).strip():
+                        return {"success": False, "error": "`prompt` is required (describe the modification)."}
+                    ws_root = _resolve_tool_workspace_root(self)
+                    source_path = ws_root / str(source).replace("\\", "/").strip().lstrip("/")
+                    if not source_path.is_file():
+                        return {"success": False, "error": f"Source audio '{source}' was not found in the workspace."}
+                    source_bytes = source_path.read_bytes()
+                    try:
+                        result = binding.edit_music(source_bytes, prompt.strip())
+                    except Exception as edit_ex:
+                        trace_exception(edit_ex)
+                        return {"success": False, "error": _sanitize_host_paths(str(edit_ex))}
+                    if isinstance(result, (bytes, bytearray)):
+                        audio_bytes = bytes(result)
+                    elif isinstance(result, str) and result.strip():
+                        try:
+                            audio_bytes = base64.b64decode(
+                                re.sub(r'^data:audio/[^;]+;base64,', '', result.strip())
+                            )
+                        except Exception:
+                            return {"success": False, "error": "The music editor returned an undecodable payload."}
+                    elif isinstance(result, dict):
+                        audio_bytes = b""
+                        for key in ("audio", "audio_bytes", "bytes", "data", "b64"):
+                            value = result.get(key)
+                            if isinstance(value, (bytes, bytearray)):
+                                audio_bytes = bytes(value)
+                                break
+                            if isinstance(value, str) and value.strip():
+                                audio_bytes = base64.b64decode(
+                                    re.sub(r'^data:audio/[^;]+;base64,', '', value.strip())
+                                )
+                                break
+                        if not audio_bytes:
+                            return {"success": False, "error": "The music editor returned no usable data."}
+                    else:
+                        return {"success": False, "error": "The music editor returned an unsupported payload type."}
+                    out_name = name or f"{Path(str(source)).stem}_edited.mp3"
+                    return _media_persist_artifact(audio_bytes, out_name, "audio", ".mp3", prompt)
+
+                active_tools["tool_edit_music"] = {
+                    "name": "tool_edit_music",
+                    "description": (
+                        "Modifies an existing workspace audio track (extend, remix, "
+                        "change instrumentation, adjust tempo). Returns the "
+                        "workspace-relative path of the edited file."
+                    ),
+                    "parameters": [
+                        {"name": "source", "type": "string",
+                         "description": "Exact workspace file name of the audio to modify."},
+                        {"name": "prompt", "type": "string",
+                         "description": "Instructions describing the modification."},
+                        {"name": "name", "type": "string", "optional": True, "default": "",
+                         "description": "Optional output file name."},
+                    ],
+                    "callable": tool_edit_music,
+                }
+                _dbg("[ChatMixin] Registered media tool 'tool_edit_music'.")
+
+            # ── SPEECH SYNTHESIS TOOL ──
+            if kwargs.get("enable_synthesize_speech") and _media_configured(
+                "tts", "tts_model_profiles_registry", "generate_speech"
+            ):
+                def tool_synthesize_speech(text: str, name: str = "", voice: str = "") -> Dict[str, Any]:
+                    """Converts text to spoken audio and saves it to the workspace.
+
+                    Parameters
+                    ----------
+                    text : str
+                        The exact text to be spoken aloud.
+                    name : str
+                        Optional output file name (`.mp3` appended when omitted).
+                    voice : str
+                        Optional engine-specific voice name or id (empty → engine default).
+                    """
+                    binding = _media_resolve_binding("tts")
+                    if binding is None or not callable(getattr(binding, "generate_speech", None)):
+                        return _media_missing_error("tts", "tts_model_profiles_registry", "Speech synthesis")
+                    if not text or not str(text).strip():
+                        return {"success": False, "error": "`text` is required (the text to speak)."}
+                    gen_kwargs: Dict[str, Any] = {}
+                    if voice and str(voice).strip():
+                        gen_kwargs["voice"] = str(voice).strip()
+                    try:
+                        result = binding.generate_speech(text.strip(), **gen_kwargs)
+                    except Exception as gen_ex:
+                        trace_exception(gen_ex)
+                        return {"success": False, "error": _sanitize_host_paths(str(gen_ex))}
+                    if isinstance(result, (bytes, bytearray)):
+                        audio_bytes = bytes(result)
+                    elif isinstance(result, str) and result.strip():
+                        try:
+                            audio_bytes = base64.b64decode(
+                                re.sub(r'^data:audio/[^;]+;base64,', '', result.strip())
+                            )
+                        except Exception:
+                            return {"success": False, "error": "The speech engine returned an undecodable payload."}
+                    elif isinstance(result, dict):
+                        audio_bytes = b""
+                        for key in ("audio", "audio_bytes", "bytes", "data", "b64"):
+                            value = result.get(key)
+                            if isinstance(value, (bytes, bytearray)):
+                                audio_bytes = bytes(value)
+                                break
+                            if isinstance(value, str) and value.strip():
+                                audio_bytes = base64.b64decode(
+                                    re.sub(r'^data:audio/[^;]+;base64,', '', value.strip())
+                                )
+                                break
+                        if not audio_bytes:
+                            return {"success": False, "error": "The speech engine returned no usable data."}
+                    else:
+                        return {"success": False, "error": "The speech engine returned an unsupported payload type."}
+                    return _media_persist_artifact(audio_bytes, name, "audio", ".mp3", text)
+
+                active_tools["tool_synthesize_speech"] = {
+                    "name": "tool_synthesize_speech",
+                    "description": (
+                        "Converts text to spoken audio and saves it to the workspace. "
+                        "Use for narration, voice-over, or any text-to-speech request. "
+                        "Returns the workspace-relative file path."
+                    ),
+                    "parameters": [
+                        {"name": "text", "type": "string",
+                         "description": "The exact text to be spoken aloud."},
+                        {"name": "name", "type": "string", "optional": True, "default": "",
+                         "description": "Optional output file name (extension appended when omitted)."},
+                        {"name": "voice", "type": "string", "optional": True, "default": "",
+                         "description": "Optional engine-specific voice name or id."},
+                    ],
+                    "callable": tool_synthesize_speech,
+                }
+                _dbg("[ChatMixin] Registered media tool 'tool_synthesize_speech'.")
+
         if personality and hasattr(personality, "skills_manager") and personality.skills_manager and not _persona_active:
             sm = personality.skills_manager
             # Wire LCP dynamic tool loading for skills
@@ -7507,6 +9059,200 @@ class ChatMixin:
                     "tool was admitted — check that the 'git_manager' LCP library is "
                     "discoverable by the LCP binding."
                 )
+
+        # ── 🎬🎵🗣️ MEDIA GENERATION TOOLS (FLAG + CAPABILITY GATED) ──
+        # Each flag registers ONE callable tool wired to the corresponding
+        # client binding method. The tool is only added when the binding method
+        # is callable OR when a model profile is configured (doctrine/gating
+        # parity with the prompt injection). Tools resolve the binding at
+        # call time; a missing binding surfaces a structured error to the LLM.
+        enable_generate_video = bool(kwargs.get("enable_generate_video", False))
+        enable_edit_video = bool(kwargs.get("enable_edit_video", False))
+        enable_generate_music = bool(kwargs.get("enable_generate_music", False))
+        enable_edit_music = bool(kwargs.get("enable_edit_music", False))
+        enable_synthesize_speech = bool(kwargs.get("enable_synthesize_speech", False))
+
+        _client_for_media = self.lollmsClient
+
+        def _resolve_binding_b64(method_owner: Any, method_name: str, invoke: Callable[[], Any]) -> Dict[str, Any]:
+            method = getattr(method_owner, method_name, None) if method_owner is not None else None
+            if not callable(method):
+                return {"success": False, "error": f"No engine exposes '{method_name}' in this session."}
+            try:
+                result = invoke()
+            except Exception as exc:
+                trace_exception(exc)
+                return {"success": False, "error": _sanitize_host_paths(str(exc))}
+            if isinstance(result, (bytes, bytearray)):
+                return {"success": True, "bytes_b64": base64.b64encode(bytes(result)).decode("ascii"), "format": "raw_bytes"}
+            if isinstance(result, str) and result.strip():
+                return {"success": True, "bytes_b64": re.sub(r'^data:[^;]+;base64,', '', result.strip()), "format": "base64_string"}
+            if isinstance(result, dict):
+                for key in ("video", "audio", "image", "bytes", "data", "b64", "b64_json"):
+                    value = result.get(key)
+                    if isinstance(value, (bytes, bytearray)):
+                        return {"success": True, "bytes_b64": base64.b64encode(bytes(value)).decode("ascii"), "format": "dict_bytes"}
+                    if isinstance(value, str) and value.strip():
+                        return {"success": True, "bytes_b64": re.sub(r'^data:[^;]+;base64,', '', value.strip()), "format": "dict_b64"}
+            return {"success": False, "error": f"'{method_name}' returned no usable payload."}
+
+        if enable_generate_video:
+            def _tool_generate_video(prompt: str, name: str = "", duration: int = 0, width: int = 0, height: int = 0, fps: int = 0, seed: int = 0, negative_prompt: str = "") -> Dict[str, Any]:
+                """Generates a NEW video from a text prompt. Writes to the workspace and returns the file path."""
+                ttv = getattr(_client_for_media, "ttv", None)
+                kwargs_in: Dict[str, Any] = {}
+                if duration: kwargs_in["duration"] = int(duration)
+                if width: kwargs_in["width"] = int(width)
+                if height: kwargs_in["height"] = int(height)
+                if fps: kwargs_in["fps"] = int(fps)
+                if seed: kwargs_in["seed"] = int(seed)
+                if negative_prompt: kwargs_in["negative_prompt"] = negative_prompt
+                payload = _resolve_binding_b64(ttv, "generate_video", lambda: ttv.generate_video(prompt, **kwargs_in))
+                if not payload.get("success"):
+                    return payload
+                return _persist_media_tool_output(payload, name or "generated_video.mp4", ".mp4", "video")
+
+            active_tools["tool_generate_video"] = {
+                "name": "tool_generate_video",
+                "description": "Generate a NEW video from a text prompt via the TTV engine. Writes the result to the workspace and returns its path.",
+                "parameters": [
+                    {"name": "prompt", "type": "string", "description": "Descriptive prompt for the video."},
+                    {"name": "name", "type": "string", "description": "Output file name (mp4/webm). Optional.", "optional": True, "default": ""},
+                    {"name": "duration", "type": "int", "description": "Duration in seconds. Optional.", "optional": True, "default": 0},
+                    {"name": "width", "type": "int", "description": "Frame width in pixels. Optional.", "optional": True, "default": 0},
+                    {"name": "height", "type": "int", "description": "Frame height in pixels. Optional.", "optional": True, "default": 0},
+                    {"name": "fps", "type": "int", "description": "Frames per second. Optional.", "optional": True, "default": 0},
+                    {"name": "seed", "type": "int", "description": "Random seed for reproducibility. Optional.", "optional": True, "default": 0},
+                    {"name": "negative_prompt", "type": "string", "description": "What to avoid in the video. Optional.", "optional": True, "default": ""},
+                ],
+                "callable": _tool_generate_video,
+            }
+
+        if enable_edit_video:
+            def _tool_edit_video(source: str, prompt: str, name: str = "", duration: int = 0, width: int = 0, height: int = 0, fps: int = 0, seed: int = 0) -> Dict[str, Any]:
+                """Edits an EXISTING workspace video. Returns the edited file path."""
+                ttv = getattr(_client_for_media, "ttv", None)
+                ws_root = _resolve_tool_workspace_root(self)
+                src_candidate = (ws_root / (source or "").replace("\\", "/").lstrip("/")).resolve()
+                if not str(src_candidate).startswith(str(ws_root)) or not src_candidate.is_file():
+                    return {"success": False, "error": f"Source video '{source}' not found in the workspace."}
+                kwargs_in: Dict[str, Any] = {}
+                if duration: kwargs_in["duration"] = int(duration)
+                if width: kwargs_in["width"] = int(width)
+                if height: kwargs_in["height"] = int(height)
+                if fps: kwargs_in["fps"] = int(fps)
+                if seed: kwargs_in["seed"] = int(seed)
+                payload = _resolve_binding_b64(
+                    ttv, "edit_video", lambda: ttv.edit_video(video=str(src_candidate), prompt=prompt, **kwargs_in)
+                )
+                if not payload.get("success"):
+                    return payload
+                return _persist_media_tool_output(payload, name or f"edited_{Path(source).name}", ".mp4", "video")
+
+            active_tools["tool_edit_video"] = {
+                "name": "tool_edit_video",
+                "description": "Edit an EXISTING workspace video via the TTV engine. Writes the edited result to the workspace and returns its path.",
+                "parameters": [
+                    {"name": "source", "type": "string", "description": "Exact workspace file name of the video to edit."},
+                    {"name": "prompt", "type": "string", "description": "Instructions describing the edit."},
+                    {"name": "name", "type": "string", "description": "Output file name. Optional.", "optional": True, "default": ""},
+                    {"name": "duration", "type": "int", "description": "Duration in seconds (overrides source). Optional.", "optional": True, "default": 0},
+                    {"name": "width", "type": "int", "description": "Frame width. Optional.", "optional": True, "default": 0},
+                    {"name": "height", "type": "int", "description": "Frame height. Optional.", "optional": True, "default": 0},
+                    {"name": "fps", "type": "int", "description": "Frames per second. Optional.", "optional": True, "default": 0},
+                    {"name": "seed", "type": "int", "description": "Random seed. Optional.", "optional": True, "default": 0},
+                ],
+                "callable": _tool_edit_video,
+            }
+
+        if enable_generate_music:
+            def _tool_generate_music(prompt: str, name: str = "", duration: int = 0, genre: str = "", mood: str = "", seed: int = 0, negative_prompt: str = "") -> Dict[str, Any]:
+                """Generates NEW music from a text prompt. Returns the audio file path."""
+                ttm = getattr(_client_for_media, "ttm", None)
+                kwargs_in: Dict[str, Any] = {}
+                if duration: kwargs_in["duration"] = int(duration)
+                if genre: kwargs_in["genre"] = genre
+                if mood: kwargs_in["mood"] = mood
+                if seed: kwargs_in["seed"] = int(seed)
+                if negative_prompt: kwargs_in["negative_prompt"] = negative_prompt
+                payload = _resolve_binding_b64(ttm, "generate_music", lambda: ttm.generate_music(prompt, **kwargs_in))
+                if not payload.get("success"):
+                    return payload
+                return _persist_media_tool_output(payload, name or "generated_music.wav", ".wav", "audio")
+
+            active_tools["tool_generate_music"] = {
+                "name": "tool_generate_music",
+                "description": "Generate NEW music from a text prompt via the TTM engine. Writes the result to the workspace and returns its path.",
+                "parameters": [
+                    {"name": "prompt", "type": "string", "description": "Descriptive prompt for the music."},
+                    {"name": "name", "type": "string", "description": "Output file name (wav/mp3). Optional.", "optional": True, "default": ""},
+                    {"name": "duration", "type": "int", "description": "Duration in seconds. Optional.", "optional": True, "default": 0},
+                    {"name": "genre", "type": "string", "description": "Musical genre. Optional.", "optional": True, "default": ""},
+                    {"name": "mood", "type": "string", "description": "Musical mood. Optional.", "optional": True, "default": ""},
+                    {"name": "seed", "type": "int", "description": "Random seed. Optional.", "optional": True, "default": 0},
+                    {"name": "negative_prompt", "type": "string", "description": "What to avoid. Optional.", "optional": True, "default": ""},
+                ],
+                "callable": _tool_generate_music,
+            }
+
+        if enable_edit_music:
+            def _tool_edit_music(source: str, prompt: str, name: str = "", duration: int = 0, seed: int = 0) -> Dict[str, Any]:
+                """Edits an EXISTING workspace audio file. Returns the edited file path."""
+                ttm = getattr(_client_for_media, "ttm", None)
+                ws_root = _resolve_tool_workspace_root(self)
+                src_candidate = (ws_root / (source or "").replace("\\", "/").lstrip("/")).resolve()
+                if not str(src_candidate).startswith(str(ws_root)) or not src_candidate.is_file():
+                    return {"success": False, "error": f"Source audio '{source}' not found in the workspace."}
+                kwargs_in: Dict[str, Any] = {}
+                if duration: kwargs_in["duration"] = int(duration)
+                if seed: kwargs_in["seed"] = int(seed)
+                payload = _resolve_binding_b64(
+                    ttm, "edit_music", lambda: ttm.edit_music(audio=str(src_candidate), prompt=prompt, **kwargs_in)
+                )
+                if not payload.get("success"):
+                    return payload
+                return _persist_media_tool_output(payload, name or f"edited_{Path(source).name}", ".wav", "audio")
+
+            active_tools["tool_edit_music"] = {
+                "name": "tool_edit_music",
+                "description": "Edit an EXISTING workspace audio via the TTM engine. Writes the edited result to the workspace and returns its path.",
+                "parameters": [
+                    {"name": "source", "type": "string", "description": "Exact workspace file name of the audio to edit."},
+                    {"name": "prompt", "type": "string", "description": "Instructions describing the edit."},
+                    {"name": "name", "type": "string", "description": "Output file name. Optional.", "optional": True, "default": ""},
+                    {"name": "duration", "type": "int", "description": "Duration in seconds. Optional.", "optional": True, "default": 0},
+                    {"name": "seed", "type": "int", "description": "Random seed. Optional.", "optional": True, "default": 0},
+                ],
+                "callable": _tool_edit_music,
+            }
+
+        if enable_synthesize_speech:
+            def _tool_synthesize_speech(text: str, name: str = "", voice: str = "", language: str = "", speed: float = 0.0, pitch: float = 0.0) -> Dict[str, Any]:
+                """Synthesizes TEXT to spoken audio via the TTS engine. Returns the audio file path."""
+                tts = getattr(_client_for_media, "tts", None)
+                kwargs_in: Dict[str, Any] = {}
+                if voice: kwargs_in["voice"] = voice
+                if language: kwargs_in["language"] = language
+                if speed: kwargs_in["speed"] = float(speed)
+                if pitch: kwargs_in["pitch"] = float(pitch)
+                payload = _resolve_binding_b64(tts, "generate_speech", lambda: tts.generate_speech(text, **kwargs_in))
+                if not payload.get("success"):
+                    return payload
+                return _persist_media_tool_output(payload, name or "speech.wav", ".wav", "audio")
+
+            active_tools["tool_synthesize_speech"] = {
+                "name": "tool_synthesize_speech",
+                "description": "Convert TEXT to spoken audio via the TTS engine. Writes the result to the workspace and returns its path.",
+                "parameters": [
+                    {"name": "text", "type": "string", "description": "The exact text to be spoken."},
+                    {"name": "name", "type": "string", "description": "Output file name (wav/mp3). Optional.", "optional": True, "default": ""},
+                    {"name": "voice", "type": "string", "description": "Voice identifier. Optional.", "optional": True, "default": ""},
+                    {"name": "language", "type": "string", "description": "Language code (e.g. 'en'). Optional.", "optional": True, "default": ""},
+                    {"name": "speed", "type": "float", "description": "Speech rate multiplier. Optional.", "optional": True, "default": 0.0},
+                    {"name": "pitch", "type": "float", "description": "Pitch multiplier. Optional.", "optional": True, "default": 0.0},
+                ],
+                "callable": _tool_synthesize_speech,
+            }
 
         if debug:
             if active_tools:
@@ -7869,6 +9615,12 @@ class ChatMixin:
         enable_skill_editing:         bool = False,
         skill_editing_paths:          Optional[List[str]] = None,
 
+        enable_generate_video:        bool = False,
+        enable_edit_video:            bool = False,
+        enable_generate_music:        bool = False,
+        enable_edit_music:            bool = False,
+        enable_synthesize_speech:     bool = False,
+
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -8128,6 +9880,11 @@ class ChatMixin:
                 confirm_handler=confirm_handler,
                 enable_computer_use=enable_computer_use,
                 allow_computer_use=allow_computer_use,
+                enable_generate_video=enable_generate_video,
+                enable_edit_video=enable_edit_video,
+                enable_generate_music=enable_generate_music,
+                enable_edit_music=enable_edit_music,
+                enable_synthesize_speech=enable_synthesize_speech,
                 **kwargs,
             )
             runner = AgenticRunner(
@@ -8383,6 +10140,167 @@ class ChatMixin:
             not _tti_live
             or callable(getattr(_tti_binding, 'edit_image', None))
         )
+
+        # ── 🎬🎵🔊 MEDIA MODALITY GATES (VIDEO / MUSIC / SPEECH) ──
+        # Mirrors the TTI gate contract: a modality is "configured" when EITHER
+        # a live binding exposes the required callable OR a non-empty model
+        # profile registry declares the user's intent. The dispatcher stays
+        # authoritative at execution time; the gate only governs doctrine and
+        # tool registration, so a lazily-created binding is not misread as
+        # "unavailable" on the first turn.
+        _ttv_binding = getattr(self.lollmsClient, 'ttv', None)
+        _ttv_live = _ttv_binding is not None and callable(
+            getattr(_ttv_binding, 'generate_video', None)
+        )
+        _has_ttv = _ttv_live or bool(
+            getattr(self.lollmsClient, 'ttv_model_profiles_registry', None)
+        )
+        _has_ttv_edit = _has_ttv and (
+            not _ttv_live
+            or callable(getattr(_ttv_binding, 'edit_video', None))
+        )
+
+        _ttm_binding = getattr(self.lollmsClient, 'ttm', None)
+        _ttm_live = _ttm_binding is not None and callable(
+            getattr(_ttm_binding, 'generate_music', None)
+        )
+        _has_ttm = _ttm_live or bool(
+            getattr(self.lollmsClient, 'ttm_model_profiles_registry', None)
+        )
+        _has_ttm_edit = _has_ttm and (
+            not _ttm_live
+            or callable(getattr(_ttm_binding, 'edit_music', None))
+        )
+
+        _tts_binding = getattr(self.lollmsClient, 'tts', None)
+        _tts_live = _tts_binding is not None and callable(
+            getattr(_tts_binding, 'generate_speech', None)
+        )
+        _has_tts = _tts_live or bool(
+            getattr(self.lollmsClient, 'tts_model_profiles_registry', None)
+        )
+
+        # ── 🎬 VIDEO GENERATION / EDITING DOCTRINE ──
+        # Only injected when the caller opted in AND the modality is configured.
+        # A flag on an unconfigured modality would teach tag vocabulary that is
+        # guaranteed to fail at dispatch time.
+        if enable_generate_video and _has_ttv and not orchestrator_persona:
+            extra_instructions += (
+                "\n=== VIDEO GENERATION PROTOCOL (CRITICAL) ===\n"
+                "You can create videos ONLY with the `<generate_video>` tag. An "
+                "`<artifact>` tag is a TEXT channel and can NEVER produce video bytes.\n\n"
+                "SYNTAX:\n"
+                "  <generate_video name=\"descriptive_name.mp4\" duration=\"3\">\n"
+                "  A vivid, cinematic description of the video to create.\n"
+                "  </generate_video>\n\n"
+                "RULES:\n"
+                "1. `name` (RECOMMENDED): a descriptive kebab-case file name with a "
+                "video extension (`.mp4` is appended when omitted). You MAY include a "
+                "subfolder path (e.g. `clips/sunset.mp4`); subfolders are created "
+                "automatically.\n"
+                "2. `duration` (OPTIONAL): video length in seconds. Omit it to use the "
+                "engine's default.\n"
+                "3. OPTIONAL ATTRIBUTES: `width`, `height`, `fps`, `seed`, "
+                "`negative_prompt`. Malformed values are dropped (never silently "
+                "coerced to a default that changes the user's intent).\n"
+                "4. The TAG BODY is the prompt — describe motion, subjects, camera "
+                "style. Do not put dimensions or format directives in the body; use "
+                "the attributes.\n"
+                "5. After dispatch, the video is saved to the workspace. Reference it "
+                "in your answer with `[video](./name.mp4)` (markdown link) or "
+                "`./name.mp4` (plain path).\n"
+                "6. NEVER emit `<artifact type=\"video\">` — it will be rejected.\n"
+                "=== END VIDEO GENERATION PROTOCOL ===\n"
+            )
+        if enable_edit_video and _has_ttv_edit and not orchestrator_persona:
+            extra_instructions += (
+                "\n=== VIDEO EDITING PROTOCOL (CRITICAL) ===\n"
+                "To MODIFY an existing video, use the `<edit_video>` tag. Do NOT "
+                "regenerate from scratch — that destroys the user's original content.\n\n"
+                "DECISION RULE: When the user references an EXISTING video (by file "
+                "name, artefact title, 'this video', 'the video you made') or uses a "
+                "transform verb (trim, extend, restyle, slow down, add subtitles, "
+                "recolor), you MUST use `<edit_video>`.\n\n"
+                "SYNTAX:\n"
+                "  <edit_video name=\"output.mp4\" source=\"input.mp4\">\n"
+                "  Instructions describing the modification.\n"
+                "  </edit_video>\n\n"
+                "RULES:\n"
+                "1. `source` (REQUIRED): the exact workspace file name of the video to "
+                "modify.\n"
+                "2. `name`: the output file name for the edited result.\n"
+                "3. The TAG BODY describes the CONTENT edit only.\n"
+                "=== END VIDEO EDITING PROTOCOL ===\n"
+            )
+
+        # ── 🎵 MUSIC GENERATION / EDITING DOCTRINE ──
+        if enable_generate_music and _has_ttm and not orchestrator_persona:
+            extra_instructions += (
+                "\n=== MUSIC GENERATION PROTOCOL (CRITICAL) ===\n"
+                "You can create music ONLY with the `<generate_music>` tag. An "
+                "`<artifact>` tag is a TEXT channel and can NEVER produce audio bytes.\n\n"
+                "SYNTAX:\n"
+                "  <generate_music name=\"descriptive_name.mp3\" duration=\"30\">\n"
+                "  A detailed musical brief: genre, mood, instrumentation, tempo, "
+                "structure, and — when vocals are wanted — the lyrics.\n"
+                "  </generate_music>\n\n"
+                "RULES:\n"
+                "1. `name` (RECOMMENDED): a descriptive kebab-case file name with an "
+                "audio extension (`.mp3` is appended when omitted). Subfolders are "
+                "allowed.\n"
+                "2. `duration` (OPTIONAL): clip length in seconds.\n"
+                "3. OPTIONAL: `genre`, `mood`, `tempo`, `instrumental` (true/false), "
+                "`seed`, `negative_prompt`. Malformed values are dropped.\n"
+                "4. The TAG BODY describes the music. Put LYRICS in the body only when "
+                "vocals are wanted; otherwise describe instrumentation only.\n"
+                "5. After dispatch, reference the result with `[music](./name.mp3)` or "
+                "`./name.mp3`.\n"
+                "6. NEVER emit `<artifact type=\"audio\">` — it will be rejected.\n"
+                "=== END MUSIC GENERATION PROTOCOL ===\n"
+            )
+        if enable_edit_music and _has_ttm_edit and not orchestrator_persona:
+            extra_instructions += (
+                "\n=== MUSIC EDITING PROTOCOL (CRITICAL) ===\n"
+                "To MODIFY existing music, use the `<edit_music>` tag. Do NOT "
+                "regenerate — that discards the user's original track.\n\n"
+                "SYNTAX:\n"
+                "  <edit_music name=\"output.mp3\" source=\"input.mp3\">\n"
+                "  Instructions describing the modification (extend, remix, change "
+                "instrumentation, adjust tempo, etc.).\n"
+                "  </edit_music>\n\n"
+                "RULES:\n"
+                "1. `source` (REQUIRED): the exact workspace file name of the audio "
+                "to modify.\n"
+                "2. `name`: the output file name.\n"
+                "3. The TAG BODY describes the CONTENT edit only.\n"
+                "=== END MUSIC EDITING PROTOCOL ===\n"
+            )
+
+        # ── 🔊 SPEECH SYNTHESIS (TTS) DOCTRINE ──
+        if enable_synthesize_speech and _has_tts and not orchestrator_persona:
+            extra_instructions += (
+                "\n=== SPEECH SYNTHESIS PROTOCOL (CRITICAL) ===\n"
+                "To convert TEXT to spoken audio, use the `<synthesize_speech>` tag. An "
+                "`<artifact>` tag cannot produce audio bytes.\n\n"
+                "SYNTAX:\n"
+                "  <synthesize_speech name=\"narration.mp3\" voice=\"default\">\n"
+                "  The exact text to be spoken aloud.\n"
+                "  </synthesize_speech>\n\n"
+                "RULES:\n"
+                "1. `name` (RECOMMENDED): a descriptive file name with an audio "
+                "extension (`.mp3` is appended when omitted).\n"
+                "2. `voice` (OPTIONAL): engine-specific voice name or id. Omit it to "
+                "use the engine's default voice.\n"
+                "3. OPTIONAL: `language`, `speed`, `pitch` where the engine supports "
+                "them. Malformed values are dropped.\n"
+                "4. The TAG BODY is the text to be spoken — verbatim. Do not wrap it "
+                "in quotes and do not add stage directions; the engine reads exactly "
+                "what you provide.\n"
+                "5. After dispatch, reference the result with `[audio](./name.mp3)` or "
+                "`./name.mp3`.\n"
+                "=== END SPEECH SYNTHESIS PROTOCOL ===\n"
+            )
+
         if (enable_image_generation or (enable_image_editing and _has_tti_edit)) and _has_tti and not orchestrator_persona:
             extra_instructions += self._build_image_generation_instructions()
             # ── 🖼️ IMAGE EDIT DOCTRINE (EDIT vs GENERATE DECISION) ──
@@ -8425,6 +10343,84 @@ class ChatMixin:
                     "it is an edit — always.\n"
                     "=== END IMAGE EDITING PROTOCOL ===\n"
                 )
+
+        # ── 🎬 VIDEO GENERATION/EDITING DOCTRINE (FLAG + CAPABILITY GATED) ──
+        _ttv_binding = getattr(self.lollmsClient, "ttv", None)
+        _ttv_gen_live = _ttv_binding is not None and callable(getattr(_ttv_binding, "generate_video", None))
+        _ttv_edit_live = _ttv_binding is not None and callable(getattr(_ttv_binding, "edit_video", None))
+        _ttv_profile_configured = bool(getattr(self.lollmsClient, "ttv_model_profiles_registry", None))
+        _has_ttv_gen = _ttv_gen_live or _ttv_profile_configured
+        _has_ttv_edit = _ttv_edit_live or (_ttv_profile_configured and _ttv_edit_live)
+        if enable_generate_video and _has_ttv_gen and not orchestrator_persona:
+            extra_instructions += (
+                "\n=== VIDEO GENERATION PROTOCOL ===\n"
+                "Create a NEW video from a text prompt by emitting exactly:\n"
+                '  <generate_video name="OUTPUT.mp4" duration="N">descriptive prompt</generate_video>\n'
+                "- `name`: workspace file name (mp4/webm/mov/gif; a '.mp4' extension is added if absent).\n"
+                "- `duration`: seconds (optional, provider default otherwise).\n"
+                "- Optional attributes: `width`, `height`, `fps`, `seed`, `negative_prompt`.\n"
+                "- The tag body is the PROMPT ONLY. Attributes carry numeric parameters.\n"
+                "- `<artifact type=\"video\">` can NEVER produce video bytes — always use `<generate_video>`.\n"
+                "- Reference the result with `[video](./OUTPUT.mp4)` or `./OUTPUT.mp4`.\n"
+                "=== END VIDEO GENERATION PROTOCOL ===\n"
+            )
+        if enable_edit_video and _has_ttv_edit and not orchestrator_persona:
+            extra_instructions += (
+                "\n=== VIDEO EDITING PROTOCOL ===\n"
+                "Edit an EXISTING workspace video by emitting exactly:\n"
+                '  <edit_video name="OUTPUT.mp4" source="SOURCE.mp4">editing instruction</edit_video>\n'
+                "- `source`: the exact workspace file name of the video to edit (REQUIRED).\n"
+                "- `name`: output file name for the edited result.\n"
+                "- `duration`/`width`/`height`/`fps`/`seed` (optional) override the source's values.\n"
+                "- NEVER use `<generate_video>` for a modification request — that discards the source.\n"
+                "=== END VIDEO EDITING PROTOCOL ===\n"
+            )
+
+        # ── 🎵 MUSIC GENERATION/EDITING DOCTRINE (FLAG + CAPABILITY GATED) ──
+        _ttm_binding = getattr(self.lollmsClient, "ttm", None)
+        _ttm_gen_live = _ttm_binding is not None and callable(getattr(_ttm_binding, "generate_music", None))
+        _ttm_edit_live = _ttm_binding is not None and callable(getattr(_ttm_binding, "edit_music", None))
+        _ttm_profile_configured = bool(getattr(self.lollmsClient, "ttm_model_profiles_registry", None))
+        _has_ttm_gen = _ttm_gen_live or _ttm_profile_configured
+        _has_ttm_edit = _ttm_edit_live or (_ttm_profile_configured and _ttm_edit_live)
+        if enable_generate_music and _has_ttm_gen and not orchestrator_persona:
+            extra_instructions += (
+                "\n=== MUSIC GENERATION PROTOCOL ===\n"
+                "Create NEW music from a text prompt by emitting exactly:\n"
+                '  <generate_music name="OUTPUT.wav">descriptive prompt</generate_music>\n'
+                "- `name`: workspace file name (wav/mp3/flac/ogg/m4a; a '.wav' extension is added if absent).\n"
+                "- Optional attributes: `duration` (sec), `genre`, `mood`, `seed`, `negative_prompt`.\n"
+                "- `<artifact type=\"audio\">` can NEVER produce audio bytes — always use `<generate_music>`.\n"
+                "- Reference the result with `[audio](./OUTPUT.wav)` or `./OUTPUT.wav`.\n"
+                "=== END MUSIC GENERATION PROTOCOL ===\n"
+            )
+        if enable_edit_music and _has_ttm_edit and not orchestrator_persona:
+            extra_instructions += (
+                "\n=== MUSIC EDITING PROTOCOL ===\n"
+                "Edit an EXISTING workspace audio file by emitting exactly:\n"
+                '  <edit_music name="OUTPUT.wav" source="SOURCE.wav">editing instruction</edit_music>\n'
+                "- `source`: the exact workspace file name of the audio to edit (REQUIRED).\n"
+                "- `name`: output file name for the edited result.\n"
+                "- NEVER use `<generate_music>` for a modification request — that discards the source.\n"
+                "=== END MUSIC EDITING PROTOCOL ===\n"
+            )
+
+        # ── 🗣️ SPEECH SYNTHESIS DOCTRINE (FLAG + CAPABILITY GATED) ──
+        _tts_binding = getattr(self.lollmsClient, "tts", None)
+        _tts_live = _tts_binding is not None and callable(getattr(_tts_binding, "generate_speech", None))
+        _tts_profile_configured = bool(getattr(self.lollmsClient, "tts_model_profiles_registry", None))
+        _has_tts = _tts_live or _tts_profile_configured
+        if enable_synthesize_speech and _has_tts and not orchestrator_persona:
+            extra_instructions += (
+                "\n=== SPEECH SYNTHESIS PROTOCOL ===\n"
+                "Convert TEXT to spoken audio by emitting exactly:\n"
+                '  <synthesize_speech name="OUTPUT.wav">the text to speak</synthesize_speech>\n'
+                "- The tag body IS the text to be spoken (verbatim).\n"
+                "- `name`: workspace file name (wav/mp3/flac/ogg/m4a; a '.wav' extension is added if absent).\n"
+                "- Optional attributes: `voice`/`voice_id`/`speaker`, `language`, `speed`/`rate`, `pitch`.\n"
+                "- Reference the result with `[audio](./OUTPUT.wav)` or `./OUTPUT.wav`.\n"
+                "=== END SPEECH SYNTHESIS PROTOCOL ===\n"
+            )
 
         # Vision Capability Instructions (only when the active model profile is vision-capable)
         _turn_has_vision = False
@@ -8651,6 +10647,11 @@ class ChatMixin:
             enable_pdf=enable_pdf,
             enable_office_files=enable_office_files,
             allow_computer_use=allow_computer_use,
+            enable_generate_video=enable_generate_video,
+            enable_edit_video=enable_edit_video,
+            enable_generate_music=enable_generate_music,
+            enable_edit_music=enable_edit_music,
+            enable_synthesize_speech=enable_synthesize_speech,
             **kwargs,
         )
 

@@ -81,10 +81,10 @@ the table below.
 | `enable_image_editing` | `True` | Artifacts | TTI capability-gated |
 | `forward_artefact_chunks` | `False` | Artifacts | UI streaming events |
 | `enable_in_message_status` | `False` | Artifacts | UI progress lines |
-| `enable_memory` | `True` | Memory | **master switch** |
-| `enable_episodic_memory` | `True` | Memory | skips trivial exchanges |
-| `enable_auto_dream` | `True` | Memory | post-turn consolidation |
-| `enable_deep_memory_pulling` | `True` | Memory | pre-generation retrieval |
+| `enable_memory` | `False` | Memory | **master switch** |
+| `enable_episodic_memory` | `False` | Memory | skips trivial exchanges |
+| `enable_auto_dream` | `False` | Memory | post-turn consolidation |
+| `enable_deep_memory_pulling` | `False` | Memory | pre-generation retrieval |
 | `prehydrate_rag` | `True` | Knowledge | 50,000-char cap |
 | `web_search` / `internet_search` | `False` | Knowledge | max 5 hits prehydrated |
 | `enable_data_tools` | `True` | Tools | contextual workspace scan |
@@ -97,16 +97,28 @@ the table below.
 | `enable_powerpoint` | `False` | Tools | mounts PowerPoint tools (build/edit/read + info + view_slides) |
 | `enable_word` | `False` | Tools | mounts Word tools (build/edit/read) |
 | `enable_excel` | `False` | Tools | mounts Excel tools (build/edit/read, formulas doctrine) |
+| `enable_pdf` | `False` | Tools | mounts PDF tools; **auto-admitted on `.pdf` presence** |
+| `enable_toolset_editing` | `False` | Tools | mounts `toolset_staging`; needs LCP binding |
+| `enable_skill_editing` | `False` | Tools | mounts `skill_editor`; needs LCP binding |
+| `enable_generate_video` | `False` | Media | **TTV**-gated `<generate_video>` |
+| `enable_edit_video` | `False` | Media | **TTV**-gated `<edit_video>` |
+| `enable_generate_music` | `False` | Media | **TTM**-gated `<generate_music>` |
+| `enable_edit_music` | `False` | Media | **TTM**-gated `<edit_music>` |
+| `enable_synthesize_speech` | `False` | Media | **TTS**-gated `<generate_speech>` |
 | `suppress_images` | `False` | Tools | negative polarity |
 | `orchestrator_mode` | `False` | Personas | AgenticRunner route |
 | `orchestrator_persona` | `False` | Personas | delegation-only persona |
 | `debug` | `False` | Diagnostics | tool registry dump |
 | `debug_export` | `False` | Diagnostics | prompt/stream dumps to disk |
+| `verbose` | `False` | Diagnostics | per-round telemetry (independent of `debug`) |
 
 > Non-boolean parameters (`max_nb_rounds`, `tolerance_level`, `shell_autonomy_level`,
 > `python_autonomy_level`, `context_compaction_threshold`, `event_mode`, `think`,
 > `reasoning_effort`, `reasoning_summary`, `confirm_handler`, `allow_computer_use`
-> — an `Optional[bool]` capability override) are out of scope here.
+> — an `Optional[bool]` capability override — `toolset_editing_paths`,
+> `skill_editing_paths`, `builtin_tools_activation_list`, `fast_artefact_replicas`)
+> are out of scope here. Kwarg-only RSI flags `enable_toolsmith` / `enable_skillmaker`
+> are documented in their own section below.
 
 ---
 
@@ -382,7 +394,7 @@ processing blocks are scrubbed from LLM context either way.
 
 ## Memory
 
-### `enable_memory: bool = True` — MASTER SWITCH
+### `enable_memory: bool = False` — MASTER SWITCH
 
 **What it does**: Enables the memory subsystem for the turn: memory system
 instructions, decay, budget enforcement, `<mem_*>` tag processing (`<mem_new>`,
@@ -393,10 +405,11 @@ instructions, decay, budget enforcement, `<mem_*>` tag processing (`<mem_new>`,
 `_get_memory_manager()` → explicit `memory_manager` argument →
 `self.memory_manager`.
 
-**What to expect**: with `False`, no memory operations occur and memory tags are
-not processed.
+**What to expect**: with `False` (the default), no memory operations occur and
+memory tags are not processed. Enable explicitly to opt into persistent agent
+memory.
 
-### `enable_episodic_memory: bool = True`
+### `enable_episodic_memory: bool = False`
 
 **What it does**: Saves this conversation turn as episodic memory — but only for
 **non-trivial exchanges**:
@@ -407,7 +420,7 @@ not processed.
 **What to expect**: set `False` for privacy-sensitive sessions or when you want
 manual control over memory persistence.
 
-### `enable_auto_dream: bool = True`
+### `enable_auto_dream: bool = False`
 
 **What it does**: Runs a memory consolidation ("dream") cycle after the turn
 completes.
@@ -415,7 +428,7 @@ completes.
 **Recovering generated stuff (report)**: the chat result's `"dream_report"` key
 carries the report (when enabled and the manager exists).
 
-### `enable_deep_memory_pulling: bool = True`
+### `enable_deep_memory_pulling: bool = False`
 
 **What it does**: Automatically pulls relevant deep memories into working memory
 based on the user message, before generation.
@@ -761,11 +774,104 @@ result = discussion.chat(
 | Bootstrap succeeded (flags active) | Ignored |
 | Bootstrap failed / no flags / `lcp_binding is None` | Direct-call registration; tools dispatch normally |
 
+### `enable_pdf: bool = False`
+
+**What it does**: Mounts the `pdf_tools` LCP library and admits only its tool
+family (PDF read / inspect / annotate). Per-flag isolation applies — no
+PowerPoint/Word/Excel tools leak in.
+
+**What to expect**: unlike the other office-family flags, `enable_pdf` is
+**auto-admitted** when a `.pdf` file is present in the workspace or the
+discussion's artifacts, even without the flag being passed. Passing
+`enable_pdf=True` forces the mount even when no PDF exists yet.
+
+**Recovering generated stuff**: annotated PDFs are written to the discussion
+working directory and auto-registered as artifacts by `_sync_tool_artifacts` —
+recover via `discussion.artefacts.get(...)` or open the `workspace_file` path
+directly. First invocation auto-installs `pypdf` via pipmaster.
+
+### Per-Toolset Editing Flags: `enable_toolset_editing` / `enable_skill_editing`
+
+**What they do**: Mount the callable editing surfaces for LCP toolsets and
+`SKILL.md` files respectively — inside the turn.
+
+| Flag | Library | Admitted tools |
+|---|---|---|
+| `enable_toolset_editing` | `toolset_staging` | `tool_stage_list_stageable`, `tool_stage`, `tool_stage_patch`, `tool_stage_rewrite`, `tool_stage_test`, `tool_stage_unstage`, `tool_stage_status` |
+| `enable_skill_editing` | `skill_editor` | `tool_edit_skill_list/activate/read/patch/rewrite/reload/test/load_status/close` |
+
+Companions `toolset_editing_paths` / `skill_editing_paths` (Optional[List[str]],
+non-boolean) extend the editable set to folders OUTSIDE `workspace_path`. Both
+are validated once per turn (`expanduser().resolve()`, directory-checked),
+deduplicated, and pushed into the loaded module via `set_staging_paths(...)` /
+`set_skill_paths(...)` after the mount. Invalid entries are warned and skipped —
+never raised.
+
+**What to expect**:
+- **Require a live LCP tools binding.** With none configured, the mount is
+  refused with an actionable diagnostic; the turn proceeds with whatever tools
+  it has.
+- **`toolset_staging`**: one focused toolset at a time (multi-staging refused);
+  only folder-layout toolsets (`<name>/TOOLS.py`) are editable. Patches are
+  applied atomically (`ast.parse` + a top-level `def tool_*` requirement); a
+  broken source never reaches disk. `execute_python`, `tool_write_file`, and
+  `<artifact>` are FORBIDDEN writers against a staged toolset.
+- **`skill_editor`**: auto-activates against a sole candidate, allowing an agent
+  to update a skill it already holds without an explicit activation step. A
+  skill that declares `modifiable: false`, `SKILL_LIBRARY_READONLY: true`, or
+  `SKILL_LIBRARY_READONLY = True` refuses all writes (report, do not bypass).
+- Both mounts pre-authorize their fail-closed session flag on the binding
+  (`tools_binding_config` + `host_tool_configs[stem]` + `set_session_flags`)
+  before mounting, so discovery succeeds in normal operation.
+- On success, a matching doctrine block (`TOOLSET EDITING PROTOCOL` /
+  `SKILL EDITING PROTOCOL`) is injected into the system prompt for the turn.
+
+**Recovering generated stuff**: the edited `TOOLS.py` / `SKILL.md` lives on disk
+in its folder — the file IS the deliverable. See
+[`TOOLSET_STAGING_AND_SANDBOX.md`](TOOLSET_STAGING_AND_SANDBOX.md) and
+[`SKILL_EDITOR_AGENT.md`](SKILL_EDITOR_AGENT.md).
+
+### Media Generation Flags: `enable_generate_video` / `enable_edit_video` / `enable_generate_music` / `enable_edit_music` / `enable_synthesize_speech`
+
+**What they do**: Each activates ONE text-to-X modality through dedicated XML
+tags (NOT tools — wrapping them in `<tool>{}` is rejected as phantom). All five
+default to `False` (media generation is expensive). Image equivalents
+(`enable_image_generation` / `enable_image_editing`) default to `True` and are
+documented above.
+
+| Flag | Tag | Engine gate |
+|---|---|---|
+| `enable_generate_video` | `<generate_video>` | **TTV** |
+| `enable_edit_video` | `<edit_video>` | **TTV** (`edit_video`) |
+| `enable_generate_music` | `<generate_music>` | **TTM** |
+| `enable_edit_music` | `<edit_music>` | **TTM** (`edit_music`) |
+| `enable_synthesize_speech` | `<synthesize_speech>` | **TTS** |
+
+**What to expect**:
+- **Capability-gated per modality**: a live binding with the required callable
+  OR a non-empty `*_model_profiles_registry`. Missing both → the doctrine block
+  is withheld and any emitted tag surfaces a `status:failure` block.
+- Numeric parameters (`duration`, `width`, `height`, `fps`, `seed`,
+  `negative_prompt`) belong in the tag ATTRIBUTES; describing them in the body
+  has no effect. Malformed values are dropped.
+- Edit tags require `source` (exact workspace file name). The source is NOT
+  overwritten — output defaults to `<stem>_edited.<ext>` unless `name` is given.
+- Output extensions default to `.mp4` (video), `.mp3` (music), `.wav`
+  (speech); subfolder paths in `name` are created automatically.
+
+**Recovering generated stuff**: the physical file lands in the discussion
+workspace (`workspace_data_path`) and a metadata-card artifact (`type="video"`
+or `"audio"`) is registered. The card carries a summary, NOT the bytes — the
+file on disk is the source of truth (as-is doctrine). Recover via
+`discussion.artefacts.get("<name>.<ext>")` or open the file directly; the turn
+result's `"artefacts"` array lists every card produced. Message anchors use
+markdown links (`[🎬 …](…mp4)` / `[🎵 …](…mp3)` / `[🗣️ …](…wav)`).
+
 ### Legacy flag — `enable_office_files` (DEPRECATED)**: passing
-`enable_office_files=True` as a kwarg enables all three per-software flags AND
+`enable_office_files=True` as a kwarg enables all four per-software flags AND
 mounts the monolithic legacy `office_files_builder` library (12 tools:
 `tool_office_build/edit/read` plus nine per-format aliases). A one-line
-deprecation notice is logged. Prefer the three per-software flags.
+deprecation notice is logged. Prefer the per-software flags.
 
 ### `suppress_images: bool = False` — NEGATIVE POLARITY
 
@@ -809,6 +915,17 @@ the active tool registry to the console.
 **What to expect**: combine with `discussion._debug_mode = True` for persistent
 per-discussion dumps. Zero-registry turns print an explicit warning.
 
+### `verbose: bool = False`
+
+**What it does**: Enables per-round telemetry — trace timings, token fill
+percentage, time-to-first-token (TTFT), round bookkeeping, and vision
+diagnostics. Independent of `debug` (which mounts the debug toolset and logs the
+tool registry).
+
+**What to expect**: no behavioural change to the turn — purely console output.
+The CLI stays clean unless `verbose=True`. Typically enabled during performance
+profiling or agentic-loop debugging.
+
 ### `debug_export: bool = False`
 
 **What it does**: Writes per-round prompt dumps, raw LLM stream logs, and an
@@ -827,8 +944,10 @@ end-of-turn JSON context dump.
 1. **Master-switch hierarchy**: `enable_artefacts=False` disables notes, skills,
    widgets, books instructions, and image-tag dispatch even when their own
    flags are `True`. (Office toolset instructions and tools are governed solely
-   by `enable_powerpoint` / `enable_word` / `enable_excel` — or the deprecated
-   `enable_office_files` kwarg.)
+   by `enable_powerpoint` / `enable_word` / `enable_excel` / `enable_pdf` — or
+   the deprecated `enable_office_files` kwarg. Media flags are independent of
+   `enable_artefacts` for PHYSICAL file writing — only the artifact card
+   registration is suppressed.)
 2. **Discovery ≠ exposure**: LCP libraries are AST-discovered at client
    construction, but the model only sees a library when the per-turn chat flag
    mounts it. A model claiming "I have no such tools" almost always means the
@@ -843,11 +962,13 @@ end-of-turn JSON context dump.
    even with the flag enabled. Office toolset instructions are injected
    unconditionally per-flag when the flag is on.
 5. **Per-flag isolation**: each office flag exposes ONLY its own tool family —
-   `enable_excel=True` alone never exposes PowerPoint or Word tools. When both
-   a per-software flag and the legacy `enable_office_files` kwarg are set,
+   `enable_excel=True` alone never exposes PowerPoint or Word tools. `enable_pdf`
+   is the only office-family flag auto-admitted on file presence (a `.pdf` file
+   in the workspace/artifacts triggers a mount even with the flag off). When
+   both a per-software flag and the legacy `enable_office_files` kwarg are set,
    per-library mounting selects the winner and the later mount wins (identical
    tool names are deduplicated by the LCP registry).
-5. **Negative-polarity flags**: `suppress_images` is inverted — `True` *disables*
+6. **Negative-polarity flags**: `suppress_images` is inverted — `True` *disables*
    vision hydration rather than enabling a feature.
 6. **Memory sub-flags require the master**: `enable_episodic_memory`,
    `enable_auto_dream`, and `enable_deep_memory_pulling` are inert when
@@ -938,11 +1059,47 @@ result = discussion.chat(
 # Screenshots: computer_use_screenshot.png in the working directory
 ```
 
+**Generate a video clip**:
+```python
+result = discussion.chat(
+    "Generate a 5-second timelapse of a sunset over the ocean",
+    enable_generate_video=True,
+)
+# Disk: ./sunset_timelapse.mp4 in the workspace
+# Artifact card: discussion.artefacts.get("sunset_timelapse.mp4")
+# Message: [🎬 sunset_timelapse](./sunset_timelapse.mp4)
+```
+
+**Multi-modal turn (music + narration + video)**:
+```python
+result = discussion.chat(
+    "Compose a 20s lofi intro, narrate 'Welcome to the show', then generate "
+    "a 3-second animated logo clip",
+    enable_generate_music=True,
+    enable_synthesize_speech=True,
+    enable_generate_video=True,
+)
+# All three physical files land in the workspace; all three cards appear in
+# result["artefacts"].
+```
+
+**Fix a toolset in-place (intra-turn staging)**:
+```python
+result = discussion.chat(
+    "The unit_converter toolset mishandles negative temperatures — fix it",
+    enable_toolset_editing=True,
+    toolset_editing_paths=["/path/to/handbags/toolsets"],
+    enable_code_execution=True,   # needed for tool_stage_test to execute
+)
+# The edited TOOLS.py lives on disk in the toolset folder.
+```
+
 **Privacy session (no persistence of conversation memory)**:
 ```python
 discussion.chat(
     user_message,
-    enable_episodic_memory=False,
+    enable_memory=False,            # master switch already off by default
+    enable_episodic_memory=False,   # sub-flags inert without the master
     enable_auto_dream=False,
 )
 ```

@@ -16,8 +16,9 @@ against `_mixin_chat.py`'s signature).
 - **Category** matches the master table's `Category` column.
 - **Parent master switch** — if the flag is a sub-flag, its page's first
   paragraph names the parent master switch.
-- **Gate** — if the flag is gated by a runtime capability (vision, TTI) or by
-  a security precondition, the page documents it in a `## Gate` section.
+- **Gate** — if the flag is gated by a runtime capability (vision, TTI, TTV,
+  TTM, TTS) or by a security precondition, the page documents it in a
+  `## Gate` section.
 - **Page template** (mirror of the master per-flag contract):
   1. Signature (` ```python flag: type = default ` ``)
   2. `**Category**`
@@ -45,6 +46,7 @@ against `_mixin_chat.py`'s signature).
 | `enforce_end_tag` | `False` | [enforce_end_tag.md](enforce_end_tag.md) |
 | `dynamic_effort` | `False` | [dynamic_effort.md](dynamic_effort.md) |
 | `clean_reasoning_at_save` | `True` | [clean_reasoning_at_save.md](clean_reasoning_at_save.md) |
+| `verbose` | `False` | (in master table) |
 
 ### Artifacts (Workspace Files)
 | Flag | Default | Parent | Page |
@@ -56,18 +58,35 @@ against `_mixin_chat.py`'s signature).
 | `enable_inline_widgets` | `False` | `enable_artefacts` | [enable_inline_widgets.md](enable_inline_widgets.md) |
 | `enable_forms` | `False` | `enable_artefacts` | [enable_forms.md](enable_forms.md) |
 | `enable_books` | `False` | `enable_artefacts` | [enable_books.md](enable_books.md) |
-| `enable_image_generation` | `True` | `enable_artefacts`, **TTI gate** | [enable_image_generation.md](enable_image_generation.md) |
-| `enable_image_editing` | `True` | `enable_artefacts`, **TTI gate** | [enable_image_editing.md](enable_image_editing.md) |
 | `forward_artefact_chunks` | `False` | — | [forward_artefact_chunks.md](forward_artefact_chunks.md) |
 | `enable_in_message_status` | `False` | — | [enable_in_message_status.md](enable_in_message_status.md) |
+
+### Media Generation (Image / Video / Music / Speech)
+
+Consolidated walkthrough: [enable_media_generation.md](enable_media_generation.md)
+
+| Flag | Default | Parent | Gate | Page |
+|---|---|---|---|---|
+| `enable_image_generation` | `True` | `enable_artefacts` | **TTI** | [enable_image_generation.md](enable_image_generation.md) |
+| `enable_image_editing` | `True` | `enable_artefacts` | **TTI** | [enable_image_editing.md](enable_image_editing.md) |
+| `enable_generate_video` | `False` | — | **TTV** | [enable_media_generation.md](enable_media_generation.md) |
+| `enable_edit_video` | `False` | — | **TTV** | [enable_media_generation.md](enable_media_generation.md) |
+| `enable_generate_music` | `False` | — | **TTM** | [enable_media_generation.md](enable_media_generation.md) |
+| `enable_edit_music` | `False` | — | **TTM** | [enable_media_generation.md](enable_media_generation.md) |
+| `enable_synthesize_speech` | `False` | — | **TTS** | [enable_media_generation.md](enable_media_generation.md) |
 
 ### Memory
 | Flag | Default | Parent | Page |
 |---|---|---|---|
-| `enable_memory` | `True` | — | [enable_memory.md](enable_memory.md) |
-| `enable_episodic_memory` | `True` | `enable_memory` | [enable_episodic_memory.md](enable_episodic_memory.md) |
-| `enable_auto_dream` | `True` | `enable_memory` | [enable_auto_dream.md](enable_auto_dream.md) |
-| `enable_deep_memory_pulling` | `True` | `enable_memory` | [enable_deep_memory_pulling.md](enable_deep_memory_pulling.md) |
+| `enable_memory` | `False` | — | [enable_memory.md](enable_memory.md) |
+| `enable_episodic_memory` | `False` | `enable_memory` | [enable_episodic_memory.md](enable_episodic_memory.md) |
+| `enable_auto_dream` | `False` | `enable_memory` | [enable_auto_dream.md](enable_auto_dream.md) |
+| `enable_deep_memory_pulling` | `False` | `enable_memory` | [enable_deep_memory_pulling.md](enable_deep_memory_pulling.md) |
+
+> **Default drift fixed**: earlier revisions of the master table listed these
+> four flags as `True`. The actual `chat()` signature defaults them to `False`
+> so a bare `chat()` call does not silently persist conversation content. The
+> master table and this index now agree.
 
 ### Knowledge & Search
 | Flag | Default | Page |
@@ -87,13 +106,23 @@ against `_mixin_chat.py`'s signature).
 | `enable_powerpoint` | `False` | per-format toolset | [enable_powerpoint.md](enable_powerpoint.md) |
 | `enable_word` | `False` | per-format toolset | [enable_word.md](enable_word.md) |
 | `enable_excel` | `False` | per-format toolset | [enable_excel.md](enable_excel.md) |
+| `enable_pdf` | `False` | per-format toolset (auto-admitted on `.pdf` presence) | [enable_pdf.md](enable_pdf.md) |
+| `enable_toolset_editing` | `False` | requires LCP binding | [enable_toolset_editing.md](enable_toolset_editing.md) |
+| `enable_skill_editing` | `False` | requires LCP binding | [enable_skill_editing.md](enable_skill_editing.md) |
 | `suppress_images` | `False` | negative polarity | [suppress_images.md](suppress_images.md) |
+
+Companion non-boolean parameters (out of scope of this index but read from
+the same `chat()` call):
+- `toolset_editing_paths: Optional[List[str]]` — extra toolset folders/masters.
+- `skill_editing_paths: Optional[List[str]]` — extra skill folders/masters.
+- `builtin_tools_activation_list: Optional[List[str]]` — force-load builtin
+  tool names when no LCP binding is configured.
 
 Tool-calling wire format reference: [`../TOOLCALLING_FORMAT.md`](../TOOLCALLING_FORMAT.md) (`<tool>`, `<tool_result>`, `<done/>`, registry rules, anti-loop guards).
 
-Legacy alias (**DEPRECATED**): [`enable_office_files.md`](enable_office_files.md) — enables all three per-software office flags. Prefer `enable_powerpoint` / `enable_word` / `enable_excel`.
+Legacy alias (**DEPRECATED**): [`enable_office_files.md`](enable_office_files.md) — enables all four per-software office flags. Prefer `enable_powerpoint` / `enable_word` / `enable_excel` / `enable_pdf`.
 
-### RSI (Toolsmith & Skillmaker)
+### RSI (Toolsmith & Skillmaker) — kwarg-only flags
 
 Act-phase flags for the `tool_maker` / `skill_maker` toolsets. Basic
 manipulation tools remain available without these flags — see the master table

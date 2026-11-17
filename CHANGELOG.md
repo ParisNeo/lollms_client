@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-17 23:12]
+
+- docs: refactor boolean flag documentation with default values and structured metadata
+
 ## [2026-11-17 15:31]
 
 - feat(lollms_discussion): add enabled flag to image generation instructions

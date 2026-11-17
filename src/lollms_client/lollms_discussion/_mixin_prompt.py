@@ -1422,6 +1422,263 @@ EXAMPLE OF CORRECT FORM:
             "the report and finish."
         )
 
+    # ─────────────────────────────────── media tag execution (non-streaming) ──
+
+    def _decode_media_payload(self, result: Any, media_prefix: str) -> Optional[bytes]:
+        """Normalize a media engine result (bytes / base64 string / dict) to raw bytes.
+
+        Returns None when the payload is absent or undecodable. Never raises —
+        this mirrors the streaming dispatcher's ``_decode_media_bytes`` and
+        guarantees the non-streaming path survives every backend shape.
+        """
+        try:
+            if isinstance(result, (bytes, bytearray)):
+                return bytes(result)
+            if isinstance(result, str) and result.strip():
+                import base64 as _b64
+                return _b64.b64decode(
+                    re.sub(rf'^data:{media_prefix}/[^;]+;base64,', '', result.strip())
+                )
+            if isinstance(result, dict):
+                import base64 as _b64
+                for key in ("video", "video_bytes", "audio", "audio_bytes", "bytes", "data", "b64"):
+                    value = result.get(key)
+                    if isinstance(value, (bytes, bytearray)):
+                        return bytes(value)
+                    if isinstance(value, str) and value.strip():
+                        return _b64.b64decode(
+                            re.sub(rf'^data:{media_prefix}/[^;]+;base64,', '', value.strip())
+                        )
+        except Exception:
+            return None
+        return None
+
+    def _execute_media_tag(
+        self,
+        *,
+        kind: str,
+        action: str,
+        attrs: Dict[str, str],
+        body: str,
+        ai_message: 'LollmsMessage',
+        affected_artefacts: List[Dict],
+        auto_activate_artefacts: bool,
+    ) -> str:
+        """Execute one media tag from the non-streaming post-processor path.
+
+        ``kind`` is one of ``video`` / ``music`` / ``speech``; ``action`` is
+        ``generate`` or ``edit``. Returns the replacement text (a markdown
+        anchor on success, an empty string on failure). Never raises — every
+        failure path degrades to a warning so the caller's text survives.
+
+        Why this is separate from the streaming dispatcher in ``_mixin_chat``:
+        that dispatcher depends on the ``_StreamState`` object model (event
+        mode state, ``self.ai_message``, an open processing block). The
+        post-processor runs on the plain ``ai_message`` param with a return-
+        value contract. This helper reproduces the ESSENTIAL behaviour of the
+        streaming path (engine call → decode → disk persist → artefact card
+        → markdown anchor) without importing stream state.
+        """
+        kind_norm = kind.lower().strip()
+        if kind_norm not in ("video", "music", "speech"):
+            ASCIIColors.warning(f"[media] Unknown media kind '{kind}'; skipping.")
+            return ""
+
+        default_ext = {
+            "video":  ".mp4",
+            "music":  ".mp3",
+            "speech": ".wav",
+        }[kind_norm]
+        anchor_label = {
+            "video":  "🎬",
+            "music":  "🎵",
+            "speech": "🗣️",
+        }[kind_norm]
+        artefact_type = "video" if kind_norm == "video" else "audio"
+
+        raw_name = attrs.get("name") or attrs.get("title")
+        if not raw_name:
+            sanitized = re.sub(r'[^A-Za-z0-9_-]+', '_', (body or "").strip())[:24].strip('_')
+            raw_name = (sanitized or f"{kind_norm}_{uuid.uuid4().hex[:8]}") + default_ext
+        if not raw_name.lower().endswith((".mp4", ".webm", ".mov", ".gif",
+                                          ".mp3", ".wav", ".flac", ".ogg", ".m4a")):
+            raw_name = raw_name + default_ext
+        rel_path = raw_name.replace("\\", "/").strip().lstrip("/")
+
+        client = getattr(self, "lollmsClient", None)
+        if client is None:
+            ASCIIColors.warning(f"[media] No client available for {kind_norm} {action}; skipping.")
+            return ""
+
+        # ── Resolve ENGINE + callable ──
+        if kind_norm == "video":
+            engine = getattr(client, "ttv", None)
+            generate_callable = getattr(engine, "generate_video", None) if engine else None
+            edit_callable = getattr(engine, "edit_video", None) if engine else None
+        elif kind_norm == "music":
+            engine = getattr(client, "ttm", None)
+            generate_callable = getattr(engine, "generate_music", None) if engine else None
+            edit_callable = getattr(engine, "edit_music", None) if engine else None
+        else:  # speech
+            engine = getattr(client, "tts", None)
+            generate_callable = getattr(engine, "generate_speech", None) if engine else None
+            edit_callable = None  # TTS edit surface is not uniformly exposed
+            if action == "edit":
+                ASCIIColors.warning(
+                    "[media] Edit-speech is not supported by the current TTS binding — "
+                    "skipping <edit_speech>."
+                )
+                return ""
+
+        if action == "generate":
+            if not callable(generate_callable):
+                ASCIIColors.warning(
+                    f"[media] {kind_norm} generation requested but the engine does not "
+                    f"expose the required callable — skipping."
+                )
+                return ""
+        else:  # edit
+            if not callable(edit_callable):
+                ASCIIColors.warning(
+                    f"[media] {kind_norm} editing requested but the engine does not "
+                    f"expose the edit callable — skipping."
+                )
+                return ""
+
+        # ── Build generation kwargs (pass-through doctrine) ──
+        gen_kwargs: Dict[str, Any] = {}
+        for int_key in ("duration", "width", "height", "fps", "seed",
+                        "num_frames", "num_inference_steps"):
+            if int_key in attrs:
+                try:
+                    gen_kwargs[int_key] = int(attrs[int_key])
+                except (TypeError, ValueError):
+                    pass
+        if attrs.get("negative_prompt"):
+            gen_kwargs["negative_prompt"] = attrs["negative_prompt"]
+        if kind_norm == "music" and attrs.get("instrumental", "").lower() in ("true", "1", "yes"):
+            gen_kwargs["instrumental"] = True
+        for str_key in ("voice", "language", "speaker", "voice_id", "genre", "mood"):
+            if attrs.get(str_key):
+                gen_kwargs[str_key] = attrs[str_key]
+        for float_key in ("speed", "rate", "pitch"):
+            if float_key in attrs:
+                try:
+                    gen_kwargs[float_key] = float(attrs[float_key])
+                except (TypeError, ValueError):
+                    pass
+
+        # ── Resolve source bytes for EDIT actions ──
+        source_bytes: Optional[bytes] = None
+        if action == "edit":
+            sources_attr = (attrs.get("sources") or attrs.get("source") or "").strip()
+            if not sources_attr:
+                ASCIIColors.warning(
+                    f"[media] <edit_{kind_norm}> is missing the required 'sources' attribute — skipping."
+                )
+                return ""
+            first_ref = sources_attr.split(",")[0].strip()
+            if not first_ref:
+                ASCIIColors.warning(
+                    f"[media] <edit_{kind_norm}> has an empty source reference — skipping."
+                )
+                return ""
+            try:
+                from pathlib import Path as _Path
+                ws_root = _Path(getattr(self, 'workspace_data_path', '') or './data_workspace').resolve()
+                candidate = (ws_root / first_ref).resolve()
+                if str(candidate).startswith(str(ws_root)) and candidate.is_file():
+                    source_bytes = candidate.read_bytes()
+            except Exception as disk_ex:
+                ASCIIColors.warning(
+                    f"[media] Could not hydrate source '{first_ref}' for <edit_{kind_norm}>: {disk_ex}"
+                )
+            if source_bytes is None:
+                ASCIIColors.warning(
+                    f"[media] Source file '{first_ref}' was not found in the workspace — "
+                    f"<edit_{kind_norm}> skipped."
+                )
+                return ""
+
+        # ── Invoke the engine ──
+        payload_bytes: Optional[bytes] = None
+        try:
+            if action == "generate":
+                if kind_norm == "speech":
+                    if not body.strip():
+                        ASCIIColors.warning("[media] <generate_speech> has an empty body — skipping.")
+                        return ""
+                    result = generate_callable(body.strip(), **gen_kwargs)
+                else:
+                    result = generate_callable(body, **gen_kwargs)
+            else:  # edit
+                if kind_norm == "music":
+                    result = edit_callable(source_bytes, body, **gen_kwargs)
+                else:
+                    # TTV edit_video signature accepts source bytes + prompt.
+                    result = edit_callable(source_bytes, body, **gen_kwargs)
+            payload_bytes = self._decode_media_payload(result, kind_norm if kind_norm != "music" else "audio")
+        except Exception as gen_ex:
+            trace_exception(gen_ex)
+            ASCIIColors.warning(
+                f"[media] {kind_norm} {action} failed: {gen_ex}"
+            )
+            return ""
+
+        if not payload_bytes:
+            ASCIIColors.warning(
+                f"[media] {kind_norm} {action} produced no usable payload — skipping."
+            )
+            return ""
+
+        # ── Persist to workspace + artefact card ──
+        try:
+            from pathlib import Path as _Path
+            ws_root = _Path(getattr(self, 'workspace_data_path', '') or './data_workspace').resolve()
+            ws_root.mkdir(parents=True, exist_ok=True)
+            disk_path = ws_root / rel_path
+            disk_path.parent.mkdir(parents=True, exist_ok=True)
+            disk_path.write_bytes(payload_bytes)
+        except Exception as write_ex:
+            trace_exception(write_ex)
+            ASCIIColors.warning(
+                f"[media] Failed to write {kind_norm} '{rel_path}' to disk: {write_ex}"
+            )
+            return ""
+
+        prompt_summary = (body or "")[:200]
+        meta_card = (
+            f"### {kind_norm.capitalize()}: `{rel_path}`\n\n"
+            f"Generated via the {kind_norm} engine.\n"
+            f"- **Type**: {kind_norm.capitalize()} (AS-IS physical artefact)\n"
+            f"- **Prompt**: {prompt_summary}\n"
+            f"- **Location**: `./{rel_path}`\n\n"
+            f"> **Action**: Reference this file in your answer with `./{rel_path}`."
+        )
+
+        from pathlib import Path as _Path
+        art: Optional[Dict] = None
+        try:
+            art = self.artefacts.add(
+                title=rel_path,
+                artefact_type=artefact_type,
+                content=meta_card,
+                file_ext=_Path(rel_path).suffix or default_ext,
+                active=auto_activate_artefacts,
+            )
+            if art and not any(a.get('title') == rel_path for a in affected_artefacts):
+                affected_artefacts.append(art)
+        except Exception as persist_ex:
+            trace_exception(persist_ex)
+            ASCIIColors.warning(
+                f"[media] '{rel_path}' was written to disk but artefact registration failed: "
+                f"{persist_ex}"
+            )
+
+        ASCIIColors.success(f"[media] {kind_norm.capitalize()} '{rel_path}' generated and saved.")
+        stem = _Path(rel_path).stem
+        return f"\n\n[{anchor_label} {stem}](./{rel_path})\n"
+
     # ─────────────────────────────────── LLM response post-processor ─────────
 
     def _post_process_llm_response(
@@ -1430,6 +1687,11 @@ EXAMPLE OF CORRECT FORM:
         ai_message: 'LollmsMessage',
         enable_image_generation: bool = False,
         enable_image_editing:    bool = False,
+        enable_video_generation: bool = False,
+        enable_video_editing:    bool = False,
+        enable_music_generation: bool = False,
+        enable_music_editing:    bool = False,
+        enable_speech_generation: bool = False,
         auto_activate_artefacts: bool = True,
         enable_inline_widgets:   bool = True,
         enable_notes:            bool = True,
@@ -1445,6 +1707,12 @@ EXAMPLE OF CORRECT FORM:
             <artifact …>…</artifact>   Create or patch a named artefact.
             <generate_image …>…        Image generation via TTI binding.
             <edit_image …>…            Image editing via TTI binding.
+            <generate_video …>…        Video generation via TTV binding.
+            <edit_video …>…            Video editing via TTV binding.
+            <generate_music …>…        Music generation via TTM binding.
+            <edit_music …>…            Music editing via TTM binding.
+            <generate_speech …>…       Speech synthesis via TTS binding.
+            <edit_speech …>…           Speech editing via TTS binding.
             <lollms_inline …>…         Inline interactive HTML widget.
             <note …>…                  Persistent note (ArtefactType.NOTE).
             <skill …>…                 Knowledge capsule (ArtefactType.SKILL).
@@ -1474,6 +1742,18 @@ EXAMPLE OF CORRECT FORM:
         has_artefact = bool(re.search(r'^[ \t]*<(?:revert_)?art[ei]fact[\s>]', masked_text, re.IGNORECASE | re.MULTILINE))
         has_gen      = bool(re.search(r'^[ \t]*<generate_image[\s>]', masked_text, re.IGNORECASE | re.MULTILINE))
         has_edit     = bool(re.search(r'^[ \t]*<edit_image[\s>]', masked_text, re.IGNORECASE | re.MULTILINE))
+        has_gen_vid  = enable_video_generation and bool(
+            re.search(r'^[ \t]*<generate_video[\s>]', masked_text, re.IGNORECASE | re.MULTILINE))
+        has_edit_vid = enable_video_editing and bool(
+            re.search(r'^[ \t]*<edit_video[\s>]', masked_text, re.IGNORECASE | re.MULTILINE))
+        has_gen_mus  = enable_music_generation and bool(
+            re.search(r'^[ \t]*<generate_music[\s>]', masked_text, re.IGNORECASE | re.MULTILINE))
+        has_edit_mus = enable_music_editing and bool(
+            re.search(r'^[ \t]*<edit_music[\s>]', masked_text, re.IGNORECASE | re.MULTILINE))
+        has_gen_spe  = enable_speech_generation and bool(
+            re.search(r'^[ \t]*<generate_speech[\s>]', masked_text, re.IGNORECASE | re.MULTILINE))
+        has_edit_spe = enable_speech_generation and bool(
+            re.search(r'^[ \t]*<edit_speech[\s>]', masked_text, re.IGNORECASE | re.MULTILINE))
         has_note     = enable_notes and bool(
             re.search(r'^[ \t]*<note[\s>]', masked_text, re.IGNORECASE | re.MULTILINE))
         has_skill    = enable_skills and bool(
@@ -1482,6 +1762,9 @@ EXAMPLE OF CORRECT FORM:
             re.search(r'^[ \t]*<lollms_form[\s>]', masked_text, re.IGNORECASE | re.MULTILINE))
 
         if not (has_artefact or has_gen or has_edit
+                or has_gen_vid or has_edit_vid
+                or has_gen_mus or has_edit_mus
+                or has_gen_spe or has_edit_spe
                 or has_note or has_skill or has_form):
             return text, []
 
@@ -1695,6 +1978,195 @@ EXAMPLE OF CORRECT FORM:
                     return ''
 
                 cleaned = edit_pattern.sub(handle_edit, cleaned)
+
+        # ── 4. Video generation / editing (TTV) ──────────────────────────────
+        # Symmetric with the <generate_image>/<edit_image> handlers above: the
+        # post-processor is the non-streaming counterpart of the streaming
+        # dispatcher. It must honour every media tag the doctrine advertises.
+        if has_gen_vid or has_edit_vid:
+            ttv = getattr(self.lollmsClient, 'ttv', None)
+            ttv_ok = ttv is not None and callable(getattr(ttv, 'generate_video', None))
+            if not ttv_ok:
+                ASCIIColors.warning(
+                    "<generate_video>/<edit_video> found but lollmsClient.ttv is None or "
+                    "does not expose generate_video — skipping."
+                )
+            else:
+                if has_gen_vid:
+                    gen_vid_pattern = re.compile(
+                        r'^[ \t]*<generate_video\s*([^>]*)>(.*?)</generate_video>',
+                        re.DOTALL | re.IGNORECASE | re.MULTILINE,
+                    )
+
+                    def handle_generate_video(match: re.Match) -> str:
+                        attrs  = _parse_attrs(match.group(1))
+                        prompt = match.group(2).strip()
+                        for placeholder, original in code_blocks.items():
+                            prompt = prompt.replace(placeholder, original)
+                            for k, v in attrs.items():
+                                if placeholder in v:
+                                    attrs[k] = v.replace(placeholder, original)
+                        return self._execute_media_tag(
+                            kind="video",
+                            action="generate",
+                            attrs=attrs,
+                            body=prompt,
+                            ai_message=ai_message,
+                            affected_artefacts=affected_artefacts,
+                            auto_activate_artefacts=auto_activate_artefacts,
+                        )
+
+                    cleaned = gen_vid_pattern.sub(handle_generate_video, cleaned)
+
+                if has_edit_vid:
+                    edit_vid_pattern = re.compile(
+                        r'^[ \t]*<edit_video\s*([^>]*)>(.*?)</edit_video>',
+                        re.DOTALL | re.IGNORECASE | re.MULTILINE,
+                    )
+
+                    def handle_edit_video(match: re.Match) -> str:
+                        attrs  = _parse_attrs(match.group(1))
+                        prompt = match.group(2).strip()
+                        for placeholder, original in code_blocks.items():
+                            prompt = prompt.replace(placeholder, original)
+                            for k, v in attrs.items():
+                                if placeholder in v:
+                                    attrs[k] = v.replace(placeholder, original)
+                        return self._execute_media_tag(
+                            kind="video",
+                            action="edit",
+                            attrs=attrs,
+                            body=prompt,
+                            ai_message=ai_message,
+                            affected_artefacts=affected_artefacts,
+                            auto_activate_artefacts=auto_activate_artefacts,
+                        )
+
+                    cleaned = edit_vid_pattern.sub(handle_edit_video, cleaned)
+
+        # ── 4b. Music generation / editing (TTM) ─────────────────────────────
+        if has_gen_mus or has_edit_mus:
+            ttm = getattr(self.lollmsClient, 'ttm', None)
+            ttm_ok = ttm is not None and callable(getattr(ttm, 'generate_music', None))
+            if not ttm_ok:
+                ASCIIColors.warning(
+                    "<generate_music>/<edit_music> found but lollmsClient.ttm is None or "
+                    "does not expose generate_music — skipping."
+                )
+            else:
+                if has_gen_mus:
+                    gen_mus_pattern = re.compile(
+                        r'^[ \t]*<generate_music\s*([^>]*)>(.*?)</generate_music>',
+                        re.DOTALL | re.IGNORECASE | re.MULTILINE,
+                    )
+
+                    def handle_generate_music(match: re.Match) -> str:
+                        attrs  = _parse_attrs(match.group(1))
+                        prompt = match.group(2).strip()
+                        for placeholder, original in code_blocks.items():
+                            prompt = prompt.replace(placeholder, original)
+                            for k, v in attrs.items():
+                                if placeholder in v:
+                                    attrs[k] = v.replace(placeholder, original)
+                        return self._execute_media_tag(
+                            kind="music",
+                            action="generate",
+                            attrs=attrs,
+                            body=prompt,
+                            ai_message=ai_message,
+                            affected_artefacts=affected_artefacts,
+                            auto_activate_artefacts=auto_activate_artefacts,
+                        )
+
+                    cleaned = gen_mus_pattern.sub(handle_generate_music, cleaned)
+
+                if has_edit_mus:
+                    edit_mus_pattern = re.compile(
+                        r'^[ \t]*<edit_music\s*([^>]*)>(.*?)</edit_music>',
+                        re.DOTALL | re.IGNORECASE | re.MULTILINE,
+                    )
+
+                    def handle_edit_music(match: re.Match) -> str:
+                        attrs  = _parse_attrs(match.group(1))
+                        prompt = match.group(2).strip()
+                        for placeholder, original in code_blocks.items():
+                            prompt = prompt.replace(placeholder, original)
+                            for k, v in attrs.items():
+                                if placeholder in v:
+                                    attrs[k] = v.replace(placeholder, original)
+                        return self._execute_media_tag(
+                            kind="music",
+                            action="edit",
+                            attrs=attrs,
+                            body=prompt,
+                            ai_message=ai_message,
+                            affected_artefacts=affected_artefacts,
+                            auto_activate_artefacts=auto_activate_artefacts,
+                        )
+
+                    cleaned = edit_mus_pattern.sub(handle_edit_music, cleaned)
+
+        # ── 4c. Speech synthesis / editing (TTS) ─────────────────────────────
+        if has_gen_spe or has_edit_spe:
+            tts = getattr(self.lollmsClient, 'tts', None)
+            tts_ok = tts is not None and callable(getattr(tts, 'generate_speech', None))
+            if not tts_ok:
+                ASCIIColors.warning(
+                    "<generate_speech>/<edit_speech> found but lollmsClient.tts is None or "
+                    "does not expose generate_speech — skipping."
+                )
+            else:
+                if has_gen_spe:
+                    gen_spe_pattern = re.compile(
+                        r'^[ \t]*<generate_speech\s*([^>]*)>(.*?)</generate_speech>',
+                        re.DOTALL | re.IGNORECASE | re.MULTILINE,
+                    )
+
+                    def handle_generate_speech(match: re.Match) -> str:
+                        attrs = _parse_attrs(match.group(1))
+                        text  = match.group(2).strip()
+                        for placeholder, original in code_blocks.items():
+                            text = text.replace(placeholder, original)
+                            for k, v in attrs.items():
+                                if placeholder in v:
+                                    attrs[k] = v.replace(placeholder, original)
+                        return self._execute_media_tag(
+                            kind="speech",
+                            action="generate",
+                            attrs=attrs,
+                            body=text,
+                            ai_message=ai_message,
+                            affected_artefacts=affected_artefacts,
+                            auto_activate_artefacts=auto_activate_artefacts,
+                        )
+
+                    cleaned = gen_spe_pattern.sub(handle_generate_speech, cleaned)
+
+                if has_edit_spe:
+                    edit_spe_pattern = re.compile(
+                        r'^[ \t]*<edit_speech\s*([^>]*)>(.*?)</edit_speech>',
+                        re.DOTALL | re.IGNORECASE | re.MULTILINE,
+                    )
+
+                    def handle_edit_speech(match: re.Match) -> str:
+                        attrs  = _parse_attrs(match.group(1))
+                        prompt = match.group(2).strip()
+                        for placeholder, original in code_blocks.items():
+                            prompt = prompt.replace(placeholder, original)
+                            for k, v in attrs.items():
+                                if placeholder in v:
+                                    attrs[k] = v.replace(placeholder, original)
+                        return self._execute_media_tag(
+                            kind="speech",
+                            action="edit",
+                            attrs=attrs,
+                            body=prompt,
+                            ai_message=ai_message,
+                            affected_artefacts=affected_artefacts,
+                            auto_activate_artefacts=auto_activate_artefacts,
+                        )
+
+                    cleaned = edit_spe_pattern.sub(handle_edit_speech, cleaned)
 
         # ── 5. Notes ──────────────────────────────────────────────────────────
         if has_note:
