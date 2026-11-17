@@ -20,6 +20,14 @@ description: >
   anything substantial — it writes and runs in a single call. Use
   tool_execute_python_file only to re-run an already-created file. Use
   tool_execute_python_code only for short, punctual, disposable one-liners.
+  PACKAGE INSTALLATION: a pip install in your code is operator-GATED, not
+  blocked. In safe/strict/full_access modes the host asks the operator to
+  approve installing the requested package specs; on approval the host runs
+  the install outside the sandbox and re-runs your code. If the operator
+  declines (or the host sets pip_install_policy='blocked'), the call returns
+  a clean refusal. Prefer the toolset's own dependency helpers
+  (`install_missing_dependencies([...])` / pipmaster) where available; use a
+  raw `pip install` only when that path is unavailable.
 input_parameters:
   - name: code
     type: str

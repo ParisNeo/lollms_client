@@ -257,10 +257,18 @@ class SandboxPermissionError(PermissionError):
 
 @dataclass
 class SandboxViolation:
-    """A static-analysis rejection returned by `validate_source`."""
+    """A static-analysis rejection returned by `validate_source`.
+
+    `requested_packages` is set (possibly to an empty list when the exact specs
+    could not be recovered) when the violation is a GATEABLE pip-install
+    request rather than an unconditional block. The tool layer recognises it,
+    asks the operator, and — on approval only — performs the install through
+    its trusted host path before re-running the code.
+    """
     reason: str
     snippet: str
     line: int
+    requested_packages: Optional[List[str]] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -334,6 +342,244 @@ DATA_QUERY_SAFE_OS_ATTRS: frozenset[str] = frozenset({
     "path", "getcwd", "listdir", "sep", "linesep", "curdir", "pardir",
     "environ",  # read-only usage is normal; we still block mutation calls
 })
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pip-install gating (package installation) — a *gateable* violation class.
+#
+# Package installation is a legitimate, recurring agent need ("install pandas",
+# "add plotly", "pip install torch"), yet it is genuinely risky: it runs an
+# external process, touches the network, and mutates the interpreter's
+# site-packages. The previous behaviour folded it into the blanket
+# `subprocess`/`os.system` block, so it was 100% refused with the same generic
+# "process execution is forbidden" message and no operator prompt.
+#
+# The correct contract mirrors the rest of the sandbox's risk model: a
+# structured, operator-gated violation. `_pip_install_packages(source)` returns
+# the package specs when the source attempts a pip install, or None otherwise.
+# It is a PROMPTING/ROUTING heuristic — NOT the runtime boundary: the parent
+# tool asks the operator, then (only on approval) runs pip through its trusted
+# host path OUTSIDE the sandboxed child. The static validators below convert a
+# positive match into a `SandboxViolation` carrying `requested_packages`, which
+# the tool layer recognises and gates instead of hard-refusing.
+#
+# Only the "standard"/"authorized" profiles (general execute_python) surface
+# this gateable violation. The "data_query" profile is intentionally strict and
+# keeps hard-blocking whatever its allowlist rejects.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_PIP_MODULE_NAMES: frozenset[str] = frozenset({"pip", "pip3"})
+# Shell-level pip-capable entry points a subprocess/os.system call may invoke.
+_PIP_SHELL_TOKENS: frozenset[str] = frozenset({"pip", "pip3", "py", "python", "python3"})
+
+# Package-spec safety: a pip requirement spec is `name[extra]==ver` etc. Reject
+# anything with whitespace control, shell metacharacters, or path traversal — a
+# gated install must never become a command-injection or file-write vector. The
+# install always runs with a LIST argv (never `shell=True`), but validating the
+# spec here keeps the contract explicit and auditable.
+_PIP_SPEC_UNSAFE_RE = re.compile(r"[\s;&|`$<>\"'\\]|\.\.")
+
+
+def _is_safe_pip_spec(spec: Any) -> bool:
+    """True iff `spec` looks like a single, safe pip requirement token."""
+    if not isinstance(spec, str):
+        return False
+    s = spec.strip()
+    if not s or len(s) > 200:
+        return False
+    return _PIP_SPEC_UNSAFE_RE.search(s) is None
+
+
+def _packages_from_pip_argv(argv: List[str]) -> Optional[List[str]]:
+    """Returns the package specs from a pip argv list, or None when it is not an install.
+
+    Recognises the canonical forms:
+      [python, -m, pip, install, pkg ...] / [pip, install, pkg ...] /
+      [pip3, install, -U, pkg ...]. Only `install` is a gated package operation;
+    other pip subcommands (`list`, `show`, `--version`, `uninstall`) are NOT
+    auto-gated here — they are handled by the normal process policy.
+    """
+    if not argv:
+        return None
+    tokens = [str(a) for a in argv if isinstance(a, (str, int, float))]
+    if not tokens:
+        return None
+    lowered = [t.lower() for t in tokens]
+    if "install" not in lowered:
+        return None
+    install_idx = lowered.index("install")
+    has_pip_context = False
+    for i, tok in enumerate(lowered):
+        if tok in _PIP_MODULE_NAMES:
+            has_pip_context = True
+            break
+        if tok in _PIP_SHELL_TOKENS and i + 2 < len(lowered) and lowered[i + 2] in _PIP_MODULE_NAMES:
+            has_pip_context = True
+            break
+    if not has_pip_context:
+        return None
+    specs: List[str] = []
+    for tok in tokens[install_idx + 1:]:
+        if tok.startswith("-"):
+            # Options (``-U``, ``--upgrade``, ``-q``) are dropped: the operator
+            # authorises package NAMES, not pip flags. Requirements files
+            # (``-r req.txt``) resolve to a local file the operator did not
+            # review — refuse the gate rather than install unseen packages.
+            if tok.lower() in ("-r", "--requirement", "-e", "--editable"):
+                return None
+            continue
+        specs.append(tok)
+    specs = [s for s in specs if _is_safe_pip_spec(s)]
+    return specs or None
+
+
+def _split_shell_command(command: str) -> List[str]:
+    """Splits a shell command line into tokens without invoking a shell."""
+    if not isinstance(command, str):
+        return []
+    return [tok for tok in re.split(r"\s+", command.strip()) if tok]
+
+
+def _pip_install_packages(source: str) -> Optional[List[str]]:
+    """Returns pip-install package specs the source requests, or None.
+
+    Detects the realistic, statically-visible install surfaces:
+      - ``subprocess.run/call/check_call/check_output/Popen([...pip...install...])``
+      - ``os.system("pip install pkg")`` / ``os.popen("python -m pip install pkg")``
+      - ``subprocess.run("pip install pkg", shell=True)``  (string command form)
+      - ``__import__("pip")`` / ``importlib.import_module("pip")`` +
+        subsequent ``pip``-API usage (``pip.main(...)`` / ``pip._internal``)
+
+    Returns a de-duplicated, order-preserving list of safe package specs, or
+    None when the source performs no pip install (or only an unsafe/unknown
+    install we refuse to gate — requirements files, shell redirections).
+
+    Never raises; a syntax error returns None (there is nothing to gate on
+    source that cannot compile, and the runtime will surface the SyntaxError).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    def _consume_argv_strings(node: Optional[ast.AST]) -> Optional[List[str]]:
+        if node is None:
+            return None
+        # List/tuple literal of string constants: the canonical safe form.
+        if isinstance(node, (ast.List, ast.Tuple)):
+            values: List[str] = []
+            for elt in node.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    values.append(elt.value)
+                elif isinstance(elt, ast.Constant) and isinstance(elt.value, (int, float)):
+                    values.append(str(elt.value))
+                elif isinstance(elt, ast.JoinedStr):
+                    # f-string: resolve constant fragments, else refuse (unknown).
+                    fragments: List[str] = []
+                    for piece in elt.values:
+                        if isinstance(piece, ast.Constant) and isinstance(piece.value, str):
+                            fragments.append(piece.value)
+                        else:
+                            return None
+                    values.append("".join(fragments))
+                else:
+                    return None
+            return values
+        # String literal command: split on whitespace (shell form).
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return _split_shell_command(node.value)
+        # Concatenation of literals is a common generated-code pattern.
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left = _consume_argv_strings(node.left)
+            right = _consume_argv_strings(node.right)
+            if left is None or right is None:
+                return None
+            return left + right
+        return None
+
+    found_specs: List[str] = []
+    pip_api_imported = False
+    importlib_aliases: set = set()
+    for node in ast.walk(tree):
+        # Track import aliases so `import pip as p; p.main(...)` and
+        # `import importlib as il; il.import_module("pip")` are recognised.
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0].lower()
+                if root in _PIP_MODULE_NAMES:
+                    pip_api_imported = True
+                if root == "importlib" and alias.asname:
+                    importlib_aliases.add(alias.asname)
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0].lower() in _PIP_MODULE_NAMES:
+                pip_api_imported = True
+        elif isinstance(node, ast.Call):
+            func = node.func
+            func_name = ""
+            func_attr = ""
+            if isinstance(func, ast.Attribute):
+                func_attr = func.attr
+                if isinstance(func.value, ast.Name):
+                    func_name = func.value.id
+            elif isinstance(func, ast.Name):
+                func_name = func.id
+
+            # Dynamic pip import: __import__("pip") / importlib.import_module("pip")
+            if func_name == "__import__" and node.args:
+                arg0 = node.args[0]
+                if isinstance(arg0, ast.Constant) and isinstance(arg0.value, str):
+                    if arg0.value.split(".")[0].lower() in _PIP_MODULE_NAMES:
+                        pip_api_imported = True
+            if func_attr == "import_module" and node.args:
+                arg0 = node.args[0]
+                if isinstance(arg0, ast.Constant) and isinstance(arg0.value, str):
+                    if arg0.value.split(".")[0].lower() in _PIP_MODULE_NAMES:
+                        pip_api_imported = True
+
+            # subprocess.<run|call|check_call|check_output|Popen>(...)
+            if func_name in (subprocess.__name__, "__import__"):
+                pass  # handled below by attribute branch
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                mod_name = func.value.id.lower()
+                if mod_name in (subprocess.__name__, "verbose_subprocess"):
+                    # Best-effort: accept the first positional arg OR the
+                    # common keywords `args`/`command`.
+                    argv_node: Optional[ast.AST] = None
+                    if node.args:
+                        argv_node = node.args[0]
+                    for kw in node.keywords:
+                        if kw.arg in ("args", "command", "cmd"):
+                            argv_node = kw.value
+                            break
+                    argv = _consume_argv_strings(argv_node)
+                    if argv:
+                        specs = _packages_from_pip_argv(argv)
+                        if specs:
+                            found_specs.extend(specs)
+
+            # os.system("...") / os.popen("...")
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                if func.value.id == "os" and func.attr in ("system", "popen", "startfile"):
+                    if node.args:
+                        argv = _consume_argv_strings(node.args[0])
+                        if argv:
+                            specs = _packages_from_pip_argv(argv)
+                            if specs:
+                                found_specs.extend(specs)
+
+    # If pip was imported and used through its API, but we could not extract the
+    # exact specs, do not invent packages — return an empty list so the caller
+    # can still surface a gateable violation whose package set is unknown.
+    if found_specs:
+        seen: set = set()
+        ordered: List[str] = []
+        for spec in found_specs:
+            if spec not in seen:
+                seen.add(spec)
+                ordered.append(spec)
+        return ordered
+    if pip_api_imported:
+        return []
+    return None
 
 # Builtins that escape the AST sandbox if exposed to user code.
 DANGEROUS_BUILTINS: frozenset[str] = frozenset({
@@ -1014,6 +1260,25 @@ def validate_source(source: str, profile: str) -> Optional[SandboxViolation]:
         return None
     if profile == "data_query":
         return _validate_data_query(tree)
+    # ── Gateable pip-install: a structured, operator-gated violation ──
+    # Run this BEFORE the denylist checks so an install surface is reported as
+    # "gated pip install" (carrying requested packages) instead of the generic
+    # "process execution is forbidden" that the subprocess/os.system rules would
+    # otherwise raise. The tool layer turns this into an operator prompt; only
+    # an approval reaches pip, and only through the trusted host path.
+    requested = _pip_install_packages(source)
+    if requested is not None:
+        pkg_display = ", ".join(requested) if requested else "(unspecified packages)"
+        return SandboxViolation(
+            reason=(
+                "This code performs a package installation via pip. "
+                "Package installs are operator-gated: the host must approve "
+                f"installing [{pkg_display}] before this code runs."
+            ),
+            snippet=(source.strip().splitlines()[0][:160] if source.strip() else "pip install"),
+            line=1,
+            requested_packages=list(requested),
+        )
     if profile == "authorized":
         return _validate_authorized(tree)
     return _validate_standard(tree)
@@ -1048,6 +1313,8 @@ __all__ = [
     "run_in_sandboxed_child",
     "set_extra_read_roots",
     "set_extra_write_roots",
+    "_pip_install_packages",
+    "_is_safe_pip_spec",
     "DANGEROUS_OS_ATTRS",
     "PROCESS_ESCAPE_OS_ATTRS",
     "MUTATING_OS_ATTRS",

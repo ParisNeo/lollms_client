@@ -734,8 +734,8 @@ RULES:
         registry = getattr(client, f"{kind}_model_profiles_registry", None)
         return bool(registry)
 
-    def _build_image_generation_instructions(self) -> str:
-        if not self._media_capability_probe('tti'):
+    def _build_image_generation_instructions(self, enabled: bool = True) -> str:
+        if not enabled or not self._media_capability_probe('tti'):
             return ""
         lines = [
             "",

@@ -95,6 +95,7 @@ _sandbox_validate_source = _sandbox_kernel.validate_source
 _SandboxViolation = _sandbox_kernel.SandboxViolation
 _SandboxPermissionError = _sandbox_kernel.SandboxPermissionError
 _run_in_sandboxed_child = _sandbox_kernel.run_in_sandboxed_child
+_pip_install_packages = getattr(_sandbox_kernel, "_pip_install_packages", None)
 
 TOOL_LIBRARY_NAME = "Execute Python"
 TOOL_LIBRARY_DESC = (
@@ -118,6 +119,16 @@ _APPROVED_CATEGORIES: frozenset = frozenset()
 # means "at least one category has been pre-approved".
 _AUTO_APPROVE_PYTHON: bool = False
 _CONFIRM_HANDLER: Optional[Any] = None
+
+# ── Package-install policy ─────────────────────────────────────────────────────
+# "gated"  (default): a pip install in user code is a GATEABLE operation — the
+#                      operator is prompted; on approval the host installs the
+#                      packages outside the sandbox, then the code re-runs.
+# "blocked":            a pip install is hard-refused (the pre-gating behaviour),
+#                      for environments that forbid package changes entirely.
+# Configured via `init_tools_library(config={"pip_install_policy": ...})`.
+PIP_INSTALL_POLICY: str = "gated"
+_PIP_POLICIES: frozenset = frozenset({"gated", "blocked"})
 
 _PREVIEW_WINDOW_CHARS = 8000
 _PREVIEW_HALF_CHARS = _PREVIEW_WINDOW_CHARS // 2
@@ -757,6 +768,16 @@ def init_tools_library(config: dict = None) -> None:
             ASCIIColors.info(f"[execute_python] Configured autonomy level: {AUTONOMY_LEVEL}")
         else:
             AUTONOMY_LEVEL = "safe"
+        # Package-install policy: "gated" (prompt the operator, default) or
+        # "blocked" (hard-refuse, for environments that forbid installs).
+        pip_policy = str(config.get("pip_install_policy", "gated")).lower().strip()
+        if pip_policy in _PIP_POLICIES:
+            PIP_INSTALL_POLICY = pip_policy
+        else:
+            ASCIIColors.warning(
+                f"[execute_python] Invalid pip_install_policy '{pip_policy}'. "
+                f"Expected one of {sorted(_PIP_POLICIES)}; defaulting to 'gated'."
+            )
         # Host-controlled pre-approval. Accepts either:
         #   - a bool (legacy `auto_approve: True`)  → approve ALL categories
         #   - an iterable of category names         → approve only those
@@ -876,6 +897,181 @@ def _is_headless_environment() -> bool:
     if os.environ.get("CI"):
         return True
     return False
+
+
+def _prompt_pip_install(packages: List[str], script_label: str) -> Tuple[str, str]:
+    """Asks the operator whether to install the requested packages.
+
+    Returns ("allow"|"reject", reason). Resolution mirrors `_prompt_user_validation`:
+      1. `_CONFIRM_HANDLER` (GUI/WebUI/host API) is asked first, with a
+         structured payload whose `action_type` is `pip_install`.
+      2. Headless (pytest / CI): refuse — the sandbox is the control and there
+         is no human to authorise a package install.
+      3. Interactive TTY: prompt directly.
+      4. No interactive channel: refuse (fail safe — never install silently).
+    """
+    handler = _CONFIRM_HANDLER
+    if not handler:
+        for mod_name, mod in list(sys.modules.items()):
+            if "execute_python" in mod_name and hasattr(mod, "_CONFIRM_HANDLER") and mod._CONFIRM_HANDLER:
+                handler = mod._CONFIRM_HANDLER
+                break
+
+    package_text = ", ".join(packages) if packages else "(unspecified — provides via pip API)"
+
+    if handler is not None and callable(handler):
+        try:
+            try:
+                res = handler({
+                    "tool_name": "execute_python",
+                    "action_type": "pip_install",
+                    "packages": list(packages),
+                    "script_label": script_label,
+                    "label": script_label,
+                    "content": package_text,
+                    "metadata": {"autonomy_level": AUTONOMY_LEVEL},
+                })
+            except TypeError:
+                res = handler(script_label)
+            if isinstance(res, tuple):
+                decision = str(res[0]).strip().lower()
+                reason = str(res[1]) if len(res) > 1 else ""
+            elif isinstance(res, bool):
+                decision, reason = ("allow", "") if res else ("reject", "Declined by operator.")
+            elif isinstance(res, str):
+                decision, reason = res.strip().lower(), ""
+            else:
+                decision, reason = "allow", ""
+            if decision in ("allow", "always", "y", "yes", "true"):
+                return "allow", ""
+            return "reject", reason or f"Package installation of [{package_text}] declined by operator."
+        except Exception as handler_err:
+            ASCIIColors.warning(f"[execute_python] Pip-install confirm handler failed: {handler_err}")
+            return "reject", f"Confirmation handler failed: {handler_err}"
+
+    if _is_headless_environment():
+        return "reject", (
+            "Headless environment (pytest/CI): package installation requires an "
+            f"interactive operator. Requested: [{package_text}]."
+        )
+
+    if _can_prompt_interactive():
+        ASCIIColors.panel(
+            f"[bold cyan]Script:[/bold cyan] [yellow]{script_label}[/yellow]\n"
+            f"[bold cyan]Packages to install:[/bold cyan] [green]{package_text}[/green]\n\n"
+            "[bold yellow]⚠️  The LLM agent wants to install Python packages "
+            "into the current environment.[/bold yellow]\n"
+            "[dim]This runs `pip install` outside the sandbox and modifies site-packages.[/dim]",
+            title="[bold yellow]📦 Package Installation Authorization[/bold yellow]",
+            border_style="yellow",
+        )
+        try:
+            choice = input("  Install these packages? [y]es / [n]o (default: n): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "reject", "Package installation interrupted by operator (Ctrl+C / EOF)."
+        if choice in ("y", "yes"):
+            return "allow", ""
+        return "reject", f"Package installation of [{package_text}] declined by operator."
+
+    return "reject", (
+        "No interactive channel available (no TTY, no confirm_handler registered). "
+        f"Package installation of [{package_text}] cannot be authorized. Pass a "
+        "confirm_handler to the discussion or enable full_access mode."
+    )
+
+
+def _perform_pip_install(packages: List[str]) -> Dict[str, Any]:
+    """Installs `packages` in the HOST environment (outside the sandbox).
+
+    Contract:
+      - Uses pipmaster when available (respects the project's install policy).
+      - Falls back to `sys.executable -m pip install` with a LIST argv (never
+        `shell=True`) using subprocess directly — this function runs in the
+        host tool process, not inside `SandboxContext`.
+      - Each spec is re-validated here (defence in depth) so an injection can
+        never reach the argv even if the caller skipped validation.
+
+    Returns {"success": bool, "installed": [...], "error": Optional[str],
+             "stdout": str, "stderr": str}.
+    """
+    import subprocess as _sp
+
+    if not packages:
+        return {
+            "success": False,
+            "installed": [],
+            "error": "No package specs were extracted from the install command.",
+            "stdout": "",
+            "stderr": "",
+        }
+
+    unsafe = [p for p in packages if not _is_safe_pip_spec_spec(p)]
+    if unsafe:
+        return {
+            "success": False,
+            "installed": [],
+            "error": f"Refused unsafe package spec(s): {unsafe}. Only plain pip requirement tokens are allowed.",
+            "stdout": "",
+            "stderr": "",
+        }
+
+    try:
+        import pipmaster as pm  # type: ignore
+        pm.ensure_packages(packages)
+        return {"success": True, "installed": list(packages), "error": None, "stdout": "", "stderr": ""}
+    except ImportError:
+        pass
+    except Exception as pm_err:
+        ASCIIColors.warning(
+            f"[execute_python] pipmaster install failed ({pm_err}); falling back to pip CLI."
+        )
+
+    try:
+        completed = _sp.run(
+            [sys.executable, "-m", "pip", "install", *packages],
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+    except Exception as run_err:
+        return {
+            "success": False,
+            "installed": [],
+            "error": f"pip install failed to launch: {run_err}",
+            "stdout": "",
+            "stderr": "",
+        }
+
+    if completed.returncode != 0:
+        return {
+            "success": False,
+            "installed": [],
+            "error": f"pip install exited with code {completed.returncode}.",
+            "stdout": completed.stdout or "",
+            "stderr": completed.stderr or "",
+        }
+    return {
+        "success": True,
+        "installed": list(packages),
+        "error": None,
+        "stdout": completed.stdout or "",
+        "stderr": completed.stderr or "",
+    }
+
+
+def _is_safe_pip_spec_spec(spec: Any) -> bool:
+    """Local mirror of the kernel's spec validator (single source of truth when importable)."""
+    if _pip_install_packages is not None:
+        validator = getattr(_sandbox_kernel, "_is_safe_pip_spec", None)
+        if callable(validator):
+            return bool(validator(spec))
+    if not isinstance(spec, str):
+        return False
+    s = spec.strip()
+    if not s or len(s) > 200:
+        return False
+    return re.search(r'[\s;&|`$<>"\'\\]|\.\.', s) is None
 
 
 def _prompt_user_validation(source: str, script_label: str, argv: Optional[List[Any]] = None) -> Tuple[str, str]:
@@ -1608,24 +1804,85 @@ def _run_python_source(
 
     static_violation = _sandbox_validate_source(source, profile=_static_profile)
     if static_violation is not None:
-        ASCIIColors.warning(
-            f"[execute_python] Static sandbox rejection ({_static_profile}): "
-            f"{static_violation.reason}"
-        )
-        return {
-            "success": False,
-            "error": (
-                f"🛑 BLOCKED BY SANDBOX (line {static_violation.line}): "
-                f"{static_violation.reason}\n"
-                f"Offending construct: {static_violation.snippet}\n"
-                "This primitive has no safe alternative inside the sandbox — even "
-                "with user authorization it cannot be reached from Python code "
-                "because it can escape the sandbox at the native level. "
-                "Use the system_shell tool if you legitimately need host commands."
-            ),
-            "output": "",
-            "stderr": "static_sandbox_rejection",
-        }
+        # ── Gateable pip-install escalation ──
+        # A pip install is not an unconditional block: it is a package change the
+        # operator must approve. If the violation is GATEABLE (the kernel tagged
+        # it with `requested_packages`), route it through the operator prompt and,
+        # on approval, install via the trusted host path BEFORE re-running the
+        # source. On rejection (or when the policy is "blocked"), return a clean
+        # structured refusal — never a silent install.
+        requested_packages = getattr(static_violation, "requested_packages", None)
+        if requested_packages is not None:
+            if PIP_INSTALL_POLICY == "blocked":
+                ASCIIColors.warning(
+                    "[execute_python] Pip install refused (pip_install_policy='blocked')."
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        "🛑 BLOCKED BY SANDBOX: package installation is disabled by "
+                        "policy ('pip_install_policy=blocked'). Ask the operator to "
+                        "change the policy or install the packages manually."
+                    ),
+                    "output": "",
+                    "stderr": "pip_install_blocked_by_policy",
+                }
+
+            decision, pip_reason = _prompt_pip_install(
+                list(requested_packages), script_label
+            )
+            if decision != "allow":
+                return {
+                    "success": False,
+                    "error": (
+                        "🛑 BLOCKED BY OPERATOR: package installation was not authorized.\n"
+                        f"Reason: {pip_reason or 'declined'}\n"
+                        f"Requested packages: {', '.join(requested_packages) or '(unspecified)'}"
+                    ),
+                    "output": "",
+                    "stderr": "pip_install_rejected",
+                }
+
+            install_result = _perform_pip_install(list(requested_packages))
+            if not install_result.get("success"):
+                return {
+                    "success": False,
+                    "error": (
+                        "Package installation failed; the code was not executed.\n"
+                        f"Details: {install_result.get('error')}"
+                    ),
+                    "output": install_result.get("stdout", ""),
+                    "stderr": install_result.get("stderr", "") or "pip_install_failed",
+                }
+            ASCIIColors.success(
+                f"[execute_python] 📦 Installed: {', '.join(install_result.get('installed', []))}"
+            )
+            # Re-validate now that the packages are installed: the source still
+            # performs the same install call, which we strip from the runtime
+            # copy so the child does not attempt a nested install under the
+            # runtime gate. The install already happened here on the host.
+            source = _strip_pip_install_calls(source)
+            static_violation = _sandbox_validate_source(source, profile=_static_profile)
+
+        if static_violation is not None:
+            ASCIIColors.warning(
+                f"[execute_python] Static sandbox rejection ({_static_profile}): "
+                f"{static_violation.reason}"
+            )
+            return {
+                "success": False,
+                "error": (
+                    f"🛑 BLOCKED BY SANDBOX (line {static_violation.line}): "
+                    f"{static_violation.reason}\n"
+                    f"Offending construct: {static_violation.snippet}\n"
+                    "This primitive has no safe alternative inside the sandbox — even "
+                    "with user authorization it cannot be reached from Python code "
+                    "because it can escape the sandbox at the native level. "
+                    "Use the system_shell tool if you legitimately need host commands."
+                ),
+                "output": "",
+                "stderr": "static_sandbox_rejection",
+            }
 
     _np = None
     _plt = None
@@ -1976,6 +2233,118 @@ def _run_python_source(
         "output": _sanitize_host_paths(out_str),
         "stderr": _sanitize_host_paths(_window_output(err_str)),
     }
+
+
+def _strip_pip_install_calls(source: str) -> str:
+    """Removes statically-identified pip-install calls from `source`.
+
+    After the host has performed the install, leaving the child to re-run
+    ``subprocess.run([..., "pip", "install", ...])`` would fail at the runtime
+    process gate (the child cannot spawn subprocesses under the sandbox). This
+    rewrites the source to a no-op at those exact call sites — preserving all
+    other code, line count is NOT preserved (this is a post-install rewrite,
+    traceback line numbers refer to the rewritten source).
+
+    Best-effort by design: on any transform failure the ORIGINAL source is
+    returned unchanged. A call that the transform cannot safely isolate is left
+    in place so the runtime gate refuses it explicitly (fail-safe, never
+    silently runs an unintended install).
+    """
+    if _pip_install_packages is None:
+        return source
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    install_call_nodes: List[ast.Call] = []
+
+    def _consume_argv_strings(node: Optional[ast.AST]) -> Optional[List[str]]:
+        if node is None:
+            return None
+        if isinstance(node, (ast.List, ast.Tuple)):
+            values: List[str] = []
+            for elt in node.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    values.append(elt.value)
+                elif isinstance(elt, ast.Constant) and isinstance(elt.value, (int, float)):
+                    values.append(str(elt.value))
+                elif isinstance(elt, ast.JoinedStr):
+                    fragments: List[str] = []
+                    for piece in elt.values:
+                        if isinstance(piece, ast.Constant) and isinstance(piece.value, str):
+                            fragments.append(piece.value)
+                        else:
+                            return None
+                    values.append("".join(fragments))
+                else:
+                    return None
+            return values
+        if isinstance(elt := node, ast.Constant) and isinstance(elt.value, str):
+            return [t for t in re.split(r"\s+", elt.value.strip()) if t]
+        return None
+
+    def _is_install_argv(argv: Optional[List[str]]) -> bool:
+        if not argv:
+            return False
+        lowered = [t.lower() for t in argv]
+        if "install" not in lowered:
+            return False
+        return any(tok in ("pip", "pip3") for tok in lowered)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        argv: Optional[List[str]] = None
+        candidate = False
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            mod = func.value.id.lower()
+            if mod == subprocess.__name__ and func.attr in ("run", "call", "check_call", "check_output", "Popen"):
+                candidate = True
+            elif mod == "os" and func.attr in ("system", "popen"):
+                candidate = True
+        if not candidate:
+            continue
+        if node.args:
+            argv = _consume_argv_strings(node.args[0])
+        if argv is None:
+            for kw in node.keywords:
+                if kw.arg in ("args", "command", "cmd"):
+                    argv = _consume_argv_strings(kw.value)
+                    break
+        if _is_install_argv(argv):
+            install_call_nodes.append(node)
+
+    if not install_call_nodes:
+        return source
+
+    lines = source.splitlines(keepends=True)
+    removals: List[Tuple[int, int]] = []
+    for call_node in install_call_nodes:
+        start = getattr(call_node, "lineno", None)
+        end = getattr(call_node, "end_lineno", None)
+        if start is None or end is None:
+            continue
+        removals.append((start, end))
+    if not removals:
+        return source
+
+    kept_lines: List[str] = []
+    skip_ranges = sorted(removals)
+    idx = 0
+    line_no = 1
+    while idx < len(lines):
+        current_start, current_end = (skip_ranges[0] if skip_ranges else (0, 0))
+        if skip_ranges and current_start <= line_no <= current_end:
+            idx += current_end - line_no + 1
+            line_no = current_end + 1
+            skip_ranges.pop(0)
+            continue
+        kept_lines.append(lines[idx])
+        idx += 1
+        line_no += 1
+    return "".join(kept_lines)
 
 
 def _get_workspace_root(tool_ctx: Optional[Any] = None) -> Path:
