@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-17 14:25]
+
+- feat(lollms_client): add image upload capability to chat mixin
+
 ## [2026-11-17 01:39]
 
 - `Fix version bump in lollms_client client module: Update major version to v1.22.11.`

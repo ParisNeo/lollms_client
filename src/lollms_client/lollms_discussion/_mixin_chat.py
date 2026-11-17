@@ -377,6 +377,101 @@ _IMAGE_EXT_MIME = {
 
 _IMAGE_ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
+# ── 🖼️ IMAGE PAYLOAD VALIDATION (MAGIC-BYTE SNIFF) ────────────────────────────
+# Image candidates reach the LLM bindings from three independent sources:
+#   • user-supplied `images` (raw base64, or data URLs)
+#   • affected-artefact `images` (DB pixels persisted by earlier turns/tools)
+#   • tool/VLM injection blocks (already `{"type":"image_url", ...}` dicts)
+# Any one of those can carry a non-image payload — a metadata card string, an
+# empty string, raw text, a data URL with the wrong prefix, or base64 of a file
+# that is not actually raster image data. The OpenAI-compatible server decodes
+# these at request time and rejects the ENTIRE call with
+#   "Failed to load image: cannot identify image file"
+# which wedges the whole turn. We therefore validate magic bytes HERE, before
+# the payload is ever wrapped into a `data:` URL or forwarded to a binding.
+_IMAGE_MAGIC_PREFIXES: Tuple[Tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+)
+
+
+def _sniff_image_mime(raw: bytes) -> Optional[str]:
+    """Returns the image MIME type from magic bytes, or None if not a raster image.
+
+    Covers PNG, JPEG, GIF, BMP, and WEBP (RIFF....WEBP). Never raises.
+    """
+    if not raw or len(raw) < 12:
+        return None
+    for prefix, mime in _IMAGE_MAGIC_PREFIXES:
+        if raw.startswith(prefix):
+            return mime
+    # WEBP: "RIFF" + 4-byte size + "WEBP"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+_DATA_URL_IMAGE_RE = re.compile(r'^data:image/[a-zA-Z0-9.+-]+;base64,(.+)$', re.DOTALL)
+
+
+def _normalize_image_to_data_url(candidate: Any) -> Optional[str]:
+    """Normalizes ONE image candidate into a valid ``data:<mime>;base64,<...>`` URL.
+
+    Accepts:
+      • a bare base64 string (optionally whitespace-wrapped)
+      • a ``data:image/...;base64,...`` data URL string
+      • a dict block ``{"type": "image_url", "image_url": {"url": ...}}``
+      • a dict with a plain ``url`` key
+
+    Returns the clean data URL, or ``None`` when the candidate is not decodable
+    base64 of a REAL raster image (magic-byte validated). Never raises.
+    """
+    url: Optional[str] = None
+
+    if isinstance(candidate, dict):
+        if isinstance(candidate.get("image_url"), dict):
+            inner = candidate["image_url"].get("url")
+            if isinstance(inner, str):
+                url = inner
+        elif isinstance(candidate.get("url"), str):
+            url = candidate["url"]
+    elif isinstance(candidate, str):
+        url = candidate
+
+    if not url or not isinstance(url, str):
+        return None
+
+    stripped = url.strip()
+    if not stripped:
+        return None
+
+    # Extract the base64 body (strip an existing data URL prefix if present).
+    data_url_match = _DATA_URL_IMAGE_RE.match(stripped)
+    b64_body = data_url_match.group(1) if data_url_match else stripped
+
+    # A bare base64 string may still contain embedded whitespace/newlines.
+    b64_body = re.sub(r'\s+', '', b64_body)
+    if not b64_body:
+        return None
+
+    try:
+        raw_bytes = base64.b64decode(b64_body, validate=False)
+    except Exception:
+        return None
+
+    mime = _sniff_image_mime(raw_bytes)
+    if mime is None:
+        return None
+
+    # Re-encode from the verified bytes so the emitted data URL is guaranteed
+    # to round-trip and carries an accurate MIME type (source prefix may have
+    # been wrong or absent).
+    clean_b64 = base64.b64encode(raw_bytes).decode("ascii")
+    return f"data:{mime};base64,{clean_b64}"
+
 
 def _normalize_image_workspace_path(raw_name: str, default_stem: str = "generated_image") -> str:
     """
@@ -9442,6 +9537,63 @@ class ChatMixin:
                 kept.extend(msgs)
             virtual_history[:] = kept
 
+        def _extract_leading_preamble(text: str) -> str:
+            """Returns the leading preamble sentence/word-block used for repetition matching.
+
+            The repetition is a *preamble* phenomenon: the model opens each round
+            with the same intent sentence ("I have all the information I need. Let
+            me now...") and only then (if ever) diverges. We therefore compare a
+            fixed-length prefix of the assistant's text, whitespace-normalised, so
+            minor trailing differences do not defeat detection.
+            """
+            normalised = re.sub(r'\s+', ' ', (text or '').strip())
+            return normalised[:200]
+
+        def _prune_repeated_preamble_tail() -> int:
+            """Removes the trailing run of assistant entries that repeat the SAME
+            leading preamble. Returns the number of assistant rounds pruned.
+
+            Contract:
+            - Compare the leading preamble of the most recent assistant entry
+              against earlier assistant entries.
+            - Find the OLDEST assistant entry in the trailing run that shares the
+              identical preamble (the *first* hallucinated entry of the streak).
+            - Drop that entry and everything after it — along with any user
+              (tool-result / correction) entries interleaved with them — so the
+              model can no longer "see itself" and copy the preamble again.
+            - If fewer than 2 assistant entries share the preamble, do nothing
+              (one occurrence is not yet a repetition).
+            """
+            assistant_idx = [
+                i for i, vh in enumerate(virtual_history)
+                if getattr(vh, "sender_type", "") == "assistant"
+            ]
+            if len(assistant_idx) < 2:
+                return 0
+
+            last_text = getattr(virtual_history[assistant_idx[-1]], "content", "")
+            last_preamble = _extract_leading_preamble(last_text)
+            if len(last_preamble) < 30:
+                # Too short to be a reliable repetition signature.
+                return 0
+
+            first_repeat_idx = None
+            for idx in assistant_idx:
+                entry_text = getattr(virtual_history[idx], "content", "")
+                if _extract_leading_preamble(entry_text) == last_preamble:
+                    first_repeat_idx = idx
+                    break
+
+            if first_repeat_idx is None:
+                return 0
+
+            pruned_rounds = 0
+            for idx in assistant_idx:
+                if idx >= first_repeat_idx:
+                    pruned_rounds += 1
+            del virtual_history[first_repeat_idx:]
+            return pruned_rounds
+
         def _previous_round_was_artifact_only_or_empty() -> bool:
             """True when the last assistant round in virtual history carried no
             prose — only functional tags (artifact/image) or nothing at all.
@@ -9675,6 +9827,13 @@ class ChatMixin:
         object.__setattr__(self, "_maybe_sync_active_artifacts_to_disk", _maybe_sync_active_artifacts_to_disk)
 
         round_event_state = {"last_status": None}
+        # ── 🔁 REPETITION REWIND MARKER ──────────────────────────────────────
+        # Snapshot of virtual_history length taken WHEN the first repetition
+        # is detected (noncompliance_streak == 1). If the streak escalates to
+        # shake_active (>= 2), we prune virtual_history back to this snapshot
+        # so the model cannot keep imitating its own repeated output.
+        # None means "no prune needed this round".
+        repetition_rewind_marker: Optional[int] = None
         if dynamic_effort:
             if reasoning_effort:
                 active_reasoning_effort = str(reasoning_effort).strip().lower()
@@ -9714,6 +9873,29 @@ class ChatMixin:
             _emit_round_event(MSG_TYPE.MSG_TYPE_ROUND_START)
 
             shake_active = noncompliance_streak >= 2
+            # ── 🔁 REPETITION PRUNE (ANTI-SELF-IMITATION) ──
+            # When a repetition streak is active, instead of accumulating the
+            # repeated round(s) in virtual_history (which the model then copies
+            # verbatim, feeding the loop), we REWIND virtual_history back to the
+            # state BEFORE the first repeated round — so the model sees only
+            # everything up to (and including) the last genuinely productive
+            # message. Round counter is rewound to match. This is far more
+            # effective than temperature shaking alone: the model can no longer
+            # imitate its own prior (identical) output.
+            if shake_active and repetition_rewind_marker is not None:
+                _rewind_to = repetition_rewind_marker
+                _dropped = 0
+                if len(virtual_history) > _rewind_to:
+                    _dropped = len(virtual_history) - _rewind_to
+                    del virtual_history[_rewind_to:]
+                    round_count = max(1, round_count - _dropped)
+                    _dbg(
+                        f"[ChatLoop] Repetition prune: dropped {_dropped} repeated "
+                        f"message(s) from virtual_history; round counter rewound to "
+                        f"{round_count}."
+                    )
+                # Reset the marker so we only rewind once per repetition episode.
+                repetition_rewind_marker = None
             if shake_active:
                 base_temp = kwargs.get("temperature")
                 if isinstance(base_temp, (int, float)):
@@ -13221,6 +13403,18 @@ class ChatMixin:
 
                 _dbg("[ChatMixin] Text-only round without <done/>. Continuing loop until explicit termination.")
                 noncompliance_streak += 1
+
+                # ── 🔁 FIRST-REPETITION REWIND MARKER ──
+                # On the FIRST non-compliant round, snapshot the current
+                # virtual_history length. The current round's assistant text
+                # has ALREADY been appended, and the correction user message
+                # is appended immediately below — so this snapshot marks the
+                # position AFTER the repeated assistant text. If the streak
+                # escalates to shake_active (>= 2), the round-loop head rewinds
+                # virtual_history to a marker taken one round EARLIER (see the
+                # shake_active prune block), removing the imitation anchor.
+                if noncompliance_streak == 1:
+                    repetition_rewind_marker = len(virtual_history)
 
                 # ── 🛠️ NATIVE-TOOL BINDINGS ARE EXEMPT FROM INTENT-ONLY FORCING ──
                 # When the active binding drives native tool calls (either by
