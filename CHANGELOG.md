@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-18 22:49]
+
+- feat(workspace_tools): add `tool_grep_file` alias for singular pattern matching
+
 ## [2026-11-17 23:59]
 
 - chore: bump version to 1.22.12

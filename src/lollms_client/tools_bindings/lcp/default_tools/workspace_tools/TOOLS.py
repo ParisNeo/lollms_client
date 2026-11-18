@@ -459,3 +459,38 @@ def tool_grep_files(
         return {"success": False, "error": f"Invalid regex pattern: {re_err}"}
     except Exception as e:
         return {"success": False, "error": f"An unexpected error occurred during grep: {str(e)}"}
+
+
+def tool_grep_file(
+    pattern: str,
+    path: Optional[str] = None,
+    file_extension: Optional[str] = None,
+    max_results: int = 50,
+    search_mode: str = "case_insensitive",
+    sort_by_relevance: bool = True,
+) -> Dict[str, Any]:
+    """
+    Search for a pattern across files in the workspace (singular alias of tool_grep_files).
+
+    This alias exists because models frequently call the singular name `tool_grep_file`.
+    The `path` argument is accepted for backward compatibility but IGNORED for scoping:
+    searching always happens from the workspace root, because LCP already mounts the
+    agent in the correct working directory. Passing a file name (e.g. 'train_surrogate.py')
+    as `pattern` will search for its occurrences inside file *contents*, not for a filename.
+    Use `tool_find_files` to locate a file by name.
+
+    Args:
+        pattern (str): The search pattern (regex for 'exact', literal/keywords otherwise).
+        path (str, optional): Ignored. Kept only for model-argument compatibility.
+        file_extension (str, optional): Filter by extension (e.g. '.py'). '*' = all files.
+        max_results (int): Maximum number of matching lines to return. Defaults to 50.
+        search_mode (str): 'exact' | 'case_sensitive' | 'case_insensitive' | 'fuzzy' | 'words'.
+        sort_by_relevance (bool): Sort fuzzy/words results by score descending.
+    """
+    return tool_grep_files(
+        pattern=pattern,
+        file_extension=file_extension,
+        max_results=max_results,
+        search_mode=search_mode,
+        sort_by_relevance=sort_by_relevance,
+    )
