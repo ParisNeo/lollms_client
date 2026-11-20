@@ -1,0 +1,53 @@
+# ── MCP SERVER MANIFEST: Filesystem (stdio) ─────────────────────────────────
+#
+# The filename stem (`filesystem`) is the canonical server_id. It is used as
+# the tool namespace prefix (e.g. `filesystem__read_file`) and log tag. It MUST
+# match `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`.
+#
+# Transport: `stdio` launches `command` + `args` as a subprocess and speaks
+# JSON-RPC over the process's stdin/stdout. No network ports are opened.
+
+title: Filesystem
+description: >
+  Read and write files inside the agent workspace. Provides
+  read_file, write_file, list_directory, and search tools backed by the
+  reference `@modelcontextprotocol/server-filesystem` server.
+
+# Setting `enabled: false` keeps the manifest on disk for reference but tells
+# the host to skip it. Absence of this key is equivalent to `true`.
+enabled: true
+
+transport: stdio
+
+# `command` is REQUIRED for stdio. `args` is optional but in practice the
+# reference servers need a working directory argument — that's the last item.
+command: npx
+args:
+  - "-y"
+  - "@modelcontextprotocol/server-filesystem"
+  - "/workspace"
+
+# Optional environment variables for the subprocess. Do NOT commit secrets;
+# reference them via ${ENV_VAR} and let the host expand them.
+env:
+  NODE_ENV: production
+
+# Security posture. Every key has a safe default (shown below). The host is
+# expected to enforce these when the server's tools are mounted.
+security:
+  # Allow tools that mutate the filesystem. Safe-default is false.
+  allow_file_write: true
+  # Allow tools that spawn shells or arbitrary commands. Safe-default is false.
+  allow_shell: false
+  # Whitelist of paths tools may touch. Empty list = no restriction *requested*
+  # by this manifest (the host MAY still apply its own global policy).
+  allowed_paths:
+    - "/workspace"
+  # Hard denylist applied after whitelisting.
+  denied_tools:
+    - "write_file_outside_workspace"
+  # Force interactive user approval for every tool call from this server.
+  approval_required: false
+
+# Per-request timeout hint for the transport layer, in seconds.
+timeout_seconds: 30

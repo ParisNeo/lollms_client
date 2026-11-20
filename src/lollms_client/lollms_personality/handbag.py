@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Union
 
 from ascii_colors import ASCIIColors
 
+from .mcp_hooks import MCPServerSpec, load_mcp_manifests
+
 
 class Handbag:
     """
@@ -296,6 +298,35 @@ class Handbag:
 
         self.memory_db_path: Optional[str] = f"sqlite:///{self.memory_dir / 'memory.db'}" if self.memory_dir.exists() else None
         self.assets: Dict[str, str] = self._load_assets()
+
+        # ── OPTIONAL MCP HOOKS ──
+        # A handbag MAY ship an `mcp/` folder with one YAML manifest per MCP
+        # server. Parsing is pure (no subprocess, no socket) so importing a
+        # handbag never has side effects. Malformed manifests are skipped with
+        # a warning; any file failure NEVER aborts handbag construction.
+        self.mcp_dir = self.path / "mcp"
+        self.mcp_servers: List[MCPServerSpec] = []
+        self.mcp_warnings: List[str] = []
+        try:
+            self.mcp_servers, self.mcp_warnings = load_mcp_manifests(self.mcp_dir)
+            if self.mcp_servers:
+                ASCIIColors.success(
+                    f"[Handbag] Loaded {len(self.mcp_servers)} MCP server "
+                    f"manifest(s) from '{self.mcp_dir}': "
+                    f"{[s.server_id for s in self.mcp_servers]}"
+                )
+            if self.mcp_warnings:
+                ASCIIColors.warning(
+                    f"[Handbag] {len(self.mcp_warnings)} MCP manifest(s) in "
+                    f"'{self.mcp_dir}' were skipped: {self.mcp_warnings}"
+                )
+        except Exception as exc:
+            ASCIIColors.warning(
+                f"[Handbag] MCP subsystem failed to initialise for handbag "
+                f"'{self.path.name}': {exc} — continuing without MCP hooks."
+            )
+            self.mcp_servers = []
+            self.mcp_warnings = [str(exc)]
 
 
 
@@ -778,6 +809,30 @@ class Handbag:
         (p / "memory").mkdir(exist_ok=True)
         (p / "assets").mkdir(exist_ok=True)
         (p / "workspace").mkdir(exist_ok=True)
+        # `mcp/` is optional and created with a README so users discover the
+        # feature without a YAML file being present (empty dirs are not
+        # tracked by git and confusing to debug).
+        mcp_dir = p / "mcp"
+        mcp_dir.mkdir(exist_ok=True)
+        readme = mcp_dir / "README.md"
+        if not readme.exists():
+            readme.write_text(
+                "# MCP Hooks\n\n"
+                "Drop one YAML file per MCP server into this folder.\n\n"
+                "Example (`filesystem.yaml`):\n\n"
+                "```yaml\n"
+                "title: Filesystem\n"
+                "transport: stdio\n"
+                "command: npx\n"
+                "args: [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/workspace\"]\n"
+                "security:\n"
+                "  allow_file_write: true\n"
+                "  allow_shell: false\n"
+                "  allowed_paths: [\"/workspace\"]\n"
+                "```\n\n"
+                "See `docs/PERSONALITIES_AND_HANDBAGS.md` for the full schema.\n",
+                encoding="utf-8",
+            )
         return p
 
     def _load_assets(self) -> Dict[str, str]:
@@ -788,6 +843,51 @@ class Handbag:
             if f.is_file():
                 assets[f.name] = str(f.resolve())
         return assets
+
+    # ── MCP HOOKS (OPTIONAL) ────────────────────────────────────────────────
+
+    @property
+    def enabled_mcp_servers(self) -> List[MCPServerSpec]:
+        """Returns only the MCP specs whose manifest declares ``enabled: true``.
+
+        Host applications MUST iterate this property (not ``mcp_servers``)
+        when deciding which servers to actually connect to.
+        """
+        return [spec for spec in self.mcp_servers if spec.enabled]
+
+    def register_mcp_server(self, spec: MCPServerSpec) -> None:
+        """Registers an already-constructed :class:`MCPServerSpec` in memory.
+
+        Intended for host applications that build MCP specs dynamically (e.g.
+        from a GUI wizard) without writing a YAML file. Idempotent: a spec
+        whose ``server_id`` already exists is replaced, preserving uniqueness
+        of the ID within the handbag.
+        """
+        if not isinstance(spec, MCPServerSpec):
+            raise TypeError(
+                f"register_mcp_server expects MCPServerSpec, got "
+                f"{type(spec).__name__}"
+            )
+        self.mcp_servers = [s for s in self.mcp_servers if s.server_id != spec.server_id]
+        self.mcp_servers.append(spec)
+        self.mcp_servers.sort(key=lambda s: s.server_id)
+
+    def mcp_manifest_summary(self) -> List[Dict[str, Any]]:
+        """Returns a JSON-serialisable summary of every loaded MCP spec.
+
+        Suitable for surfacing to a GUI or the LLM as a catalogue. Secrets
+        (``env`` values and ``headers`` values) are redacted — those fields are
+        exposed only as key names with a ``"<redacted>"`` placeholder.
+        """
+        summary: List[Dict[str, Any]] = []
+        for spec in self.mcp_servers:
+            entry = spec.to_manifest_dict()
+            if entry.get("env"):
+                entry["env"] = {k: "<redacted>" for k in entry["env"]}
+            if entry.get("headers"):
+                entry["headers"] = {k: "<redacted>" for k in entry["headers"]}
+            summary.append(entry)
+        return summary
 
     def create_memory_manager(self) -> Optional[Any]:
         if not self.memory_db_path:

@@ -10,12 +10,16 @@
 
 1. [Overview — Why Two Tiers?](#1-overview--why-two-tiers)
 2. [The Two Dataclasses](#2-the-two-dataclasses)
+   - 2.5 [How a Binding Is Constructed](#25-how-a-binding-is-constructed-the-full-lifecycle)
+   - 2.6 [Discovery → Construction: A Concrete Walkthrough](#26-discovery--construction-a-concrete-walkthrough)
 3. [Creating Profiles — Constructor Kwargs & Formats](#3-creating-profiles--constructor-kwargs--formats)
 4. [Registry Internals](#4-registry-internals)
 5. [Switching Models & Modalities](#5-switching-models--modalities)
 6. [The Instantiation Pipeline](#6-the-instantiation-pipeline)
 7. [Default Resolution & the Single-Default Invariant](#7-default-resolution--the-single-default-invariant)
 8. [Per-Modality Guide (LLM, TTI, TTS, TTM, STT, TTV, Connection, RAG, Tools)](#8-per-modality-guide)
+   - 8.1.3b [Base Model + LoRA(s) + Projector composition](#813b-incremental-composition--base-model--loras--projector)
+   - 8.9 [Commands — Discovery & Invocation](#89-commands--navigating-and-invoking-a-bindings-exposed-operations)
 9. [Persistence Formats](#9-persistence-formats)
    - 9.4 [Discovering Available Bindings](#94-discovering-available-bindings)
    - 9.5 [Inspecting a Binding's Configuration Parameters](#95-inspecting-a-bindings-configuration-parameters)
@@ -23,6 +27,7 @@
 11. [Consumer Tools & Agents](#11-consumer-tools--agents)
 12. [Migration & Legacy Compatibility](#12-migration--legacy-compatibility)
 13. [API Quick Reference](#13-api-quick-reference)
+14. [Appendix — Composition Reference Card](#14-appendix--composition-reference-card)
 
 ---
 
@@ -690,6 +695,202 @@ LLM model profiles carry the richest set of capability flags. All of them are de
 - `supported_reasoning_efforts` constrains the accepted vocabulary (e.g. `["low", "medium", "high"]`, or `"low,medium,high"` in raw dicts). `default_reasoning_effort` is used when the caller says "think" without naming a level.
 - See §2.3 for the full semantics.
 
+#### 8.1.3b Incremental Composition — Base Model + LoRA(s) + Projector
+
+The llama.cpp server supports **stacked composition** of three independent
+GGUF artefacts:
+
+```
+┌────────────┐   ┌──────────┐   ┌───────────┐   ┌──────────────┐
+│ base model │ + │ LoRA #1  │ + │ LoRA #2   │ + │ projector    │
+│ (Q4_K_M)   │   │ (adapter)│   │ (adapter) │   │ (mmproj)     │
+└────────────┘   └──────────┘   └───────────┘   └──────────────┘
+    --model       --lora          --lora           --mmproj
+```
+
+Each token is **independent** (it can be swapped without redownloading the
+others), which means composition is **incremental**: you can add a LoRA to a
+running base, then bind a projector, then add another LoRA — each step
+persists its own state, and `load_model` always reconstructs the full command
+line from the *aggregated* state.
+
+> **Status**: The current `LlamaCppServerBinding` implements `--model`,
+> `--mmproj`, and all the launch flags listed in §9.5.1b. **LoRA stacking is
+> planned** but not yet wired. The contract below is the design to implement;
+> it uses llama.cpp's native `--lora <path>` flag (multiple flags allowed,
+> applied in order, matching `llama-server` CLI behavior).
+
+##### 8.1.3b.1 The composition state (registry schema)
+
+The composition is stored in the **multimodal registry**
+(`<models_dir>/multimodal_bindings.yaml`) extended with a `loras` list:
+
+```yaml
+Qwen3.5-4B-GLB-3D-Coder-Q4_K_M.gguf:
+  mmproj: mmproj-Qwen3.5-4B-BF16.gguf
+  loras:
+    - name: coding-adapter-v2.gguf
+      scale: 1.0
+    - name: style-tone-romantic.gguf
+      scale: 0.75
+```
+
+Fields per LoRA:
+- `name` — GGUF filename inside `models_dir` (resolved identically to the
+  base model — no absolute paths, no traversal).
+- `scale` — float (`--lora-scaled name scale` in llama.cpp; `1.0` is a
+  no-op clamp).
+
+The binding re-reads this file at each `load_model` and emits the full
+command; changing a scale or adding a LoRA is a *file edit* + `load_model`,
+which is what makes composition **incremental**.
+
+##### 8.1.3b.2 Planned API — three additive commands
+
+```python
+# 1. Attach one LoRA (idempotent: same name replaces, does not duplicate)
+binding.add_lora(
+    model_name="Qwen3.5-4B-GLB-3D-Coder-Q4_K_M.gguf",
+    lora_name="coding-adapter-v2.gguf",
+    scale=1.0,                    # optional, default 1.0
+)   # → {"status": True, "message": "..."}
+
+# 2. Remove one LoRA (by name)
+binding.remove_lora(
+    model_name="Qwen3.5-4B-GLB-3D-Coder-Q4_K_M.gguf",
+    lora_name="style-tone-romantic.gguf",
+)   # → {"status": True, "message": "..."}
+
+# 3. Adjust the scale of an attached LoRA (no re-download)
+binding.set_lora_scale(
+    model_name="Qwen3.5-4B-GLB-3D-Coder-Q4_K_M.gguf",
+    lora_name="coding-adapter-v2.gguf",
+    scale=0.6,
+)   # → {"status": True, "message": "..."}
+
+# (Projector binding already exists — see §8.9.5)
+binding.bind_multimodal_model(...)
+```
+
+**Incremental invariants:**
+
+| Action | What changes on disk | What triggers a server restart |
+|---|---|---|
+| `add_lora` | a `loras[]` entry in the multimodal registry | the **next** `load_model` (unless server is running → auto-restart like `bind_multimodal_model`) |
+| `remove_lora` | drop the entry | same as above |
+| `set_lora_scale` | mutate `scale` in-place | same as above |
+| `bind_multimodal_model` | a `mmproj:` key | same as above |
+
+The existing `bind_multimodal_model` in the source already implements the
+**auto-restart** behavior (see `_kill_server` + `load_model` when the model
+is running). The LoRA commands should mirror that exact pattern so the three
+attachment operations behave identically from a caller's viewpoint.
+
+##### 8.1.3b.3 Command-line assembly (target implementation)
+
+The command builder (`_build_server_cmd`) already builds `--model` and
+`--mmproj`; the LoRA additions are:
+
+```python
+# Pseudo-code for the planned extension of _build_server_cmd:
+for lora_entry in self._get_loras(model_name):
+    if lora_entry.get("scale", 1.0) != 1.0:
+        cmd += ["--lora-scaled", str(self.models_dir / lora_entry["name"]), str(lora_entry["scale"])]
+    else:
+        cmd += ["--lora", str(self.models_dir / lora_entry["name"])]
+```
+
+Order preserved: `--model` first, then each `--lora` / `--lora-scaled` in
+declaration order, then `--mmproj` last. This matches llama.cpp's expectation
+(base → adapters → projector) and keeps the server log readable.
+
+##### 8.1.3b.4 Discovery + example composition
+
+```python
+from lollms_client.lollms_bindings_utils import get_binding_desc
+desc = get_binding_desc("llama_cpp_server", "llm")
+
+# After implementation, three new commands will appear:
+#   add_lora, remove_lora, set_lora_scale
+
+# 1. Base model present (already pulled or copied into models_dir)
+# 2. Add a coding LoRA
+res = client.llm.add_lora(
+    model_name="Qwen3.5-4B-GLB-3D-Coder-Q4_K_M.gguf",
+    lora_name="coding-adapter-v2.gguf",
+)
+print(res)   # → {"status": True, "message": "Bound ... with lora '...'"}
+
+# 3. Add a style LoRA on top — same command, order matters
+res = client.llm.add_lora(
+    model_name="Qwen3.5-4B-GLB-3D-Coder-Q4_K_M.gguf",
+    lora_name="style-tone-romantic.gguf",
+    scale=0.75,
+)
+
+# 4. Add a projector — composition is now base + 2 LoRAs + projector
+res = client.llm.bind_multimodal_model(
+    model_name="Qwen3.5-4B-GLB-3D-Coder-Q4_K_M.gguf",
+    mmproj_name="mmproj-Qwen3.5-4B-BF16.gguf",
+)
+
+# 5. Restart to materialise the composed server
+client.llm.unload_model("Qwen3.5-4B-GLB-3D-Coder-Q4_K_M.gguf")
+client.llm.load_model("Qwen3.5-4B-GLB-3D-Coder-Q4_K_M.gguf")
+# → llama-server --model base.gguf --lora a.gguf --lora-scaled b.gguf 0.75 --mmproj proj.gguf
+```
+
+**Why incremental matters**: a 4B Q4 base is ~2.5 GB; a LoRA adapter is
+~50–300 MB; a projector is ~500 MB–1 GB. Recomposing the full set on every
+tweak would be wasteful. The **persistent registry + composed command** design
+means each artefact is downloaded once and re-used across any number of
+compositions.
+
+##### 8.1.3b.5 Cross-engine parallel — vLLM + projector (educational)
+
+The same three-artefact model applies to **vLLM** (which does not exist as a
+first-class LLM binding in this tree yet — the closest analogues are
+`tti_bindings/vllm_omni` and `ttv_bindings/vllm_omni`; the following is the
+target shape an LLM `vllm` binding would expose):
+
+```python
+# Target: a hypothetical llm_bindings/vllm/description.yaml
+commands:
+  - name: pull_model
+    parameters:
+      - { name: repo_id,    type: str, mandatory: true }
+      - { name: revision,   type: str, mandatory: false, default: "main" }
+  - name: add_lora
+    parameters:
+      - { name: model_name, type: str, mandatory: true }
+      - { name: lora_name,  type: str, mandatory: true }
+      - { name: scale,      type: float, mandatory: false, default: 1.0 }
+  - name: bind_multimodal_model     # vLLM calls this "vision tower"
+    parameters:
+      - { name: model_name,   type: str, mandatory: true }
+      - { name: mmproj_name,  type: str, mandatory: true }
+
+# Construction on the vLLM side (server launch):
+#   vllm serve <model> \
+#       --enable-lora --lora-modules coding=coding-adapter-v2 \
+#       --max-lora-rank 64 \
+#       --limit-mm-per-prompt image=<n>        # implicit via --mm-processor-kwargs
+#       --trust-remote-code
+```
+
+The two engines differ in **how composition is transported**:
+
+| Engine | Base model | Adapter | Projector |
+|---|---|---|---|
+| `llama_cpp_server` | `--model <gguf>` | `--lora <gguf>` (stacked) | `--mmproj <gguf>` |
+| vLLM (target) | `vllm serve <hf-id>` | `--enable-lora --lora-modules k=v` (dynamic on request) | `--mm-processor-kwargs` or the model's built-in tower |
+
+The doc-level rule stands: **the description schema is the contract**;
+binding authors translate `pull_model` / `add_lora` / `bind_multimodal_model`
+into whatever launch flags their engine expects. A host app that runs
+`get_binding_schema` + `get_binding_desc` gets the *same* discovery surface
+regardless of engine.
+
 #### 8.1.4 Cooperative VRAM Management
 
 Pass `cooperative_vram_management=True` (or rely on the local resource guard) and the client coordinates local bindings: `free_local_binding_resources(except_binding=...)` asks other local bindings with active resources to `unload_model()`, then retries the load (`ensure_model_loaded`). `_cooperative_unload_except(active_modality)` runs before each modality call — so generating an image can temporarily evict the LLM (and vice versa) on VRAM-constrained machines.
@@ -1094,6 +1295,128 @@ for entry in available:
 
 ---
 
+### 2.5 How a Binding Is Constructed (the full lifecycle)
+
+This section walks the *complete* path from "I want a model" to "the binding
+object is alive and the model is running", because dozens of issues (missing
+kwargs, wrong types, projector not found, LoRA not applied) become obvious
+once you see the whole pipeline.
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STAGE 0 — DECLARATIVE CONFIG                                             │
+│   LollmsBindingProfile  ──►  binding_name + binding_config               │
+│   LollmsModelProfile    ──►  model_name + execution flags                │
+│   (both live in the registries; nothing is running yet)                  │
+└──────────────────────────────────────────────────────────────────────────┘
+                    │  client.switch_*("alias")
+                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STAGE 1 — CONFIG MERGE  (_instantiate_binding_from_profile)              │
+│   merged_kwargs = {                                                      │
+│       **binding_profile.binding_config,     # host, port, service_key…   │
+│       model_name: model_profile.model_name, # execution-layer override   │
+│       user_name, ai_name,                   # LLM only                   │
+│       lollms_client: self,                  # RAG only                   │
+│       debug, system_dir, cwd, lollms_data_folder                         │
+│   }                                                                      │
+└──────────────────────────────────────────────────────────────────────────┘
+                    │  manager.create_binding(binding_name=..., **merged_kwargs)
+                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STAGE 2 — BINDING CONSTRUCTION  (BindingClass.__init__(**merged_kwargs)) │
+│   The binding parses kwargs, resolves paths (models_dir, bin_dir…),      │
+│   validates dependencies, optionally auto-installs binaries, and         │
+│   (for local bindings) starts its backing server process.                │
+│                                                                          │
+│   e.g. LlamaCppServerBinding.__init__:                                   │
+│     super().__init__(BindingName, **kwargs)                             │
+│     → parse ctx_size, n_gpu_layers, flash_attn, reasoning, lora…        │
+│     → resolve models_dir / bin_dir                                       │
+│     → if binary missing → install_llama_cpp()                            │
+│     → if self.model_name → load_model(self.model_name)   (spawn server)  │
+└──────────────────────────────────────────────────────────────────────────┘
+                    │  (back on the client)
+                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STAGE 3 — EXECUTION FLAGS  (setattr on the live binding)                 │
+│   vision_enabled, video_enabled, thinking_enabled,                       │
+│   supported_reasoning_efforts, default_reasoning_effort,                 │
+│   native_tools_enabled (ORed with binding probe), image_token_cost,      │
+│   forced_context_size, routing_config, glm_image_embedding              │
+└──────────────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STAGE 4 — RESOURCE GUARD  (ensure_model_loaded)                          │
+│   If binding.is_local() and model not loaded → try load_model();         │
+│   on failure → free other local bindings → retry once.                   │
+└──────────────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STAGE 5 — ACTIVE  (cache[alias] = binding; self.llm = binding)           │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**The single most important contract**: *a binding never sees a profile*.
+It receives only plain `**kwargs`. Anything the binding does not declare in its
+`__init__` is silently discarded — that is why **discovering the right kwargs
+from `description.yaml`** (§9.5) is mandatory before writing a profile.
+
+#### Minimal checklist before writing a binding profile
+
+1. `list_bindings(modality)` → does the binding exist? (§9.4.1)
+2. `get_binding_schema(binding_name, modality)` → which params? (§9.5.1)
+3. Cross-check heavy/optional params against the binding's `description.yaml`
+   `model_profiles_input_parameters` (e.g. `llama_cpp_server` declares
+   `ctx_size`, `n_gpu_layers`, `flash_attn`, `reasoning`, …, which is where
+   per-model tuning belongs).
+4. Write `binding_config` for the **connection-scoped** params only; per-model
+   params go in the **model profile**, not the binding config.
+
+### 2.6 Discovery → Construction: A Concrete Walkthrough
+
+The doc's golden rule is "**discover first, configure second**". Here is the
+loop, using `llama_cpp_server` as the running example:
+
+```python
+from lollms_client.lollms_bindings_utils import list_bindings
+from lollms_client.lollms_config_api import get_binding_schema
+import yaml, inspect
+from pathlib import Path
+
+# 1. Enumerate LLM bindings
+print(list_bindings("llm"))                # ['llama_cpp_server', 'ollama', ...]
+
+# 2. Fetch connection-scoped parameters (auto-UI-ready form schema)
+schema = get_binding_schema("llama_cpp_server", "llm")
+for p in schema:
+    print(f"{p['name']:<22} {p['type']:<6} default={p['default']!r}")
+
+# 3. Fetch per-model parameters (these belong to LollmsModelProfile)
+from lollms_client.lollms_bindings_utils import get_binding_desc
+desc = get_binding_desc("llama_cpp_server", "llm")
+profile_params = desc.get("model_profiles_input_parameters", [])
+for p in profile_params:
+    print(f"{p['name']:<22} {p['type']:<6} default={p['default']!r}")
+```
+
+This is exactly the pipeline `get_binding_schema` uses internally, and it is
+the loop every host app (CLI, GUI, programmatic wizard) must run **before**
+constructing a binding profile. If you skip it, you are guessing at the
+`binding_config` keys and silently dropping every branch that does not match
+`LlamaCppServerBinding.__init__`'s signature.
+
+> **Common pitfall — "I set `n_gpu_layers=32` but the model is CPU-only."**
+> `n_gpu_layers` is a **model-profile** parameter of `llama_cpp_server`
+> (declared under `model_profiles_input_parameters`), not a **binding-level**
+> parameter. `build_client_config` copies it into the model profile's
+> execution kwargs and the binding reads it from `kwargs` at construction.
+> If you put it inside `binding_config` on a *different* profile that shares
+> the same server, it will be discarded on every switch. (§6.2 explains the
+> merge.)
+
 ### 9.5 Inspecting a Binding's Configuration Parameters
 
 Once you know which binding to use, you need to know **which `binding_config` keys it accepts**. Two functions cover this:
@@ -1156,6 +1479,66 @@ client = LollmsClient(
     },
 )
 ```
+
+#### 9.5.1b Reading `model_profiles_input_parameters` from the description
+
+`get_binding_schema` intentionally merges **`global_input_parameters`** and
+**`model_input_parameters`**, but *skips* the more granular
+**`model_profiles_input_parameters`** block — that block is reserved for the
+**execution layer** (model profile) and must be staged separately by host apps
+that build both tiers. Example — the block from
+`llama_cpp_server/description.yaml`:
+
+```yaml
+model_profiles_input_parameters:
+  - name: ctx_size
+    type: int
+  - name: n_gpu_layers
+    type: int
+  - name: n_threads
+    type: int
+  - name: n_parallel
+    type: int
+  - name: batch_size
+    type: int
+  - name: flash_attn
+    type: bool
+  - name: mmap
+    type: bool
+  - name: mlock
+    type: bool
+  - name: rope_scale
+    type: float
+  - name: rope_freq_base
+    type: float
+  - name: rope_freq_scale
+    type: float
+  - name: tensor_split
+    type: str
+  - name: main_gpu
+    type: int
+  - name: cache_type_k
+    type: str
+  - name: cache_type_v
+    type: str
+  - name: multimodal
+    type: bool
+  - name: reasoning
+    type: str
+  - name: reasoning_budget
+    type: int
+```
+
+These are the fields you place **inside a `LollmsModelProfile` as
+`binding_config_extra`** (the profile-forwarded kwargs) so they reach the
+server launch command on load.
+
+> **Practical rule**: `global_input_parameters` → binding profile's
+> `binding_config`. `model_input_parameters` → the `model_name` field (already
+> documented above). `model_profiles_input_parameters` → per-model launch
+> args, forwarded to the binding constructor *via the model profile*. Any
+> launch arg that is *legitimate per model* (VRAM budget, context size,
+> quantization paths) belongs here.
 
 #### 9.5.2 `get_binding_desc` — Low-Level Description Loader (from `lollms_bindings_utils`)
 
@@ -1415,4 +1798,60 @@ class LollmsModelProfile:
 
 ---
 
-*Cross-references: [README §1–2 Universal Two-Tier Profile Architecture & Smart Router](../src/lollms_client/README.md) · [client_creation_and_profiles skill](../skills/client_creation_and_profiles/SKILL.md) · [Connection bindings skill](../skills/connection_bindings/SKILL.md)*
+---
+
+## 14. Appendix — Composition Reference Card
+
+A single-page summary for the three attachment commands described in
+§8.1.3b, plus pointers to the reference implementation.
+
+### 14.1 Composition surface per llama_cpp_server attachment
+
+| Command | Scope | Registry key touched | Auto-restarts if running? |
+|---|---|---|---|
+| `pull_model(repo_id, filename, mmproj_*)` | download | *(file on disk)* | no (download only) |
+| `bind_multimodal_model(model, mmproj)` | associate | `registry[model].mmproj` | ✅ yes (`_kill_server` + `load_model`) |
+| `add_lora(model, lora, scale=1.0)` **planned** | associate | `registry[model].loras[]` (append) | ✅ yes (mirror `bind_multimodal_model`) |
+| `remove_lora(model, lora)` **planned** | dissociate | drop matching `loras[]` entry | ✅ yes |
+| `set_lora_scale(model, lora, scale)` **planned** | mutate | set `loras[i].scale` | ✅ yes |
+| `unload_model(name)` | lifecycle | *(kill process, keep registry)* | n/a |
+| `load_model(name)` | lifecycle | *(spawn, compose from registry)* | n/a |
+| `update()` | lifecycle | *(download binary)* | calls `unload_model` first |
+
+### 14.2 Mapping discovery APIs → composition APIs
+
+| Discovery API | What it yields | Composition API it feeds |
+|---|---|---|
+| `list_bindings("llm")` | available binding names | profile `binding_name` |
+| `get_binding_schema(name, "llm")` | connection-layer params | `binding_config` |
+| `get_binding_desc(name, "llm")["model_profiles_input_parameters"]` | per-model launch flags | model profile kwargs |
+| `get_binding_desc(name, "llm")["commands"]` | command list + param schemas | direct `binding.<cmd>(**params)` |
+| `get_binding_desc(name, "llm")["commands"][i]["templates"]` | pre-baked parameter recipes | `pull_model` / `download_from_zoo` |
+| `binding.get_zoo()` | zoo entries derived from `templates` | `download_from_zoo(index)` |
+
+### 14.3 Reference implementations in this repo
+
+- **Composition + auto-restart** — `LlamaCppServerBinding.bind_multimodal_model`
+  (`src/lollms_client/llm_bindings/llama_cpp_server/__init__.py`) shows the
+  exact pattern every attachment command should follow.
+- **Registry schema** — `LlamaCppServerBinding._load_mm_registry` /
+  `_save_mm_registry` (same file) shows how composition state is persisted.
+- **Command-line assembly** — `LlamaCppServerBinding._build_server_cmd`
+  (same file) shows where `--lora` / `--mmproj` additions belong.
+- **Template zoo derivation** — `LlamaCppServerBinding.get_zoo` /
+  `_load_zoo_from_description` (same file) shows how `templates:` becomes the
+  zoo without duplication.
+- **Discovery primitives** — `lollms_bindings_utils.list_bindings` /
+  `get_binding_desc` and `lollms_config_api.get_binding_schema` / `discover_bindings`.
+
+### 14.4 Migration / compatibility note for LoRA
+
+If you have applications that only call `bind_multimodal_model`, they keep
+working unchanged. The planned LoRA commands are **additive** — they create
+new entries in the existing multimodal registry and never touch the `mmproj:`
+key. Existing profiles with no `loras:` key load with zero `--lora` flags, so
+behavior is byte-for-byte identical to today until you add a LoRA.
+
+---
+
+*Cross-references: [README §1–2 Universal Two-Tier Profile Architecture & Smart Router](../src/lollms_client/README.md) · [client_creation_and_profiles skill](../skills/client_creation_and_profiles/SKILL.md) · [Connection bindings skill](../skills/connection_bindings/SKILL.md) · [llama.cpp Composition Reference (this doc, §8.1.3b, §14)](./UNIVERSAL_MODEL_PROFILES.md#813b-incremental-composition--base-model--loras--projector)*

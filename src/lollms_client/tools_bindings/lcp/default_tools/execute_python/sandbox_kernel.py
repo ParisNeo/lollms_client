@@ -55,6 +55,7 @@ import ast
 import builtins
 import io
 import os
+import re
 import sys
 import shutil
 import socket
@@ -1853,12 +1854,31 @@ def run_in_sandboxed_child(
         stderr_fh = _tf.TemporaryFile(mode="w+b")
         stdout_path = stdout_fh.name
         stderr_path = stderr_fh.name
+        # CRITICAL: the child MUST be spawned with `cwd = workspace_root`,
+        # not the parent process's CWD. The sandbox's path guard resolves
+        # every RELATIVE path against `Path.cwd()` in its slow branch, and
+        # user code frequently builds absolute paths from `Path.cwd()` /
+        # `os.getcwd()` / `Path("x").resolve()`. When the discussion uses a
+        # CUSTOM workspace (workspace_data_path != process CWD — the common
+        # case for lollms_code sessions and per-discussion workspaces), a
+        # child spawned in the parent's CWD produces paths under the parent
+        # tree that are NOT under `workspace_root`, so `_resolve_within`
+        # blocks otherwise-legitimate writes ("some files get blocked").
+        # Pinning the child's working directory to the workspace makes
+        # `Path.cwd()`, `os.getcwd()`, `Path("x").resolve()`, bare relative
+        # `open("x")`, and the guard's slow branch all agree on ONE root.
+        try:
+            _child_cwd = str(Path(workspace_root).resolve())
+            if not Path(_child_cwd).is_dir():
+                _child_cwd = os.getcwd()
+        except Exception:
+            _child_cwd = os.getcwd()
         proc = _sp.Popen(
             [sys.executable, "-c", _CHILD_BOOTSTRAP_SOURCE],
             stdin=_sp.PIPE,
             stdout=stdout_fh,
             stderr=stderr_fh,
-            cwd=os.getcwd(),
+            cwd=_child_cwd,
             creationflags=_creationflags,
         )
     except Exception as exc:
@@ -2138,6 +2158,36 @@ def _active_user_frame_label() -> Optional[str]:
 _ACTIVE_SANDBOX_LABELS: List[str] = []
 
 
+def _is_within_root(child: Path, root: Path) -> bool:
+    """True iff `child` is `root` or a descendant of `root`.
+
+    Robust against the Windows case-insensitivity / normalization mismatch
+    that made `Path.relative_to` spuriously reject legitimate in-workspace
+    paths. `Path.relative_to` compares path COMPONENTS as exact strings, so on
+    Windows an absolute path the user/LLM built with different casing
+    (``C:\\Users\\SA226037`` vs ``c:\\Users\\sa226037``), a trailing separator,
+    or a forward-slash vs backslash form raised ``ValueError`` even though the
+    path lives inside the workspace — surfacing as the "some files get blocked
+    even in full-access mode" bug.
+
+    On Windows we normalize BOTH paths with ``os.path.normcase`` (lower-cases
+    and converts to backslashes) and use ``os.path.commonpath`` for a
+    boundary-correct containment test — ``commonpath`` is string-length aware,
+    so ``C:\\ws2`` is NOT considered inside ``C:\\ws`` (unlike a naive
+    ``startswith``). On POSIX the behaviour is identical to ``relative_to``.
+    """
+    try:
+        child_s = os.path.normcase(os.path.abspath(str(child)))
+        root_s = os.path.normcase(os.path.abspath(str(root)))
+        if child_s == root_s:
+            return True
+        # commonpath raises ValueError on different drives / mixed absolute
+        # vs relative — treated as "not within".
+        return os.path.commonpath([child_s, root_s]) == root_s
+    except (ValueError, OSError, TypeError):
+        return False
+
+
 def _resolve_within(root: Path, target: Any, allow_trusted_read: bool = False) -> Path:
     """Fast path-guard: returns the resolved target, raises if outside `root`.
 
@@ -2155,7 +2205,7 @@ def _resolve_within(root: Path, target: Any, allow_trusted_read: bool = False) -
     try:
         if isinstance(target, int):
             # Already an open file descriptor — no path to check, pass through.
-            return Path.cwd()
+            return Path(root)
         if isinstance(target, str):
             target_str = target
         else:
@@ -2170,22 +2220,26 @@ def _resolve_within(root: Path, target: Any, allow_trusted_read: bool = False) -
             return Path(root) / target_str
         p = Path(target_str)
         if not p.is_absolute():
-            p = Path.cwd() / p
+            # Resolve RELATIVE paths against `root` (the workspace), NOT
+            # `Path.cwd()`. The sandbox contract is "relative == under the
+            # workspace"; relying on the child's CWD here was the source of
+            # the "custom workspace files get blocked" bug whenever the
+            # spawned child's CWD diverged from `workspace_root` (e.g. a
+            # relative path containing `..`, or `Path("a/b").resolve()` run
+            # in a child not chdir'd into the workspace). Anchoring to
+            # `root` makes the guard independent of the process CWD.
+            p = Path(root) / p
         resolved = p.resolve(strict=False)
-        try:
-            resolved.relative_to(root)
+        if _is_within_root(resolved, root):
             return resolved
-        except ValueError:
+        else:
             # Writes/reads into the sandbox's own cache root (system temp) are
             # legitimate: matplotlib fontlist, pip wheel cache, tempfile mkstemp
             # all land there. The cache lives OUTSIDE the workspace on purpose
             # so the user's project tree stays pristine.
             for cache_root_str in _SANDBOX_WRITE_ROOTS:
-                try:
-                    resolved.relative_to(Path(cache_root_str))
+                if _is_within_root(resolved, Path(cache_root_str)):
                     return resolved
-                except (ValueError, OSError):
-                    continue
             # Operator-consented EXTRA roots (published via
             # `set_extra_read_roots` / `set_extra_write_roots` when the
             # operator pressed "always" on the `filesystem` risk category).
@@ -2202,29 +2256,20 @@ def _resolve_within(root: Path, target: Any, allow_trusted_read: bool = False) -
             # blocked unless a future operator-authored policy explicitly adds
             # them. Reads use the read set; writes use the write set.
             for consent_root_str in _SANDBOX_EXTRA_READ_ROOTS:
-                try:
-                    resolved.relative_to(Path(consent_root_str))
+                if _is_within_root(resolved, Path(consent_root_str)):
                     # Reads (including directory enumeration) honour the read
                     # consent unconditionally. Writes additionally require
                     # membership in _SANDBOX_EXTRA_WRITE_ROOTS — enforced below
                     # by the caller (the write path is only reached via
                     # functions that pass allow_trusted_read=False).
                     return resolved
-                except (ValueError, OSError):
-                    continue
             if allow_trusted_read:
                 for trusted_root in _TRUSTED_READ_ROOTS:
-                    try:
-                        resolved.relative_to(trusted_root)
+                    if _is_within_root(resolved, trusted_root):
                         return resolved
-                    except ValueError:
-                        continue
             for consent_write_root_str in _SANDBOX_EXTRA_WRITE_ROOTS:
-                try:
-                    resolved.relative_to(Path(consent_write_root_str))
+                if _is_within_root(resolved, Path(consent_write_root_str)):
                     return resolved
-                except (ValueError, OSError):
-                    continue
             raise
     except (ValueError, OSError) as exc:
         raise SandboxPermissionError(

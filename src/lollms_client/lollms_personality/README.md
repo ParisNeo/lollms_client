@@ -712,6 +712,7 @@ The constructor takes a path, validates that it is an existing directory (raisin
 | `docs/` | `docs_dir` | Documents for the `DocNavigator`. |
 | `workspace/` | `workspace_dir` | The agent's writable sandbox root. |
 | `handbag.yaml:extra_knowledge_bases` | `extra_knowledge_bases` / `extra_safe_stores` | Plain paths → `extra_knowledge_bases`; `.db` files (case-insensitive) → opened as safe stores in `extra_safe_stores`. |
+| `mcp/` | `mcp_dir` → `mcp_servers` | **Optional** MCP hooks. Every `*.yaml`/`*.yml` file (recursively, skipping hidden ones) is parsed as one MCP server manifest. The file's stem is the `server_id`. See [`docs/MCP_HOOKS.md`](../../../docs/MCP_HOOKS.md). |
 
 ### Building a Handbag — step by step
 

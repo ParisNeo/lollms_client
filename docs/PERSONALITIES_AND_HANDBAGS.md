@@ -142,6 +142,7 @@ my_agent_handbag/
 | `workspace/` | The agent's writable sandbox root. |
 | `coworkers/` | Co-worker definitions (sub-agents / crewmates). |
 | `handbag.yaml:extra_knowledge_bases` | Entries ending in `.db` (case-insensitive) are opened as safe stores (`extra_safe_stores`); everything else is a plain KB path (`extra_knowledge_bases`). |
+| `mcp/` | **Optional** MCP hooks. Each `*.yaml`/`*.yml` (recursive, skipping hidden) is parsed into an `MCPServerSpec`; the file's stem becomes the `server_id`. Results live in `handbag.mcp_servers` (all) and `handbag.enabled_mcp_servers` (enabled only). Malformed files are skipped and reported in `handbag.mcp_warnings`. Full schema: [`MCP_HOOKS.md`](MCP_HOOKS.md). |
 
 ---
 
@@ -409,7 +410,9 @@ Both lists are then consumed by the personality's RAG layer: plain paths become 
 
 ---
 
-## 9. See also
+### See also
+
+- [`MCP_HOOKS.md`](MCP_HOOKS.md) — optional MCP server hooks for a handbag (`mcp/` directory, YAML schema, security model).
 
 ### Working examples
 

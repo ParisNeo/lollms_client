@@ -1,0 +1,34 @@
+# ── MCP SERVER MANIFEST: Web Search (HTTP) ──────────────────────────────────
+#
+# Transport: `http` speaks JSON-RPC over HTTP POST to the `url` endpoint. Use
+# `sse` for legacy Server-Sent-Events transports (the connection is opened
+# with GET and responses stream back as SSE frames).
+
+title: Web Search
+description: >
+  Remote web-search MCP server exposing search_web and fetch_page tools.
+  Runs as a shared service; multiple agents connect to the same endpoint.
+
+enabled: true
+
+transport: http
+
+# `url` is REQUIRED for http/sse transports.
+url: http://localhost:8765/mcp
+
+# Optional authentication headers. Prefer `${ENV_VAR}` expansion so the token
+# lives in the environment, not in the handbag file.
+headers:
+  Authorization: "Bearer ${MCP_WEB_TOKEN}"
+  X-Client-Name: "lollms-agent"
+
+# Security posture for a read-only remote service: it cannot write local
+# files, cannot shell out, and only its output text reaches the agent.
+security:
+  allow_file_write: false
+  allow_shell: false
+  allowed_paths: []
+  denied_tools: []
+  approval_required: false
+
+timeout_seconds: 15
