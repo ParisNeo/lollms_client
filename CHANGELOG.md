@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-20 01:09]
+
+- `fix: update client version to 1.22.14 for minor patch release`
+
 ## [2026-11-20 12:28]
 
 - fix: improve file import, personality handling, and excel tools
