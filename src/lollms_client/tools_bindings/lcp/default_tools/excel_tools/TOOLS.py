@@ -38,7 +38,13 @@ TOOL_LIBRARY_DESC = (
     "tool_excel_from_markdown). Never write computed results manually — always "
     "write formulas (=SUM, =AVERAGE, =IF, =VLOOKUP ...) so Excel computes them. "
     "Literal values only for input data. Every save is verified with a strict "
-    "three-layer OOXML integrity check before being committed to the workspace."
+    "three-layer OOXML integrity check before being committed to the workspace. "
+    "Recipes run in a self-describing sandbox: print() output is captured and "
+    "returned as stdout/stderr (8 KB cap); saving is automatic (never call "
+    "wb.save()); recipe='__help__' returns a machine-readable capability manifest; "
+    "validate_only=true dry-runs the recipe in memory and returns a structural "
+    "report without writing a file; pandas is unavailable — pass tabular data via "
+    "the `data` parameter and the `write_rows()` helper."
 )
 TOOL_LIBRARY_ICON = "📈"
 
@@ -90,6 +96,220 @@ OFFICE_GUARD_GUIDANCE = (
 
 _XLSX_SUFFIXES = (".xlsx", ".xlsm")
 
+_STDOUT_CAP = 8192  # 8 KB per stream (P1 capture cap)
+
+# Rationale surfaced to the LLM when a forbidden token is hit (P4).
+_FORBIDDEN_TOKEN_REASONS = {
+    "eval(": "arbitrary code execution (defeats the sandbox)",
+    "exec(": "arbitrary code execution (defeats the sandbox)",
+    "compile(": "arbitrary code execution (defeats the sandbox)",
+    "open(": "raw file I/O — use the pre-bound media()/resolve_path() helpers",
+    "os.": "filesystem/process access — forbidden inside the sandbox",
+    "sys.": "interpreter access — forbidden inside the sandbox",
+    "subprocess": "process spawning — forbidden inside the sandbox",
+    "shutil": "filesystem mutation — forbidden inside the sandbox",
+    "pathlib": "filesystem access — use media()/resolve_path() instead",
+    "globals(": "namespace introspection — forbidden inside the sandbox",
+    "locals(": "namespace introspection — forbidden inside the sandbox",
+    "vars(": "namespace introspection — forbidden inside the sandbox",
+    "getattr(": "dynamic attribute access (escape vector) — use direct member access",
+    "setattr(": "dynamic attribute mutation (escape vector) — use direct assignment",
+    "delattr(": "dynamic attribute deletion (escape vector) — use `del obj.attr`",
+}
+
+# Canonical pre-import surface (kept in sync with _build_recipe_namespace). P5.
+_PREIMPORTED_SYMBOLS = frozenset({
+    "Workbook", "load_workbook",
+    "PieChart", "LineChart", "BarChart", "ScatterChart", "AreaChart",
+    "DoughnutChart", "RadarChart", "Reference",
+    "Font", "PatternFill", "Alignment", "Border", "Side", "NamedStyle",
+    "get_column_letter", "column_index_from_string",
+    "CellIsRule", "ColorScaleRule", "DataBarRule", "FormulaRule", "IconSetRule",
+    "DataValidation", "Table", "TableStyleInfo",
+})
+
+# Symbols exposed in the manifest's `not_preimported` field, derived as the
+# complement of _PREIMPORTED_SYMBOLS within a modest known-surface set.
+_KNOWN_OPENPYXL_SYMBOLS = _PREIMPORTED_SYMBOLS | frozenset({
+    "Comment", "Image", "Hyperlink", "PrintSetup", "WorkbookProtection",
+})
+
+_MISSING_SYMBOL_HINTS = {
+    "Table": "Import via `from openpyxl.worksheet.table import Table`.",
+    "TableStyleInfo": "Import via `from openpyxl.worksheet.table import TableStyleInfo`.",
+    "ScatterChart": "Import via `from openpyxl.chart import ScatterChart`.",
+    "AreaChart": "Import via `from openpyxl.chart import AreaChart`.",
+    "DoughnutChart": "Import via `from openpyxl.chart import DoughnutChart`.",
+    "RadarChart": "Import via `from openpyxl.chart import RadarChart`.",
+    "DataBarRule": "Import via `from openpyxl.formatting.rule import DataBarRule`.",
+    "FormulaRule": "Import via `from openpyxl.formatting.rule import FormulaRule`.",
+    "IconSetRule": "Import via `from openpyxl.formatting.rule import IconSetRule`.",
+    "NamedStyle": "Import via `from openpyxl.styles import NamedStyle`.",
+    "column_index_from_string": "Import via `from openpyxl.utils import column_index_from_string`.",
+    "pandas": (
+        "pandas is intentionally unavailable in this sandbox. Pass tabular input "
+        "via the `data` parameter (list of dicts or list of lists) and use the "
+        "pre-bound `write_rows()` helper, or assemble rows in pure Python."
+    ),
+}
+
+_HELP_SENTINELS = frozenset({"__help__", "#help", "help"})
+
+
+def _augment_error_hint(annotated: str) -> str:
+    """Appends a remediation hint for missing symbols / blocked imports (P4)."""
+    for symbol, hint in _MISSING_SYMBOL_HINTS.items():
+        if f"NameError: name '{symbol}' is not defined" in annotated:
+            return f"{annotated}\nHint: `{symbol}` is not pre-imported. {hint}"
+        if (
+            f"No module named '{symbol}'" in annotated
+            or f"Import '{symbol}' is not allowed" in annotated
+        ):
+            return f"{annotated}\nHint: `{symbol}` import was rejected. {hint}"
+    return annotated
+
+
+def _capability_manifest() -> Dict[str, Any]:
+    """Builds the machine-readable sandbox capability manifest (P2)."""
+    try:
+        import openpyxl
+        version = getattr(openpyxl, "__version__", "unknown")
+    except Exception:
+        version = "unavailable"
+    return {
+        "openpyxl_version": version,
+        "prebound": ["wb", "ws"],
+        "auto_save": True,
+        "do_not_call": ["wb.save()", "wb.close()"],
+        "forbidden_tokens": list(_FORBIDDEN_TOKENS),
+        "forbidden_dunders": list(_FORBIDDEN_DUNDERS),
+        "import_whitelist": ["openpyxl.*"] + sorted(_SAFE_STDLIB_MODULES),
+        "preimported_symbols": sorted(_PREIMPORTED_SYMBOLS),
+        "not_preimported": sorted(_KNOWN_OPENPYXL_SYMBOLS - _PREIMPORTED_SYMBOLS),
+        "unavailable": ["pandas", "os", "sys", "open"],
+        "stdout_captured": True,
+        "stdout_cap_bytes": _STDOUT_CAP,
+        "data_bridge": (
+            "Pass `data` (list of dicts or list of lists) — rows land in `data_rows` "
+            "and the `write_rows(ws=None, start_row=1, start_col=1, include_headers=True)` "
+            "helper. pandas is intentionally unavailable."
+        ),
+        "validate_only": (
+            "Set `validate_only=true` to run the recipe against an in-memory workbook "
+            "and receive a structural report without writing a file."
+        ),
+        "sentinel": (
+            "recipe='__help__' (or an empty recipe) returns this manifest without "
+            "building a file. To create a blank workbook, pass a comment-only recipe "
+            "such as `# blank`."
+        ),
+    }
+
+
+def _emit_manifest_if_requested(recipe: str) -> Optional[Dict[str, Any]]:
+    """Returns a manifest result when the recipe is empty or a help sentinel (P2)."""
+    stripped = (recipe or "").strip().lower()
+    if not stripped or stripped in _HELP_SENTINELS:
+        import json as _json
+        manifest = _capability_manifest()
+        return {
+            "success": True,
+            "manifest": manifest,
+            "output": _json.dumps(manifest, indent=2),
+            "note": "Capability manifest — no file was written.",
+        }
+    return None
+
+
+def _inject_data(namespace: Dict[str, Any], data: Any) -> None:
+    """Injects tabular input as `data_rows` + a `write_rows()` helper (P6).
+
+    Accepts a list of dicts (first dict's keys become the header row), a list of
+    lists/tuples (used as-is), or a JSON string encoding either. No-op when
+    `data` is None/empty or unparseable — never raises.
+    """
+    if data is None or data == "":
+        return
+    if isinstance(data, str):
+        try:
+            import json as _json
+            data = _json.loads(data)
+        except Exception:
+            return
+    try:
+        rows = list(data)
+    except TypeError:
+        return
+    if not rows:
+        return
+    if isinstance(rows[0], dict):
+        headers = list(rows[0].keys())
+        matrix = [headers] + [[row.get(h) for h in headers] for row in rows]
+    else:
+        matrix = [list(r) if isinstance(r, (list, tuple)) else [r] for r in rows]
+    namespace["data_rows"] = matrix
+
+    def write_rows(target_ws=None, start_row=1, start_col=1, include_headers=True):
+        target = target_ws if target_ws is not None else namespace.get("ws")
+        if target is None:
+            return
+        payload = matrix if include_headers else matrix[1:]
+        for r_off, row in enumerate(payload):
+            for c_off, value in enumerate(row):
+                target.cell(row=start_row + r_off, column=start_col + c_off, value=value)
+
+    namespace["write_rows"] = write_rows
+
+
+def _structural_report(wb: Any, suffix: str) -> Dict[str, Any]:
+    """Structural dry-run report (sheets, formulas, charts, merged ranges) (P7)."""
+    report: Dict[str, Any] = {
+        "suffix": suffix,
+        "sheet_count": len(wb.sheetnames),
+        "sheets": [],
+        "chart_count": 0,
+        "merged_ranges": [],
+        "formula_count": 0,
+        "errors": [],
+    }
+    for name in wb.sheetnames:
+        ws = wb[name]
+        info: Dict[str, Any] = {
+            "name": name,
+            "max_row": ws.max_row,
+            "max_column": ws.max_column,
+            "chart_count": 0,
+            "formula_count": 0,
+            "merged": [],
+            "suspicious_cells": [],
+        }
+        try:
+            for row in ws.iter_rows(values_only=False):
+                for cell in row:
+                    v = cell.value
+                    if isinstance(v, str) and v.startswith("="):
+                        info["formula_count"] += 1
+                        if not v[1:].strip():
+                            info["suspicious_cells"].append(cell.coordinate)
+        except Exception as exc:
+            report["errors"].append(f"[{name}] iteration error: {exc}")
+        try:
+            info["chart_count"] = len(getattr(ws, "_charts", []) or [])
+        except Exception:
+            pass
+        try:
+            if ws.merged_cells:
+                info["merged"] = [str(r) for r in ws.merged_cells.ranges]
+        except Exception:
+            pass
+        report["chart_count"] += info["chart_count"]
+        report["formula_count"] += info["formula_count"]
+        report["merged_ranges"].extend(info["merged"])
+        report["sheets"].append(info)
+    if report["sheet_count"] == 0:
+        report["errors"].append("workbook has no sheets")
+    return report
+
 
 def init_tools_library(config: dict = None) -> None:
     try:
@@ -133,10 +353,13 @@ def _check_recipe(recipe: str) -> None:
     """Rejects recipes containing forbidden tokens before execution."""
     for token in _FORBIDDEN_TOKENS:
         if token in recipe:
+            reason = _FORBIDDEN_TOKEN_REASONS.get(token, "blocked by policy")
             raise ValueError(
-                f"Forbidden token '{token}' in recipe. Recipes are plain Python: imports "
-                "are allowed only from the whitelist (openpyxl.* and safe stdlib modules), "
-                "with no file/system access. Prefer the pre-imported design symbols."
+                f"Forbidden token '{token}' in recipe — {reason}. Recipes are plain "
+                "Python: imports are allowed only from the whitelist (openpyxl.* and "
+                "safe stdlib modules), with no file/system access. Prefer the "
+                "pre-imported design symbols (pass recipe='__help__' for the full "
+                "capability manifest)."
             )
     for dunder in _FORBIDDEN_DUNDERS:
         if dunder in recipe:
@@ -268,11 +491,19 @@ def _build_recipe_namespace(working_dir: Optional[Path] = None) -> Dict[str, Any
     namespace: Dict[str, Any] = {}
     try:
         from openpyxl import Workbook as _RealWorkbook, load_workbook
-        from openpyxl.chart import PieChart, LineChart, BarChart, Reference
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
-        from openpyxl.formatting.rule import CellIsRule, ColorScaleRule
+        from openpyxl.chart import (
+            PieChart, LineChart, BarChart, Reference,
+            ScatterChart, AreaChart, DoughnutChart, RadarChart,
+        )
+        from openpyxl.styles import (
+            Font, PatternFill, Alignment, Border, Side, NamedStyle,
+        )
+        from openpyxl.utils import get_column_letter, column_index_from_string
+        from openpyxl.formatting.rule import (
+            CellIsRule, ColorScaleRule, DataBarRule, FormulaRule, IconSetRule,
+        )
         from openpyxl.worksheet.datavalidation import DataValidation
+        from openpyxl.worksheet.table import Table, TableStyleInfo
 
         def _make_shimmed_workbook(*args: Any, **kwargs: Any) -> Any:
             wb = _RealWorkbook(*args, **kwargs)
@@ -288,16 +519,27 @@ def _build_recipe_namespace(working_dir: Optional[Path] = None) -> Dict[str, Any
             "PieChart": PieChart,
             "LineChart": LineChart,
             "BarChart": BarChart,
+            "ScatterChart": ScatterChart,
+            "AreaChart": AreaChart,
+            "DoughnutChart": DoughnutChart,
+            "RadarChart": RadarChart,
             "Reference": Reference,
             "Font": Font,
             "PatternFill": PatternFill,
             "Alignment": Alignment,
             "Border": Border,
             "Side": Side,
+            "NamedStyle": NamedStyle,
             "get_column_letter": get_column_letter,
+            "column_index_from_string": column_index_from_string,
             "CellIsRule": CellIsRule,
             "ColorScaleRule": ColorScaleRule,
+            "DataBarRule": DataBarRule,
+            "FormulaRule": FormulaRule,
+            "IconSetRule": IconSetRule,
             "DataValidation": DataValidation,
+            "Table": Table,
+            "TableStyleInfo": TableStyleInfo,
         })
     except ImportError:
         ASCIIColors.warning("[excel_tools] openpyxl unavailable — xlsx recipes disabled.")
@@ -438,33 +680,62 @@ def _save_and_verify(obj: Any, save_path: Path) -> Dict[str, Any]:
     }
 
 
-def _exec_recipe(recipe: str, namespace: Dict[str, Any], source_name: str) -> Optional[Dict[str, Any]]:
-    """Validates and executes a recipe in the sandboxed namespace."""
+def _exec_recipe(
+    recipe: str, namespace: Dict[str, Any], source_name: str
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, str]]:
+    """Validates and executes a recipe in the sandboxed namespace.
+
+    Captures stdout/stderr during execution (P1) and returns them alongside any
+    failure dict: `(failure_or_None, {"stdout": "...", "stderr": "..."})`.
+    Both streams are truncated to `_STDOUT_CAP` bytes with an explicit marker.
+    """
+    import io as _io
+    import sys as _sys
+
+    captured = {"stdout": "", "stderr": ""}
+
+    def _truncate(text: str) -> str:
+        if len(text) <= _STDOUT_CAP:
+            return text
+        return text[:_STDOUT_CAP] + "\n...[truncated]"
+
     if not recipe or not recipe.strip():
-        return None
+        return None, captured
     if len(recipe) > _MAX_RECIPE_CHARS:
         return {
             "success": False,
             "error": f"Recipe exceeds the maximum length of {_MAX_RECIPE_CHARS} characters.",
-        }
+        }, captured
     try:
         _check_recipe(recipe)
     except ValueError as forbidden_err:
-        return {"success": False, "error": str(forbidden_err)}
+        return {"success": False, "error": str(forbidden_err)}, captured
 
     dedented = textwrap.dedent(recipe)
     namespace["__builtins__"] = _build_safe_builtins()
+    out_buf = _io.StringIO()
+    err_buf = _io.StringIO()
+    prev_stdout, prev_stderr = _sys.stdout, _sys.stderr
     try:
-        exec(compile(dedented, source_name, "exec"), namespace)
-        return None
+        try:
+            _sys.stdout, _sys.stderr = out_buf, err_buf
+            exec(compile(dedented, source_name, "exec"), namespace)
+        finally:
+            _sys.stdout, _sys.stderr = prev_stdout, prev_stderr
+        captured["stdout"] = _truncate(out_buf.getvalue())
+        captured["stderr"] = _truncate(err_buf.getvalue())
+        return None, captured
     except Exception:
+        captured["stdout"] = _truncate(out_buf.getvalue())
+        captured["stderr"] = _truncate(err_buf.getvalue())
         annotated = _annotate_traceback(traceback.format_exc(), dedented, source_name)
+        annotated = _augment_error_hint(annotated)
         if "save(" in annotated and "missing" in annotated:
             annotated += (
                 "\nHint: the tool saves the file automatically after your recipe — "
                 "remove the save() call."
             )
-        return {"success": False, "error": f"Recipe execution error:\n{annotated}"}
+        return {"success": False, "error": f"Recipe execution error:\n{annotated}"}, captured
 
 
 def _resolve_working_dir(discussion_instance: Optional[Any]) -> Path:
@@ -524,14 +795,22 @@ def _pick_effective_root(namespace: Dict[str, Any], suffix: str, original_root: 
     return original_root
 
 
-def _build_result(save_result: Dict[str, Any], save_path: Path) -> Dict[str, Any]:
+def _build_result(
+    save_result: Dict[str, Any],
+    save_path: Path,
+    captured: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """Shapes a successful save result into the standard result contract."""
-    return {
+    result = {
         "success": True,
         "workspace_file": str(save_path.resolve()),
         "context_files": [str(save_path.resolve())],
         "file_name": save_path.name,
     }
+    if captured:
+        result["stdout"] = captured.get("stdout", "")
+        result["stderr"] = captured.get("stderr", "")
+    return result
 
 
 def _require_suffix(
@@ -588,10 +867,12 @@ def _read_xlsx(path: Path) -> str:
 def tool_build_excel(
     file: str = "workbook.xlsx",
     recipe: str = "",
+    data: Optional[Any] = None,
+    validate_only: bool = False,
     discussion_instance: Optional[Any] = None,
     lollms_client_instance: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Creates a new Excel workbook (.xlsx/.xlsm) from a sandboxed openpyxl recipe.
+    """Creates or dry-runs an Excel workbook (.xlsx/.xlsm) via a sandboxed openpyxl recipe.
 
     === EXCEL DOCTRINE (CRITICAL — READ BEFORE WRITING THE RECIPE) ===
     NEVER write computed results manually. ALWAYS write FORMULAS into cells so
@@ -611,28 +892,54 @@ def tool_build_excel(
     precomputed literals are acceptable only when the user explicitly needs
     chart rendering without recalculation.
 
-    The root objects are pre-bound as `wb` (workbook) and `ws` (active sheet).
-    Available symbols: Workbook, load_workbook, PieChart, LineChart, BarChart,
-    Reference, Font, PatternFill, Alignment, Border, Side, get_column_letter,
-    CellIsRule, ColorScaleRule, DataValidation, media(), list_media(),
-    resolve_path().
+    === SANDBOX CONTRACT (memorize) ===
+    - Root objects PRE-BOUND: `wb` (Workbook) and `ws` (active sheet).
+    - SAVING IS AUTOMATIC. Do NOT call wb.save() — the tool performs a
+      transactional, validated save after your recipe returns.
+    - IMPORT WHITELIST: openpyxl.* plus safe stdlib modules: math, datetime,
+      random, json, statistics, itertools, functools, re, uuid, calendar,
+      decimal, fractions, textwrap, base64, hashlib, string, collections.
+      pandas, os, sys and open() are NOT available.
+    - FORBIDDEN TOKENS: eval(, exec(, compile(, open(, os., sys., subprocess,
+      shutil, pathlib, globals(, locals(, vars(, getattr(, setattr(, delattr(.
+    - PRE-IMPORTED SYMBOLS: Workbook, load_workbook, PieChart, LineChart,
+      BarChart, ScatterChart, AreaChart, DoughnutChart, RadarChart, Reference,
+      Font, PatternFill, Alignment, Border, Side, NamedStyle,
+      get_column_letter, column_index_from_string, CellIsRule, ColorScaleRule,
+      DataBarRule, FormulaRule, IconSetRule, DataValidation, Table,
+      TableStyleInfo, plus media(), list_media(), resolve_path(), write_rows().
+    - print() OUTPUT IS RETURNED: in the tool response as `stdout` (and stderr
+      as `stderr`), truncated to 8 KB. Use it freely to debug — no need for
+      cell-write/read-back probes.
+    - PANDAS IS INTENTIONALLY UNAVAILABLE: pass tabular data via the `data`
+      parameter (list of dicts or list of lists); the rows land in `data_rows`
+      and the pre-bound `write_rows(ws=None, start_row=1, start_col=1,
+      include_headers=True)` helper. Assemble further rows in pure Python.
+    - DISCOVERY: pass `recipe="__help__"` (or leave recipe empty) to receive
+      the full machine-readable capability manifest without writing a file.
+      To create a blank workbook, pass a comment-only recipe such as `# blank`.
+    - DRY-RUN: set `validate_only=true` to execute the recipe against an
+      in-memory workbook and receive a structural report (sheets, formula
+      cells, chart count, merged ranges) with NO file written.
+
     WORKSPACE RULE: every workspace asset reference (images, CSV inputs,
     sub-documents) MUST go through media()/resolve_path() — bare filenames
     resolve against the workspace, not the process folder.
-    Recipes are plain Python: imports are allowed ONLY from the whitelist
-    (openpyxl.* and safe stdlib modules); all core design symbols are also
-    pre-imported. The tool saves automatically; calling wb.save() inside the
-    recipe is a no-op — remove it. Also available: tables, conditional
-    formatting (CellIsRule/ColorScaleRule), data validation (DataValidation),
-    freeze panes (ws.freeze_panes), column widths (ws.column_dimensions),
-    number formats (cell.number_format).
 
     Args:
         file: Target .xlsx/.xlsm file name (default "workbook.xlsx").
-        recipe: Plain Python recipe code mutating the pre-bound wb/ws objects.
+        recipe: Plain Python recipe mutating the pre-bound wb/ws (or "__help__"
+            to fetch the capability manifest).
+        data: Optional tabular input (list of dicts / list of lists / JSON
+            string) injected as `data_rows` + `write_rows()`.
+        validate_only: When true, run the recipe in memory and return a
+            structural report; no file is written.
         discussion_instance: Active discussion session instance.
         lollms_client_instance: Active client instance.
     """
+    manifest = _emit_manifest_if_requested(recipe)
+    if manifest is not None:
+        return manifest
     suffix_failure = _require_suffix(file, _XLSX_SUFFIXES, "tool_build_excel")
     if suffix_failure is not None:
         return suffix_failure
@@ -647,6 +954,7 @@ def tool_build_excel(
 
         working_dir = _resolve_working_dir(discussion_instance)
         namespace = _build_recipe_namespace(working_dir=working_dir)
+        _inject_data(namespace, data)
         try:
             root_obj = _create_root_object(suffix, namespace)
         except KeyError as missing_symbol:
@@ -663,31 +971,49 @@ def tool_build_excel(
         except Exception:
             pass
 
-        exec_failure = _exec_recipe(recipe, namespace, "<excel_recipe>")
+        exec_failure, captured = _exec_recipe(recipe, namespace, "<excel_recipe>")
         if exec_failure is not None:
+            exec_failure["stdout"] = captured.get("stdout", "")
+            exec_failure["stderr"] = captured.get("stderr", "")
             return exec_failure
 
         root_obj = _pick_effective_root(namespace, suffix, root_obj)
 
+        if validate_only:
+            return {
+                "success": True,
+                "validated": True,
+                "report": _structural_report(root_obj, suffix),
+                "stdout": captured.get("stdout", ""),
+                "stderr": captured.get("stderr", ""),
+                "note": "validate_only=true — no file was written.",
+            }
+
         save_path = working_dir / file_name
         save_result = _save_and_verify(root_obj, save_path)
         if not save_result["success"]:
+            save_result["stdout"] = captured.get("stdout", "")
+            save_result["stderr"] = captured.get("stderr", "")
             return save_result
-        return _build_result(save_result, save_path)
+        return _build_result(save_result, save_path, captured)
     except Exception as unexpected_err:
         return {
             "success": False,
             "error": f"Unexpected failure building Excel workbook: {unexpected_err}",
+            "stdout": "",
+            "stderr": "",
         }
 
 
 def tool_edit_excel(
     file: str,
     recipe: str = "",
+    data: Optional[Any] = None,
+    validate_only: bool = False,
     discussion_instance: Optional[Any] = None,
     lollms_client_instance: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Edits an existing Excel workbook (.xlsx/.xlsm) in place via a sandboxed openpyxl recipe.
+    """Edits or dry-runs an existing Excel workbook (.xlsx/.xlsm) via a sandboxed openpyxl recipe.
 
     === EXCEL DOCTRINE (CRITICAL — READ BEFORE WRITING THE RECIPE) ===
     NEVER write computed results manually. ALWAYS write FORMULAS into cells so
@@ -699,26 +1025,54 @@ def tool_edit_excel(
     etc. Literal values are ONLY for input data. Writing a computed number by
     hand instead of a formula is a CRITICAL ERROR.
 
-    The opened workbook is pre-bound as `wb` and its active sheet as `ws`
-    (.xlsm files are opened with keep_vba=True). Available symbols: Workbook,
-    load_workbook, PieChart, LineChart, BarChart, Reference, Font, PatternFill,
-    Alignment, Border, Side, get_column_letter, CellIsRule, ColorScaleRule,
-    DataValidation, media(), list_media(), resolve_path(). WORKSPACE RULE:
-    every workspace asset reference (images, inputs) MUST use media()/
-    resolve_path() — bare filenames resolve against the workspace, not the
-    process folder. Recipes are plain Python: imports
-    are allowed ONLY from the whitelist (openpyxl.* and safe stdlib modules);
-    all core design symbols are also pre-imported. The tool saves
-    automatically; calling wb.save() inside the recipe is a no-op — remove it.
-    The save is transactional: on validation failure the pre-edit bytes are
-    restored.
+    === SANDBOX CONTRACT (memorize) ===
+    - The opened workbook is PRE-BOUND as `wb`, active sheet as `ws`
+      (.xlsm files are opened with keep_vba=True).
+    - SAVING IS AUTOMATIC. Do NOT call wb.save() — the tool performs a
+      transactional, validated save after your recipe returns; on validation
+      failure the pre-edit bytes are restored.
+    - IMPORT WHITELIST: openpyxl.* plus safe stdlib modules: math, datetime,
+      random, json, statistics, itertools, functools, re, uuid, calendar,
+      decimal, fractions, textwrap, base64, hashlib, string, collections.
+      pandas, os, sys and open() are NOT available.
+    - FORBIDDEN TOKENS: eval(, exec(, compile(, open(, os., sys., subprocess,
+      shutil, pathlib, globals(, locals(, vars(, getattr(, setattr(, delattr(.
+    - PRE-IMPORTED SYMBOLS: Workbook, load_workbook, PieChart, LineChart,
+      BarChart, ScatterChart, AreaChart, DoughnutChart, RadarChart, Reference,
+      Font, PatternFill, Alignment, Border, Side, NamedStyle,
+      get_column_letter, column_index_from_string, CellIsRule, ColorScaleRule,
+      DataBarRule, FormulaRule, IconSetRule, DataValidation, Table,
+      TableStyleInfo, plus media(), list_media(), resolve_path(), write_rows().
+    - print() OUTPUT IS RETURNED: in the tool response as `stdout` (and stderr
+      as `stderr`), truncated to 8 KB.
+    - PANDAS IS INTENTIONALLY UNAVAILABLE: pass tabular data via the `data`
+      parameter (list of dicts or list of lists); the rows land in `data_rows`
+      and the pre-bound `write_rows(ws=None, start_row=1, start_col=1,
+      include_headers=True)` helper.
+    - DISCOVERY: pass `recipe="__help__"` (or leave recipe empty) to receive
+      the full machine-readable capability manifest without writing a file.
+    - DRY-RUN: set `validate_only=true` to execute the recipe against the
+      opened workbook in memory and receive a structural report with NO file
+      written.
+
+    WORKSPACE RULE: every workspace asset reference (images, inputs) MUST use
+    media()/resolve_path() — bare filenames resolve against the workspace, not
+    the process folder.
 
     Args:
         file: Existing .xlsx/.xlsm file to edit (relative to workspace or absolute path).
-        recipe: Plain Python recipe code mutating the opened wb/ws objects.
+        recipe: Plain Python recipe mutating the opened wb/ws (or "__help__" to
+            fetch the capability manifest).
+        data: Optional tabular input (list of dicts / list of lists / JSON
+            string) injected as `data_rows` + `write_rows()`.
+        validate_only: When true, run the recipe in memory and return a
+            structural report; no file is written.
         discussion_instance: Active discussion session instance.
         lollms_client_instance: Active client instance.
     """
+    manifest = _emit_manifest_if_requested(recipe)
+    if manifest is not None:
+        return manifest
     suffix_failure = _require_suffix(file, _XLSX_SUFFIXES, "tool_edit_excel")
     if suffix_failure is not None:
         return suffix_failure
@@ -740,6 +1094,7 @@ def tool_edit_excel(
             }
 
         namespace = _build_recipe_namespace(working_dir=working_dir)
+        _inject_data(namespace, data)
         try:
             root_obj = _open_existing(file_path, namespace)
         except KeyError as missing_symbol:
@@ -756,20 +1111,36 @@ def tool_edit_excel(
         except Exception:
             pass
 
-        exec_failure = _exec_recipe(recipe, namespace, "<excel_recipe>")
+        exec_failure, captured = _exec_recipe(recipe, namespace, "<excel_recipe>")
         if exec_failure is not None:
+            exec_failure["stdout"] = captured.get("stdout", "")
+            exec_failure["stderr"] = captured.get("stderr", "")
             return exec_failure
 
         root_obj = _pick_effective_root(namespace, suffix, root_obj)
 
+        if validate_only:
+            return {
+                "success": True,
+                "validated": True,
+                "report": _structural_report(root_obj, suffix),
+                "stdout": captured.get("stdout", ""),
+                "stderr": captured.get("stderr", ""),
+                "note": "validate_only=true — no file was written.",
+            }
+
         save_result = _save_and_verify(root_obj, file_path)
         if not save_result["success"]:
+            save_result["stdout"] = captured.get("stdout", "")
+            save_result["stderr"] = captured.get("stderr", "")
             return save_result
-        return _build_result(save_result, file_path)
+        return _build_result(save_result, file_path, captured)
     except Exception as unexpected_err:
         return {
             "success": False,
             "error": f"Unexpected failure editing Excel workbook: {unexpected_err}",
+            "stdout": "",
+            "stderr": "",
         }
 
 
@@ -1258,19 +1629,28 @@ def get_tools() -> List[Dict[str, Any]]:
         {
             "name": "tool_build_excel",
             "description": (
-                "Creates a new Excel workbook (.xlsx/.xlsm) from a sandboxed openpyxl recipe. "
-                "DOCTRINE: NEVER write computed results manually — ALWAYS write formulas so Excel "
-                "computes them: ws['F2']='=SUM(B2:E2)', ws['G2']='=AVERAGE(B2:E2)', "
-                "ws['H2']='=IF(F2>100,\"High\",\"Low\")'. Literals only for input data. Root objects "
-                "pre-bound as wb/ws. Symbols: Workbook, load_workbook, PieChart, LineChart, BarChart, "
-                "Reference, Font, PatternFill, Alignment, Border, Side, get_column_letter, CellIsRule, "
-                "ColorScaleRule, DataValidation, media(), list_media(), resolve_path(). WORKSPACE "
-                "RULE: every workspace asset reference (images, inputs) MUST use media()/"
-                "resolve_path() — bare filenames resolve against the workspace, not the process "
-                "folder. Imports allowed ONLY from the "
-                "whitelist (openpyxl.*, safe stdlib). Do NOT call save() — the tool saves and validates "
-                "automatically. Chart note: charts referencing formula cells may appear empty in some "
-                "viewers until Excel recalculates."
+                "Creates or dry-runs an Excel workbook (.xlsx/.xlsm) via a sandboxed openpyxl "
+                "recipe. DOCTRINE: NEVER write computed results manually — ALWAYS write formulas "
+                "so Excel computes them: ws['F2']='=SUM(B2:E2)', ws['G2']='=AVERAGE(B2:E2)', "
+                "ws['H2']='=IF(F2>100,\"High\",\"Low\")'. Literals only for input data. "
+                "SANDBOX CONTRACT: wb/ws are PRE-BOUND; SAVING IS AUTOMATIC — never call wb.save(). "
+                "Import whitelist: openpyxl.* plus safe stdlib (math, datetime, random, json, "
+                "statistics, itertools, functools, re, uuid, calendar, decimal, fractions, "
+                "textwrap, base64, hashlib, string, collections). pandas/os/sys/open are NOT "
+                "available. Forbidden tokens: eval(, exec(, compile(, open(, os., sys., "
+                "subprocess, shutil, pathlib, globals(, locals(, vars(, getattr(, setattr(, "
+                "delattr(. PRE-IMPORTED symbols: Workbook, load_workbook, PieChart, LineChart, "
+                "BarChart, ScatterChart, AreaChart, DoughnutChart, RadarChart, Reference, Font, "
+                "PatternFill, Alignment, Border, Side, NamedStyle, get_column_letter, "
+                "column_index_from_string, CellIsRule, ColorScaleRule, DataBarRule, FormulaRule, "
+                "IconSetRule, DataValidation, Table, TableStyleInfo, media(), list_media(), "
+                "resolve_path(), write_rows(). print() output is captured and returned as "
+                "stdout/stderr. Pass tabular data via `data` (list of dicts / list of lists / "
+                "JSON string) → `data_rows` + `write_rows()`. Pass recipe='__help__' (or leave "
+                "it empty) to receive the full capability manifest without writing a file. Set "
+                "validate_only=true to dry-run the recipe in memory and get a structural report "
+                "(sheets, formula cells, chart count, merged ranges) with NO file written. "
+                "WORKSPACE RULE: every workspace asset reference MUST use media()/resolve_path()."
             ),
             "parameters": [
                 {
@@ -1282,7 +1662,19 @@ def get_tools() -> List[Dict[str, Any]]:
                 {
                     "name": "recipe",
                     "type": "str",
-                    "description": "Plain Python recipe mutating the pre-bound wb/ws. FORMULAS ONLY for computed cells (=SUM, =AVERAGE, =IF, =VLOOKUP...). Imports allowed only from the whitelist (openpyxl.*, safe stdlib). Do NOT call save().",
+                    "description": "Plain Python recipe mutating the pre-bound wb/ws. FORMULAS ONLY for computed cells (=SUM, =AVERAGE, =IF, =VLOOKUP...). Do NOT call save(). Pass '__help__' (or empty) to fetch the capability manifest.",
+                    "optional": True,
+                },
+                {
+                    "name": "data",
+                    "type": "list",
+                    "description": "Optional tabular input: list of dicts (header + rows) or list of lists, or a JSON string encoding either. Lands in `data_rows` and the `write_rows(ws=None, start_row=1, start_col=1, include_headers=True)` helper. This is the pandas replacement.",
+                    "optional": True,
+                },
+                {
+                    "name": "validate_only",
+                    "type": "bool",
+                    "description": "When true, the recipe runs against an in-memory workbook and returns a structural report (sheets, formula cells, charts, merged ranges). No file is written.",
                     "optional": True,
                 },
             ],
@@ -1291,6 +1683,10 @@ def get_tools() -> List[Dict[str, Any]]:
                 {"name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
                 {"name": "context_files", "type": "list", "description": "List of context files (the saved file)."},
                 {"name": "file_name", "type": "str", "description": "Name of the saved file."},
+                {"name": "stdout", "type": "str", "description": "Captured print() output (truncated to 8 KB)."},
+                {"name": "stderr", "type": "str", "description": "Captured stderr output (truncated to 8 KB)."},
+                {"name": "manifest", "type": "object", "description": "Present when recipe='__help__' or empty: the sandbox capability manifest."},
+                {"name": "report", "type": "object", "description": "Present when validate_only=true: the structural dry-run report."},
                 {"name": "error", "type": "str", "description": "Error message if failed."},
             ],
             "callable": tool_build_excel,
@@ -1300,15 +1696,27 @@ def get_tools() -> List[Dict[str, Any]]:
         {
             "name": "tool_edit_excel",
             "description": (
-                "Edits an existing Excel workbook (.xlsx/.xlsm) in place via a sandboxed openpyxl "
-                "recipe. DOCTRINE: NEVER write computed results manually — ALWAYS write formulas so "
-                "Excel computes them (=SUM, =AVERAGE, =IF, =VLOOKUP...). Literals only for input data. "
-                "Opened workbook pre-bound as wb, active sheet as ws (.xlsm opened with keep_vba=True). "
-                "WORKSPACE RULE: every workspace asset reference (images, inputs) MUST use media()/"
-                "resolve_path() — bare filenames resolve against the workspace, not the process folder. "
-                "Imports allowed ONLY from the whitelist (openpyxl.*, safe stdlib). Do NOT call save() — "
-                "the tool saves and validates automatically. Transactional save: pre-edit bytes restored "
-                "on validation failure."
+                "Edits or dry-runs an existing Excel workbook (.xlsx/.xlsm) via a sandboxed "
+                "openpyxl recipe. DOCTRINE: NEVER write computed results manually — ALWAYS write "
+                "formulas so Excel computes them (=SUM, =AVERAGE, =IF, =VLOOKUP...). Literals only "
+                "for input data. SANDBOX CONTRACT: opened wb/ws are PRE-BOUND (.xlsm opened with "
+                "keep_vba=True); SAVING IS AUTOMATIC — never call wb.save(); save is transactional "
+                "(pre-edit bytes restored on validation failure). Import whitelist: openpyxl.* "
+                "plus safe stdlib (math, datetime, random, json, statistics, itertools, functools, "
+                "re, uuid, calendar, decimal, fractions, textwrap, base64, hashlib, string, "
+                "collections). pandas/os/sys/open are NOT available. Forbidden tokens: eval(, "
+                "exec(, compile(, open(, os., sys., subprocess, shutil, pathlib, globals(, "
+                "locals(, vars(, getattr(, setattr(, delattr(. PRE-IMPORTED symbols: Workbook, "
+                "load_workbook, PieChart, LineChart, BarChart, ScatterChart, AreaChart, "
+                "DoughnutChart, RadarChart, Reference, Font, PatternFill, Alignment, Border, Side, "
+                "NamedStyle, get_column_letter, column_index_from_string, CellIsRule, "
+                "ColorScaleRule, DataBarRule, FormulaRule, IconSetRule, DataValidation, Table, "
+                "TableStyleInfo, media(), list_media(), resolve_path(), write_rows(). print() "
+                "output is captured and returned as stdout/stderr. Pass tabular data via `data` "
+                "→ `data_rows` + `write_rows()`. Pass recipe='__help__' (or leave it empty) to "
+                "receive the capability manifest without touching the file. Set validate_only=true "
+                "to dry-run the recipe in memory and get a structural report with NO file written. "
+                "WORKSPACE RULE: every workspace asset reference MUST use media()/resolve_path()."
             ),
             "parameters": [
                 {
@@ -1319,7 +1727,19 @@ def get_tools() -> List[Dict[str, Any]]:
                 {
                     "name": "recipe",
                     "type": "str",
-                    "description": "Plain Python recipe mutating the opened wb/ws. FORMULAS ONLY for computed cells. Imports allowed only from the whitelist (openpyxl.*, safe stdlib). Do NOT call save().",
+                    "description": "Plain Python recipe mutating the opened wb/ws. FORMULAS ONLY for computed cells. Do NOT call save(). Pass '__help__' (or empty) to fetch the capability manifest.",
+                    "optional": True,
+                },
+                {
+                    "name": "data",
+                    "type": "list",
+                    "description": "Optional tabular input: list of dicts, list of lists, or a JSON string. Lands in `data_rows` and the `write_rows(...)` helper. This is the pandas replacement.",
+                    "optional": True,
+                },
+                {
+                    "name": "validate_only",
+                    "type": "bool",
+                    "description": "When true, the recipe runs against the opened workbook in memory and returns a structural report. No file is written.",
                     "optional": True,
                 },
             ],
@@ -1328,6 +1748,10 @@ def get_tools() -> List[Dict[str, Any]]:
                 {"name": "workspace_file", "type": "str", "description": "Absolute path to the saved file."},
                 {"name": "context_files", "type": "list", "description": "List of context files (the saved file)."},
                 {"name": "file_name", "type": "str", "description": "Name of the saved file."},
+                {"name": "stdout", "type": "str", "description": "Captured print() output (truncated to 8 KB)."},
+                {"name": "stderr", "type": "str", "description": "Captured stderr output (truncated to 8 KB)."},
+                {"name": "manifest", "type": "object", "description": "Present when recipe='__help__' or empty: the sandbox capability manifest."},
+                {"name": "report", "type": "object", "description": "Present when validate_only=true: the structural dry-run report."},
                 {"name": "error", "type": "str", "description": "Error message if failed."},
             ],
             "callable": tool_edit_excel,

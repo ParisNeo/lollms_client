@@ -8902,7 +8902,80 @@ JSON:"""
         if docs_scope:
             parts.append(docs_scope)
 
+        # STAGED TOOLSETS region: injected last so the LLM reads the exact
+        # on-disk TOOLS.py source it is expected to edit via tool_stage_*.
+        # Empty string when nothing is staged (no cost on the common path).
+        staged_toolsets_ctx = self._build_staged_toolsets_context()
+        if staged_toolsets_ctx:
+            parts.append(staged_toolsets_ctx)
+
         return "\n\n".join(p.strip() for p in parts if p and p.strip())
+
+    def _build_staged_toolsets_context(self) -> str:
+        """Render the STAGED TOOLSETS prompt region from the staging registry.
+
+        The registry is written by the ``toolset_staging`` LCP toolset, which
+        resolves its workspace through the tool runtime ``env`` (via
+        ``env.tool_context.workspace_path`` — which, in the personality chat
+        path, IS this personality instance). We therefore resolve the SAME
+        root here, in the same precedence order:
+
+            1. ``self.workspace_path`` (primary — mirrors env.tool_context),
+            2. the handbag folder when the workspace is unset,
+            3. the process CWD as a last resort.
+
+        Returns an empty string when nothing is staged or on any error, so the
+        common path pays no prompt cost and a broken staging state can never
+        break the personality's generation.
+        """
+        try:
+            from lollms_client.lollms_personality.toolset_staging_state import (
+                build_staged_prompt_block,
+            )
+        except Exception:
+            return ""
+
+        root = self._resolve_staging_workspace_root()
+        if root is None:
+            return ""
+        try:
+            return build_staged_prompt_block(root) or ""
+        except Exception:
+            return ""
+
+    def _resolve_staging_workspace_root(self) -> Optional[Path]:
+        """Resolve the workspace root used by the toolset_staging writer.
+
+        Must match ``toolset_staging.TOOLS._workspace_root``: the writer reads
+        ``env.tool_context.workspace_path`` first, and in the personality chat
+        path the tool-context is the personality itself, so ``self.workspace_path``
+        is the authoritative root. Fallbacks keep standalone (no-workspace)
+        sessions functional.
+        """
+        candidates: List[Any] = []
+        try:
+            candidates.append(getattr(self, "workspace_path", None))
+        except Exception:
+            candidates.append(None)
+        try:
+            candidates.append(getattr(self, "handbag_path", None))
+        except Exception:
+            candidates.append(None)
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                resolved = Path(candidate).resolve()
+            except (OSError, ValueError, TypeError):
+                continue
+            if resolved.is_dir():
+                return resolved
+        try:
+            cwd = Path.cwd().resolve()
+        except Exception:
+            return None
+        return cwd if cwd.is_dir() else None
     
     
     def change_file_visibility(self, targets: List[str], action: str) -> Dict[str, Any]:
@@ -9344,17 +9417,16 @@ JSON:"""
                     discussion_instance=getattr(self, '_artefact_proxy', None),
                     lollms_client_instance=self.lollms_client
                 )
-                _resurrected = 0
+                _resurrected_names: List[str] = []
                 for _t_name, _t_spec in (_survival_specs or {}).items():
                     if _t_name not in active_tools:
                         active_tools[_t_name] = _t_spec
-                        _resurrected += 1
-                if _resurrected:
+                        _resurrected_names.append(_t_name)
+                if _resurrected_names:
                     ASCIIColors.warning(
                         f"[{self.name}] 🛡️ Handbag tools survival guard re-injected "
-                        f"{_resurrected} tool(s) that had been dropped after "
-                        f"initial discovery: "
-                        f"{[n for n in (_survival_specs or {}) if n in active_tools and n not in []]}. "
+                        f"{len(_resurrected_names)} tool(s) that had been dropped after "
+                        f"initial discovery: {_resurrected_names}. "
                         f"Please investigate what removed them upstream."
                     )
             except Exception as _surv_err:

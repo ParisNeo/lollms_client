@@ -207,12 +207,36 @@ def _pil_image_to_b64(img: Any, fmt: str = "JPEG") -> Tuple[str, str]:
     return _b64_encode(buf.getvalue()), f"image/{fmt.lower()}"
 
 
+_STRUCTURED_DATA_EXTENSIONS = frozenset({
+    ".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".xml", ".yaml", ".yml",
+    ".xlsx", ".xls", ".xlsm", ".parquet", ".feather", ".arrow",
+    ".sqlite", ".sqlite3", ".db", ".duckdb", ".pkl", ".pickle",
+})
+
+
+def _is_text_like_extension(ext: str) -> bool:
+    """True when the extension denotes human-readable text/code (not structured data)."""
+    return ext in _TEXT_EXTENSIONS or ext in _CODE_EXTENSIONS
+
+
 def _detect_artefact_type_from_mode(path: Path, mode: str) -> str:
     """
     Determines the ArtefactType strictly based on the user's explicit import mode.
     This prevents the .lam Dual-Stream system from hijacking text imports.
+
+    CRITICAL: A file whose extension is human-readable text/code is ALWAYS
+    classified as DOCUMENT/CODE — even in ``as_is`` / ``data`` / ``data_bundle``
+    modes. Otherwise the .lam dual-stream protocol replaces the real text with a
+    data-schema descriptor, and the LLM only ever sees LAM metadata for an object
+    that is essentially text.
     """
     ext = path.suffix.lower()
+
+    # Text/code formats are never structured data, regardless of requested mode.
+    # This prevents the .lam dual-stream protocol from replacing real text with
+    # a data-schema descriptor when a text file is imported in as_is/data mode.
+    if _is_text_like_extension(ext):
+        return ArtefactType.CODE if ext in _CODE_EXTENSIONS else ArtefactType.DOCUMENT
 
     if mode in (IMPORT_MODE_AS_IS, IMPORT_MODE_DATA, IMPORT_MODE_DATA_BUNDLE):
         return ArtefactType.FILE
@@ -1454,6 +1478,15 @@ class FileImportMixin:
                     }
 
         # ── as_is mode (Native Binary/Document Preservation) ─────────────────
+        # CRITICAL: Text files must never be imported "as-is" as a FILE artefact —
+        # that would surface LAM metadata instead of the actual text. Fall through
+        # to the normal text-extraction path below so the LLM sees the content.
+        if mode == IMPORT_MODE_AS_IS and _is_text_like_extension(ext):
+            _progress(
+                f"'{path.name}' is a text file — importing as text content "
+                f"instead of a binary FILE artefact."
+            )
+            mode = IMPORT_MODE_TEXT
         if mode == IMPORT_MODE_AS_IS:
             _progress(f"Importing '{path.name}' as-is (native file preservation)...")
             clean_title = title
@@ -1527,6 +1560,24 @@ class FileImportMixin:
         # Data files are as-is FILE artefacts. The schema lives in a sibling
         # '.lam' file so tools and LLM discovery both work without a dedicated
         # DATA artefact type.
+        # CRITICAL: A plain text/code file is NOT structured data — importing it
+        # via the data pipeline would surface a LAM schema instead of the actual
+        # text. Delegate such files to the text-extraction path below.
+        # A text/code file is NOT structured data. Importing it through the data
+        # pipeline would surface a LAM schema instead of the actual text content,
+        # so delegate such files to the text-extraction path below.
+        _structured_data_exts = {
+            ".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".xml",
+            ".yaml", ".yml", ".xlsx", ".xls", ".xlsm", ".parquet",
+            ".feather", ".arrow", ".sqlite", ".sqlite3", ".db",
+            ".duckdb", ".pkl", ".pickle",
+        }
+        if mode == IMPORT_MODE_DATA and _is_text_like_extension(ext) and ext not in _structured_data_exts:
+            _progress(
+                f"'{path.name}' is a text file, not structured data — "
+                f"importing as text content."
+            )
+            mode = IMPORT_MODE_TEXT
         if mode == IMPORT_MODE_DATA:
             _progress("Analyzing structured data file...")
 
