@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-23 03:34]
+
+- chore(release): bump version to 1.22.15
+
 ## [2026-11-23 03:33]
 
 - chore: update CLI, handbag logic, workspace tools, and diffusers server
