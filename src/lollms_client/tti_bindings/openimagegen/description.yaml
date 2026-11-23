@@ -1,0 +1,47 @@
+title: "OpenImageGen (OpenAI-compatible)"
+author: "ParisNeo"
+version: 1.0.0
+binding_name: "openimagegen"
+description: |
+  OpenAI-compatible Text-to-Image client for OpenImageGen services.
+  Speaks the universal OpenAI Images API contract:
+    - POST /v1/images/generations  (text-to-image, JSON)
+    - POST /v1/images/edits        (image edit, multipart)
+    - GET  /v1/models              (model listing)
+  Handles both `b64_json` and URL-based image responses, applies visible
+  watermarking + PNG metadata via the shared LollmsTTIBinding base, and
+  forwards common provider kwargs (seed, steps, guidance_scale, quality,
+  style, negative_prompt, ...) automatically.
+
+global_input_parameters:
+  - name: "host_address"
+    type: "str"
+    description: "Base URL of the OpenImageGen / OpenAI-compatible image service (e.g. 'http://localhost:8000' or your deployment URL). Trailing '/v1' or '/openai/v1' is stripped automatically."
+    mandatory: false
+    default: "http://localhost:8000"
+
+  - name: "service_key"
+    type: "str"
+    description: "Bearer token used to authenticate requests. Can also be set via the OPENIMAGEGEN_API_KEY environment variable."
+    mandatory: false
+    is_secret: true
+    default: ""
+
+  - name: verify_ssl_certificate
+    type: bool
+    description: "Whether to verify the SSL certificate of the server. Defaults to true."
+    mandatory: false
+    default: true
+
+  - name: certificate_file_path
+    type: "str"
+    description: "Path to a specific SSL certificate file (.pem, .crt) for verifying the server identity. Useful for self-signed certificates."
+    mandatory: false
+    default: ""
+
+model_input_parameters:
+  - name: "model_name"
+    type: "str"
+    description: "Model identifier sent in the 'model' field of each request (e.g. 'openimagegen-xl'). Leave empty to use the server's default model."
+    mandatory: false
+    default: ""
