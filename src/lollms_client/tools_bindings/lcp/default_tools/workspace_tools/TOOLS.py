@@ -35,10 +35,51 @@ _IGNORED_DIRS = {
 }
 
 
-def init_tools_library(config: dict = None) -> None:
-    pass
+def init_tools_library(tool_binding=None, **kwargs):
+    """Initializes the workspace tools library and caches the workspace root.
 
+    The LCP runtime has historically called this hook with a single positional
+    argument that is EITHER a ``host_config`` dict (``{"workspace": ...,
+    "workspace_data_path": ..., "binding": <LCPBinding>}``) OR the binding
+    object itself. Older/other callers may pass ``workspace=...`` as a keyword.
 
+    We accept all three shapes and cache the first valid workspace path so that
+    read/grep/find/list tools resolve against the REAL discussion workspace
+    instead of silently falling back to ``cwd`` (the project root) — which made
+    genuinely-present workspace files report as 'not found'.
+    """
+    global _CACHED_WORKSPACE_ROOT, _TOOL_BINDING
+
+    candidate: Optional[str] = kwargs.get("workspace")
+    binding_obj = None
+
+    # Shape A: first positional arg is a host_config dict (current LCP contract).
+    if isinstance(tool_binding, dict):
+        candidate = candidate or tool_binding.get("workspace") or tool_binding.get("workspace_data_path")
+        binding_obj = tool_binding.get("binding")
+    # Shape B: first positional arg is the binding object itself.
+    elif tool_binding is not None:
+        binding_obj = tool_binding
+        if not candidate:
+            candidate = getattr(tool_binding, "workspace_data_path", None)
+
+    # Keep a reference to the binding (NOT a raw dict) so late-binding lookups
+    # in ``_get_workspace_root`` can consult ``.workspace_data_path``.
+    _TOOL_BINDING = binding_obj
+
+    if not candidate and binding_obj is not None:
+        candidate = getattr(binding_obj, "workspace_data_path", None)
+    if not candidate:
+        for _env in ("LOLLMS_WORKSPACE_DIR", "LOLLMS_DISCUSSION_WORKSPACE"):
+            if os.environ.get(_env):
+                candidate = os.environ[_env]
+                break
+
+    if candidate:
+        try:
+            _CACHED_WORKSPACE_ROOT = Path(candidate).expanduser().resolve()
+        except Exception:
+            _CACHED_WORKSPACE_ROOT = None
 def _is_within_base(candidate: Path, base: Path) -> bool:
     """Case-aware containment check that matches the host filesystem semantics."""
     try:
@@ -78,13 +119,71 @@ def _reject_dangerous_names(file_name: str) -> None:
         raise PermissionError(f"Rejected file name: reserved device name '{leaf}'.")
 
 
+def _get_workspace_root() -> Path:
+    """Resolve the workspace root reliably across all execution contexts.
+
+    Prefers the workspace injected by the runtime via
+    ``init_tools_library(workspace=...)`` (cached in ``_CACHED_WORKSPACE_ROOT``),
+    then the live ``tool_binding.workspace_data_path``, then the ``LOLLMS_*``
+    env vars, and only finally falls back to ``cwd``. Without this the tools
+    resolved against the project root and reported existing workspace files as
+    'not found'.
+    """
+    if _CACHED_WORKSPACE_ROOT is not None:
+        return _CACHED_WORKSPACE_ROOT
+    if _TOOL_BINDING is not None:
+        bound = getattr(_TOOL_BINDING, "workspace_data_path", None)
+        if bound:
+            try:
+                return Path(bound).expanduser().resolve()
+            except Exception:
+                pass
+    for env_name in ("LOLLMS_WORKSPACE_DIR", "LOLLMS_DISCUSSION_WORKSPACE"):
+        env_val = os.environ.get(env_name)
+        if env_val:
+            try:
+                return Path(env_val).expanduser().resolve()
+            except Exception:
+                continue
+    return Path.cwd().resolve()
+
+
+def _get_workspace_root() -> Path:
+    """Resolve the workspace root reliably across all execution contexts.
+
+    Prefers the workspace injected by the runtime via
+    ``init_tools_library(workspace=...)`` (cached in ``_CACHED_WORKSPACE_ROOT``),
+    then the live ``tool_binding.workspace_data_path``, then the ``LOLLMS_*``
+    env vars, and only finally falls back to ``cwd``. Without a stable root the
+    walkers relativized against ``cwd`` and reported existing workspace files as
+    'not found'.
+    """
+    if _CACHED_WORKSPACE_ROOT is not None:
+        return _CACHED_WORKSPACE_ROOT
+    if _TOOL_BINDING is not None:
+        bound = getattr(_TOOL_BINDING, "workspace_data_path", None)
+        if bound:
+            try:
+                return Path(bound).expanduser().resolve()
+            except Exception:
+                pass
+    for env_name in ("LOLLMS_WORKSPACE_DIR", "LOLLMS_DISCUSSION_WORKSPACE"):
+        env_val = os.environ.get(env_name)
+        if env_val:
+            try:
+                return Path(env_val).expanduser().resolve()
+            except Exception:
+                continue
+    return Path.cwd().resolve()
+
+
 def _resolve_safe_path(file_name: str) -> Path:
     """
-    Sanitizes the file name and resolves it safely within the current working directory.
+    Sanitizes the file name and resolves it safely within the workspace root.
     Blocks path traversal attacks (e.g., ../../etc/passwd, symlinks escaping the workspace,
     Windows device names, embedded NUL bytes).
     """
-    base_path = Path.cwd().resolve()
+    base_path = _get_workspace_root()
 
     if file_name is None:
         raise PermissionError("Rejected file name: None.")
@@ -213,7 +312,7 @@ def tool_list_files(directory: str = ".", recursive: bool = False) -> Dict[str, 
             output_str = "\n".join(entries) if entries else "Directory is empty."
             return {"success": True, "files": entries, "output": output_str}
 
-        base_path = Path.cwd().resolve()
+        base_path = _get_workspace_root()
         for root, dirs, files in os.walk(target_path, followlinks=False):
             dirs[:] = [d for d in dirs if d not in _IGNORED_DIRS and not d.startswith(".")]
             for filename in files:
@@ -259,7 +358,7 @@ def tool_find_files(pattern: str, path: str = ".", max_results: int = 50) -> Dic
         if not search_dir.is_dir():
             return {"success": False, "error": f"Directory '{path}' not found."}
 
-        base_path = Path.cwd().resolve()
+        base_path = _get_workspace_root()
         matches: List[str] = []
         for root, dirs, files in os.walk(search_dir, followlinks=False):
             dirs[:] = [d for d in dirs if d not in _IGNORED_DIRS and not d.startswith('.')]
@@ -346,7 +445,7 @@ def tool_grep_files(
             max_results = 50
 
     try:
-        cwd = Path.cwd().resolve()
+        cwd = _get_workspace_root()
         results: List[Dict[str, Any]] = []
         files_scanned = 0
 

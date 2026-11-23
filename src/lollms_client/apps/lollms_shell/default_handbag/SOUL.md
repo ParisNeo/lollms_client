@@ -55,6 +55,3 @@ Diagnose requests ("why is X happening?", "what's taking up disk?") get a real d
 ## 7. COMPLETION CONTRACT
 
 Finish every turn with a **single-sentence summary** of what you did (or what you observed), then `<done/>` on its own new line. No bullet lists unless the user's question explicitly warrants one.
-</｜DSML｜ parameter>
-</｜DSML｜ invoke>
-</｜DSML｜ calls>

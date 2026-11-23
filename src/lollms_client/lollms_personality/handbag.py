@@ -30,7 +30,16 @@ class Handbag:
         self.memory_dir = self.path / "memory"
         self.rag_dir = self.path / "rag"
         self.docs_dir = self.path / "docs"
+        # NOTE: A handbag is a READ-ONLY resource bundle (soul/skills/tools/
+        # rag/memory/assets). The agent's writable files belong to the
+        # DISCUSSION's workspace_data folder, NOT to the handbag. Exposing a
+        # ``workspace_dir`` here used to leak a stray ``<handbag>/workspace/``
+        # directory whenever external code did ``handbag.workspace_dir.mkdir()``.
+        # We keep the attribute name for backward compatibility but point it at
+        # the non-authoritative placeholder ``workspace_path=None`` below so
+        # workspace resolvers skip the handbag and use the real discussion root.
         self.workspace_dir = self.path / "workspace"
+        self.workspace_path: Optional[str] = None
 
         self.manifest = self._load_manifest()
 
@@ -808,7 +817,17 @@ class Handbag:
         (p / "docs").mkdir(exist_ok=True)
         (p / "memory").mkdir(exist_ok=True)
         (p / "assets").mkdir(exist_ok=True)
-        (p / "workspace").mkdir(exist_ok=True)
+        # NOTE: no `workspace/` folder is created inside the handbag. The agent's
+        # working files belong to the discussion's `workspace_data/`, not to the
+        # handbag resource folder. Creating one here leaked a stray `workspace/`
+        # directory into every handbag. If an OLD/leaked empty `workspace/` is
+        # present, remove it (only when empty) so existing handbags self-heal.
+        _leaked_ws = p / "workspace"
+        try:
+            if _leaked_ws.is_dir() and not any(_leaked_ws.iterdir()):
+                _leaked_ws.rmdir()
+        except Exception:
+            pass
         # `mcp/` is optional and created with a README so users discover the
         # feature without a YAML file being present (empty dirs are not
         # tracked by git and confusing to debug).

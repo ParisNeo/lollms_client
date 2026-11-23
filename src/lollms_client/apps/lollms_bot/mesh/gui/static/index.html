@@ -1,0 +1,2544 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>lollms-bot · Mission Control</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='10' fill='%230e1117'/%3E%3Crect x='10' y='14' width='28' height='24' rx='6' fill='%231c2733' stroke='%2358a6ff' stroke-width='2'/%3E%3Cline x1='24' y1='8' x2='24' y2='14' stroke='%238b949e' stroke-width='2' stroke-linecap='round'/%3E%3Ccircle cx='24' cy='7' r='2.5' fill='%2358a6ff'/%3E%3Ccircle cx='18' cy='26' r='2.6' fill='%23c9d1d9'/%3E%3Ccircle cx='30' cy='26' r='2.6' fill='%23c9d1d9'/%3E%3Cpath d='M 18 32 Q 24 35 30 32' fill='none' stroke='%23c9d1d9' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E" />
+<style>
+  /* ── SVG icon system ───────────────────────────────────────────────────
+     All UI icons are inline SVG (no emoji, no external icon font). Each
+     .ico is sized by `width/height:1em` so it inherits the surrounding text
+     size automatically. `vertical-align:-0.125em` keeps it optically centred
+     on the text baseline. `fill:currentColor` lets the icon follow the text
+     colour in every state (buttons, muted labels, danger actions). */
+  .ico {
+    display: inline-block;
+    width: 1em; height: 1em;
+    vertical-align: -0.125em;
+    fill: currentColor;
+    flex: 0 0 auto;
+  }
+  .ico-lg { width: 1.25em; height: 1.25em; }
+
+  /* ── Example Agents gallery (self-mounted, independent of sidebar build) ── */
+  #example-agents { padding: 0 10px 8px; }
+  #example-agents .bp-card {
+    display: flex; gap: 8px; align-items: flex-start;
+    padding: 7px 9px; margin-bottom: 6px; background: #0d1117;
+    border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  #example-agents .bp-card:hover { border-color: var(--accent); background: #1a2332; }
+  #example-agents .bp-card .bp-icon { color: var(--accent); font-size: 16px; line-height: 1.1; }
+  #example-agents .bp-card .bp-name { font-weight: 600; font-size: 12px; }
+  #example-agents .bp-card .bp-desc { color: var(--muted); font-size: 10.5px; margin-top: 2px; line-height: 1.35; }
+  #example-agents .bp-card.exists { opacity: .55; cursor: default; border-color: var(--ok); }
+  #example-agents .bp-card.exists .bp-name::after { content: ' ✓'; color: var(--ok); }
+  #example-agents .bp-empty { color: var(--muted); font-size: 11px; padding: 4px 2px; }
+  :root {
+    --bg:      #0e1117;
+    --panel:   #161b22;
+    --border:  #30363d;
+    --text:    #c9d1d9;
+    --muted:   #8b949e;
+    --accent:  #58a6ff;
+    --ok:      #3fb950;
+    --warn:    #d29922;
+    --danger:  #f85149;
+    --running: #58a6ff;
+    --stopped: #6e7681;
+    --failed:  #f85149;
+    --pending: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg); color: var(--text); font-size: 13px;
+    display: grid; grid-template-columns: 200px 320px 1fr 360px;
+    grid-template-rows: 48px 1fr; height: 100vh; overflow: hidden;
+  }
+  /* ── Top bar ─────────────────────────────────────────────────────── */
+  header {
+    grid-column: 1 / span 4;
+    display: flex; align-items: center; gap: 12px;
+    padding: 0 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; color: var(--accent); display: flex; align-items: center; gap: 6px; }
+  header .pill {
+    padding: 2px 8px; border-radius: 999px; font-size: 11px;
+    background: #21262d; border: 1px solid var(--border); color: var(--muted);
+    display: inline-flex; align-items: center; gap: 4px;
+  }
+  header .pill.ok { border-color: var(--ok); color: var(--ok); }
+  header .pill.warn { border-color: var(--warn); color: var(--warn); }
+  header .pill.danger {
+    border-color: #ff2d55; color: #ff2d55;
+    animation: pill-danger-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pill-danger-pulse {
+    0%, 100% { border-color: rgba(255,45,85,.5); box-shadow: 0 0 0 rgba(255,45,85,0); }
+    50%      { border-color: #ff2d55; box-shadow: 0 0 8px rgba(255,45,85,.5); }
+  }
+  header .spacer { flex: 1; }
+  button {
+    font: inherit; color: var(--text); background: #21262d;
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 5px 10px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  button:hover { background: #30363d; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; }
+  button.primary:hover { background: #388bfd; }
+  button.danger { color: var(--danger); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  input, select, textarea {
+    font: inherit; background: #0d1117; color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px; padding: 5px 8px; width: 100%;
+  }
+  button:focus-visible, input:focus-visible, select:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px;
+  }
+
+  /* ── Navigation sidebar (left rail) ──────────────────────────────── */
+  nav#rail {
+    grid-column: 1; background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; padding: 8px 0;
+  }
+  nav#rail .brand {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .1em;
+    color: var(--muted); padding: 6px 16px 10px;
+  }
+  nav#rail button.navlink {
+    display: flex; align-items: center; gap: 8px;
+    border: none; background: transparent; border-radius: 0;
+    padding: 9px 16px; color: var(--muted); font-size: 12.5px;
+    border-left: 2px solid transparent; justify-content: flex-start;
+    cursor: pointer; text-align: left; width: 100%;
+  }
+  nav#rail button.navlink:hover { background: #1c242e; color: var(--text); }
+  nav#rail button.navlink.active {
+    color: var(--accent); border-left-color: var(--accent);
+    background: #121a24;
+  }
+  nav#rail button.navlink .badge {
+    margin-left: auto; font-size: 10px; font-weight: 600;
+    background: #30363d; color: var(--muted); border-radius: 999px;
+    padding: 0 6px; min-width: 18px; text-align: center;
+  }
+  nav#rail button.navlink.active .badge { background: var(--accent); color: #0e1117; }
+  nav#rail .rail-foot {
+    margin-top: auto; padding: 10px 16px 4px;
+    font-size: 10.5px; color: var(--muted); line-height: 1.4;
+    border-top: 1px solid var(--border);
+  }
+
+  /* ── Middle panel (context for the active view) ───────────────────── */
+  .panel { background: var(--panel); overflow-y: auto; border-right: 1px solid var(--border); }
+  .panel.mid { grid-column: 2; }
+  .panel.right { grid-column: 4; border-left: 1px solid var(--border); border-right: none; }
+  .panel h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--muted); margin: 0; padding: 10px 14px 4px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .panel .body { padding: 8px 14px 14px; }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  /* ── Diagnosis banner (empty-mesh guidance) ──────────────────────── */
+  .diag {
+    margin: 0 14px 12px; padding: 12px; border-radius: 8px;
+    border: 1px solid var(--warn); background:
+      linear-gradient(135deg, #2a230f 0%, #1c2b1a 130%);
+  }
+  .diag h4 { margin: 0 0 4px; font-size: 12.5px; color: var(--warn);
+             display: flex; align-items: center; gap: 6px; }
+  .diag p { margin: 0 0 8px; font-size: 11.5px; color: var(--text); line-height: 1.45; }
+  .diag .why { font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+  .diag .cta { display: flex; gap: 6px; flex-wrap: wrap; }
+
+  .list-item {
+    padding: 8px 10px; margin-bottom: 6px; border: 1px solid var(--border);
+    border-radius: 6px; cursor: pointer; background: #0d1117;
+  }
+  .list-item:hover { border-color: var(--accent); }
+  .list-item.active { border-color: var(--accent); background: #1a2332; }
+  /* A KILLED agent card is a crimson, pulsing warning — the operator must
+     be able to spot a dead bot among live ones from across the screen. The
+     pulsing left-border + faint red tint + slow halo make it unmistakable. */
+  .list-item.is-killed {
+    border-color: rgba(255,45,85,.55);
+    background: linear-gradient(90deg, rgba(255,45,85,.08) 0%, #0d1117 40%);
+    box-shadow: inset 3px 0 0 #ff2d55;
+    animation: card-killed 2.4s ease-in-out infinite;
+  }
+  .list-item.is-killed:hover { border-color: #ff2d55; }
+  .list-item.is-killed.active {
+    border-color: #ff2d55;
+    background: linear-gradient(90deg, rgba(255,45,85,.14) 0%, #1a1015 40%);
+  }
+  @keyframes card-killed {
+    0%,100% { box-shadow: inset 3px 0 0 #ff2d55, 0 0 0 rgba(255,45,85,0); }
+    50%     { box-shadow: inset 3px 0 0 #ff2d55, 0 0 10px rgba(255,45,85,.25); }
+  }
+  .list-item .name { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  .list-item .sub { color: var(--muted); font-size: 11px; margin-top: 2px; display: flex; align-items: center; gap: 4px; }
+  .status-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    vertical-align: middle; flex: 0 0 auto;
+  }
+  .status-dot.running { background: var(--running); box-shadow: 0 0 6px var(--running); }
+  .status-dot.stopped { background: var(--stopped); }
+  .status-dot.failed  { background: #ff2d55; box-shadow: 0 0 6px #ff2d55; animation: killed-pulse 2.2s ease-in-out infinite; }
+  .status-dot.pending { background: var(--pending); }
+  .status-dot.starting { background: var(--pending); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .4; } }
+
+  #graph {
+    grid-column: 3; position: relative; background:
+      radial-gradient(circle at 50% 50%, #11161d 0%, #0e1117 70%);
+    overflow: hidden;
+  }
+  #svg { width: 100%; height: 100%; }
+  .edge {
+    stroke: #30363d; stroke-width: 1.5; fill: none;
+    transition: stroke .2s, stroke-width .2s;
+  }
+  .edge.active { stroke: var(--accent); stroke-width: 3; filter: drop-shadow(0 0 4px var(--accent)); }
+  .node { cursor: pointer; }
+  .node circle { transition: r .2s, fill .2s; }
+  .node circle.halo { fill: none; stroke-opacity: .15; }
+  .node text { fill: var(--text); font-size: 11px; text-anchor: middle; user-select: none; }
+  .node.remote .avatar-head { stroke-dasharray: 4 3; }
+
+  /* ── Agent avatar (SVG character per node) ───────────────────────── */
+  .avatar-head {
+    fill: #1c2733; stroke: var(--border); stroke-width: 2;
+    transition: fill .3s, stroke .3s;
+  }
+  .avatar-antenna { stroke: var(--muted); stroke-width: 1.5; stroke-linecap: round; }
+  .avatar-tip     { fill: var(--muted); transition: fill .3s; }
+  .avatar-eye     { fill: #c9d1d9; transition: transform .2s; }
+  .avatar-mouth   { stroke: #c9d1d9; stroke-width: 1.6; fill: none; stroke-linecap: round; }
+
+  .node.running .avatar-tip { fill: var(--running); animation: tip-blink 2s ease-in-out infinite; }
+  @keyframes tip-blink { 50% { opacity: .35; } }
+
+  /* Idle "breathing" — a live but message-less bot gently bobs so it never
+     looks frozen. Subtle (1.5px) so many bots on one graph stay calm. */
+  .node.running .avatar-head { animation: alive-breathe 3.2s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+  @keyframes alive-breathe {
+    0%,100% { transform: translateY(0); }
+    50%     { transform: translateY(-1.5px); }
+  }
+  /* Once the bot is actively or talking, the bob is replaced by the
+     emotion-specific animation so the two never fight. */
+  .node.running.think .avatar-head,
+  .node.running.talk  .avatar-head { animation: none; }
+
+  @keyframes eye-scan {
+    0%,100% { transform: translateX(0); }
+    25%     { transform: translateX(-2px); }
+    75%     { transform: translateX(2px); }
+  }
+  .node.think .avatar-eye { animation: eye-scan 1.2s ease-in-out infinite; }
+  .node.think .avatar-head { stroke: var(--warn); }
+  .node.think .avatar-tip  { fill: var(--warn); }
+
+  @keyframes mouth-talk {
+    0%,100% { stroke-dasharray: 0; }
+    50%     { stroke-dasharray: 3; }
+  }
+  @keyframes eye-bounce { 50% { transform: translateY(-1.5px); } }
+  .node.talk .avatar-head { stroke: var(--ok); }
+  .node.talk .avatar-tip  { fill: var(--ok); }
+  .node.talk .avatar-eye  { animation: eye-bounce .5s ease-in-out infinite; }
+  .node.talk .avatar-mouth {
+    d: path("M -6 10 Q 0 15 6 10");
+    animation: mouth-talk .6s ease-in-out infinite;
+  }
+
+  .node.sleep .avatar-head { stroke: #2a3a55; opacity: .8; }
+  .node.sleep .avatar-eye  { opacity: .5; transform: scaleY(0.2); }
+  .node.sleep .avatar-mouth { opacity: .4; }
+  .node.sleep .avatar-tip  { fill: #3a5878; animation: none; }
+
+  .node.error .avatar-head { stroke: var(--danger); fill: #3b1a1a; }
+  .node.error .avatar-tip  { fill: var(--danger); }
+  .node.error .avatar-eye  { fill: var(--danger); }
+
+  /* ── KILLED state ─────────────────────────────────────────────────────
+     A bot that was force-killed (operator pressed Kill) is DIFFERENT from a
+     bot that crashed: it was terminated on purpose and will NOT auto-restart.
+     We render it unmistakably: cracked skull-face avatar, crimson head, a
+     slow menacing pulse on the halo, and a "zzz"-like rising smoke glyph.
+     The state class is `.killed` — set by renderGraph from the bot's
+     status=FAILED + the error text the supervisor writes on kill. */
+  .node.killed .avatar-head {
+    stroke: #ff2d55; fill: #2a0a10;
+    filter: drop-shadow(0 0 6px rgba(255,45,85,.7));
+  }
+  .node.killed .avatar-tip  { fill: #ff2d55; animation: none; }
+  .node.killed .avatar-eye  { fill: #ff2d55; transform: scaleY(0.6); }
+  /* Cracked mouth: an X-shaped grimace drawn via the mouth path swap. */
+  .node.killed .avatar-mouth {
+    d: path("M -7 7 L 7 11 M 7 7 L -7 11");
+    stroke: #ff2d55; stroke-width: 2;
+  }
+  .node.killed .halo {
+    fill: rgba(255,45,85,.12); stroke: #ff2d55; stroke-width: 2;
+    animation: killed-pulse 2.4s ease-in-out infinite;
+  }
+  @keyframes killed-pulse {
+    0%,100% { stroke-opacity: .35; r: 26; }
+    50%     { stroke-opacity: .9;  r: 30; }
+  }
+  /* Rising smoke glyph beside a killed avatar. */
+  .node.killed .smoke { opacity: .8; animation: smoke-drift 3s ease-out infinite; }
+  .node.killed .smoke text { fill: #ff2d55; font-size: 9px; }
+  .node:not(.killed) .smoke { display: none; }
+  @keyframes smoke-drift {
+    0%   { opacity: .8; transform: translateY(0); }
+    100% { opacity: 0;  transform: translateY(-10px); }
+  }
+
+  /* ── STARTING (booting) ───────────────────────────────────────────────
+     Pending & starting share a "warming up" look: blue head, spinning
+     antenna, both eyes scanning fast. This makes the brief startup window
+     readable so an operator isn't confused by a bot that "isn't doing
+     anything yet but hasn't failed". */
+  .node.pending .avatar-head,
+  .node.starting .avatar-head { stroke: var(--accent); }
+  .node.pending .avatar-tip,
+  .node.starting .avatar-tip  { fill: var(--accent); animation: tip-spin 1.2s linear infinite; }
+  @keyframes tip-spin { 100% { transform: rotate(360deg); } }
+
+  /* ── STOPPING ──────────────────────────────────────────────────────────
+     A bot in graceful shutdown: eyes half-closed, head folorn amber. */
+  .node.stopping .avatar-head { stroke: var(--warn); opacity: .85; }
+  .node.stopping .avatar-eye  { transform: scaleY(0.4); }
+  .node.stopping .avatar-tip  { fill: var(--warn); }
+
+  /* ── STOPPED ───────────────────────────────────────────────────────────
+     Cleanly stopped — eyes closed (a horizontal slit), head grey. */
+  .node.stopped .avatar-head { stroke: #4a5568; }
+  .node.stopped .avatar-eye  { transform: scaleY(0.15); fill: #4a5568; }
+  .node.stopped .avatar-mouth { opacity: .3; }
+  .node.stopped .avatar-tip  { fill: #4a5568; animation: none; }
+
+  /* ── Vivid per-status avatar palette ───────────────────────────────────
+     Each lifecycle state gets its OWN face colour (not just the halo): a
+     running bot glows cyan,<think>
+ amber, talking green, killed crimson,
+     pending blue, stopped grey. This is what makes the mesh readable at a
+     glance — the colour of the robot's FACE is the state. */
+  .node.running  .avatar-head { stroke: var(--running); fill: #16263b; }
+  .node.running  .avatar-eye  { fill: #9fd0ff; }
+  .node.pending  .avatar-head,
+  .node.starting .avatar-head { stroke: var(--accent); fill: #14202e; }
+  .node.pending  .avatar-eye,
+  .node.starting .avatar-eye  { fill: #9fd0ff; }
+  .node.think    .avatar-head { stroke: var(--warn); fill: #2a2210; }
+  .node.think    .avatar-eye  { fill: #ffd479; }
+  .node.talk     .avatar-head { stroke: var(--ok); fill: #102a16; }
+  .node.talk     .avatar-eye  { fill: #86efac; }
+  .node.error    .avatar-head { stroke: var(--danger); fill: #2a0e0e; }
+  .node.error    .avatar-eye  { fill: #ff9a9a; }
+  .node.stopping .avatar-eye  { fill: #ffd479; }
+
+  /* ── KILLED — unmistakable crimson skull with drifting smoke ───────────
+     A killed bot is NOT merely stopped: it was force-terminated and will
+     never restart on its own. Its face must scream "DEAD" so the operator
+     cannot confuse it with a quiet idle bot. We go further than colour:
+     X-eyes, a cracked mouth, a crimson skull fill, a pulsing halo, and a
+     rising smoke plume. Six independent visual cues — impossible to miss. */
+  .node.killed .avatar-head {
+    stroke: #ff2d55; fill: #1a0508;
+    filter: drop-shadow(0 0 8px rgba(255,45,85,.85));
+    animation: killed-jitter 0.35s ease-in-out infinite;
+  }
+  @keyframes killed-jitter {
+    0%,100% { transform: translate(0,0); }
+    25%     { transform: translate(-0.6px,0.4px); }
+    75%     { transform: translate(0.6px,-0.4px); }
+  }
+  .node.killed .avatar-tip  { fill: #ff2d55; animation: none; }
+  .node.killed .avatar-eye  { fill: #ff2d55; r: 3; }
+  .node.killed .avatar-mouth {
+    d: path("M -7 7 L 7 11 M 7 7 L -7 11");
+    stroke: #ff2d55; stroke-width: 2.2;
+  }
+  .node.killed .halo {
+    fill: rgba(255,45,85,.14); stroke: #ff2d55; stroke-width: 2.5;
+    animation: killed-pulse 2.2s ease-in-out infinite;
+  }
+  @keyframes killed-pulse {
+    0%,100% { stroke-opacity: .35; r: 26; }
+    50%     { stroke-opacity: .95; r: 31; }
+  }
+  .node.killed .smoke { opacity: .9; animation: smoke-rise 2.6s ease-out infinite; }
+  .node.killed .smoke text { fill: #ff2d55; font-size: 10px; font-weight: 700; }
+  .node:not(.killed) .smoke { display: none; }
+  @keyframes smoke-rise {
+    0%   { opacity: .9; transform: translateY(0) scale(1); }
+    100% { opacity: 0;  transform: translateY(-14px) scale(1.25); }
+  }
+  /* Killed also overrides talk/think emotions (a dead bot cannot be busy). */
+  .node.killed.think .avatar-eye,
+  .node.killed.talk  .avatar-eye { animation: none; }
+  .node.killed.talk  .halo,
+  .node.killed.think .halo { animation: killed-pulse 2.2s ease-in-out infinite; }
+
+  .spark { display: flex; gap: 1px; height: 10px; margin-top: 5px; }
+  .spark .cell {
+    flex: 0 0 3px; height: 100%; border-radius: 1px; background: #21262d;
+  }
+  .spark .cell.think { background: var(--warn); }
+  .spark .cell.talk  { background: var(--ok); }
+  .spark .cell.error { background: var(--danger); }
+  .spark .cell.sleep { background: #30363d; }
+
+  @keyframes agent-think    { 0%{opacity:.35} 50%{opacity:.9}  100%{opacity:.35} }
+  @keyframes agent-talk     { 0%{stroke-width:2;opacity:.9}    100%{stroke-width:0;opacity:0} }
+  @keyframes agent-sleep    { 0%{opacity:.15} 50%{opacity:.28} 100%{opacity:.15} }
+
+  .node.think  .halo {
+    fill: var(--warn); stroke: var(--warn); stroke-width: 2;
+    animation: agent-think 1.1s ease-in-out infinite;
+  }
+  .node.sleep  .halo {
+    fill: #2a3a55; stroke: #2a3a55;
+    animation: agent-sleep 3.2s ease-in-out infinite;
+  }
+  .node.talk   .halo {
+    fill: var(--ok); stroke: var(--ok); stroke-width: 3;
+    animation: agent-talk 1.4s ease-out infinite;
+  }
+  .node .burst {
+    fill: none; stroke: var(--ok); stroke-width: 2.5;
+    opacity: 0; pointer-events: none;
+    transform-origin: center;
+    transform-box: fill-box;
+  }
+  .node.talk .burst { animation: agent-talk 1.2s ease-out 1; opacity: 1; }
+
+  .node.error  circle.main { fill: var(--danger); }
+  .node.error  .halo       { fill: var(--danger); stroke: var(--danger);
+                             animation: agent-think .4s ease-in-out 3; }
+
+  .node.sleep .zzz { opacity: 0; animation: agent-sleep 4s ease-in-out infinite; }
+  .node.sleep .zzz text { fill: #4a6580; font-size: 8px; }
+  .node:not(.sleep) .zzz { display: none; }
+
+  #legend {
+    position: absolute; left: 12px; bottom: 12px;
+    background: rgba(22,27,34,.85); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; font-size: 11px;
+  }
+  #legend .row { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+
+  .tabs { display: flex; border-bottom: 1px solid var(--border); }
+  .tabs button {
+    border: none; background: transparent; border-radius: 0;
+    padding: 8px 12px; color: var(--muted);
+  }
+  .tabs button.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
+
+  .log-view {
+    background: #010409; color: #7ee787; font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 11px; padding: 10px; border-radius: 4px; overflow: auto;
+    white-space: pre-wrap; max-height: 360px; line-height: 1.4;
+  }
+  #toast {
+    position: fixed; bottom: 20px; right: 20px; z-index: 999;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px 16px;
+    transform: translateY(80px); opacity: 0;
+    transition: transform .25s, opacity .25s;
+    box-shadow: 0 8px 24px rgba(0,0,0,.4); max-width: 400px;
+  }
+  #toast.show { transform: translateY(0); opacity: 1; }
+  #toast .title { font-weight: 600; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
+  #toast.error { border-color: var(--danger); }
+  #toast.ok { border-color: var(--ok); }
+
+  .form-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+  .form-row > * { flex: 1; }
+  .form-row > .fixed { flex: 0 0 auto; }
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 998;
+    display: none; align-items: center; justify-content: center;
+  }
+  .modal-backdrop.show { display: flex; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 20px; width: 480px; max-width: 90vw;
+  }
+  .modal h3 { margin-top: 0; margin-bottom: 16px; display: flex; align-items: center; gap: 6px; }
+
+  /* ── Onboarding ─────────────────────────────────────────────────── */
+  .onboard-card {
+    background: linear-gradient(135deg, #1a2332 0%, #161b22 100%);
+    border: 1px solid var(--accent); border-radius: 10px;
+    padding: 16px; margin-bottom: 14px;
+  }
+  .onboard-card h3 { margin: 0 0 6px; color: var(--accent); font-size: 14px; display: flex; align-items: center; gap: 6px; }
+  .onboard-card p { color: var(--muted); margin: 4px 0 12px; font-size: 12px; }
+  .onboard-step {
+    display: flex; gap: 10px; align-items: flex-start;
+    padding: 8px 0; font-size: 12px;
+  }
+  .onboard-step .num {
+    flex: 0 0 22px; height: 22px; border-radius: 50%;
+    background: #21262d; color: var(--accent); font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px;
+  }
+  .onboard-step.done .num { background: var(--ok); color: #0e1117; }
+  .onboard-step .desc { flex: 1; }
+  .onboard-step .desc strong { color: var(--text); }
+  .onboard-step .desc em { color: var(--muted); font-style: normal; font-size: 11px; display: block; margin-top: 2px; }
+  .onboard-actions { display: flex; gap: 8px; margin-top: 12px; }
+  .onboard-dismiss { margin-left: auto; font-size: 11px; color: var(--muted); background: none; border: none; cursor: pointer; }
+
+  .agent-health {
+    margin-top: 8px; padding: 8px; background: #0d1117;
+    border: 1px solid var(--border); border-radius: 4px;
+    font-size: 11px;
+  }
+  .agent-health .err { color: var(--danger); white-space: pre-wrap; font-family: monospace; font-size: 10px; max-height: 90px; overflow: auto; }
+  .agent-health .idle-hint { color: var(--warn); margin-top: 4px; display: flex; align-items: center; gap: 4px; }
+  /* A killed bot's whole health panel turns crimson so it is impossible to
+     mistake for a merely stopped bot at a glance. */
+  .agent-health.killed {
+    border-color: rgba(255,45,85,.5);
+    background: rgba(255,45,85,.06);
+    box-shadow: inset 3px 0 0 #ff2d55;
+  }
+  .agent-health .idle-hint.silent { color: var(--muted); }
+  .agent-health .actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  .empty-help {
+    padding: 12px; color: var(--muted); font-size: 12px;
+    border: 1px dashed var(--border); border-radius: 6px; margin-bottom: 8px;
+  }
+  .empty-help strong { color: var(--text); }
+  .empty-help button { margin-top: 8px; }
+
+  /* ── Bus topic row ───────────────────────────────────────────────── */
+  .topic-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 8px; margin-bottom: 4px; background: #0d1117;
+    border: 1px solid var(--border); border-radius: 4px; font-size: 12px;
+  }
+  .topic-row .topic-name { font-family: monospace; flex: 1; }
+  .topic-row .meta { color: var(--muted); font-size: 10.5px; }
+  .topic-row button { padding: 2px 8px; font-size: 11px; }
+
+  .kv { display: flex; padding: 3px 0; font-size: 12px; }
+  .kv .k { color: var(--muted); width: 120px; flex: 0 0 auto; }
+  .kv .v { flex: 1; word-break: break-word; }
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════════════════════
+     SVG ICON SPRITE — one hidden <svg> defines every icon as a <symbol>.
+     Anywhere the UI needs an icon it emits <svg class="ico"><use href="#i-NAME"/></svg>.
+     Benefits: one definition, themable via currentColor, no emoji, no
+     external icon-font dependency (works air-gapped).
+     ═══════════════════════════════════════════════════════════════════════ -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm0 2v12h16V6H4zm2 2l3 3-3 3v-1.5L7.5 12 6 9.5V8zm5 6h5v1.5h-5V14z"/></symbol>
+    <symbol id="i-record" viewBox="0 0 24 24"><circle cx="12" cy="12" r="6"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/></symbol>
+    <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M10 3a2 2 0 0 1 2 2v1h3a1 1 0 0 1 1 1v3h1a2 2 0 1 1 0 4h-1v3a1 1 0 0 1-1 1h-3v1a2 2 0 1 1-4 0v-1H5a1 1 0 0 1-1-1v-3H3a2 2 0 1 1 0-4h1V7a1 1 0 0 1 1-1h3V5a2 2 0 0 1 2-2zm0 2v3H6v3h3a2 2 0 0 1 2 2v3h3v-3a2 2 0 0 1 2-2h3V8h-3a2 2 0 0 1-2-2V5h-4z"/></symbol>
+    <symbol id="i-package" viewBox="0 0 24 24"><path d="M12 2l9 4.5v9L12 20l-9-4.5v-9L12 2zm0 2.2L5.4 7.3 12 10.4l6.6-3.1L12 4.2zM5 8.9v5.4l6 3v-5.4l-6-3zm14 0l-6 3v5.4l6-3V8.9z"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M12 4a8 8 0 1 0 7.5 10.6l-1.9-.6A6 6 0 1 1 12 6c1.3 0 2.5.4 3.5 1.1L13 10h7V3l-2.5 2.5A8 8 0 0 0 12 4z"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm6.9 6h-3a15 15 0 0 0-1.4-3.9A8 8 0 0 1 18.9 8zM12 4.2c.7 1 1.3 2.3 1.7 3.8h-3.4c.4-1.5 1-2.8 1.7-3.8zM4.3 14a8 8 0 0 1 0-4h3.4a17 17 0 0 0 0 4H4.3zm.8 2h3a15 15 0 0 0 1.4 3.9A8 8 0 0 1 5.1 16zm3-8h-3A8 8 0 0 1 8.5 4.1 15 15 0 0 0 8.1 8zm3.9 11.8c-.7-1-1.3-2.3-1.7-3.8h3.4c-.4 1.5-1 2.8-1.7 3.8zM16.3 16h3A8 8 0 0 1 16.3 16zm3-8h-3c.3-1.4.3-2.7.3-4-1.3 1.1-2.2 2.4-2.9 4H16.3zm-3.4 2a17 17 0 0 0 0-4h-7.8a17 17 0 0 0 0 4h7.8z" fill-rule="evenodd"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4v16l13-8z"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></symbol>
+    <symbol id="i-kill" viewBox="0 0 24 24"><path d="M6.4 5l5.6 5.6L17.6 5 19 6.4 13.4 12 19 17.6 17.6 19 12 13.4 6.4 19 5 17.6 10.6 12 5 6.4z"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M9 3h6l1 2h4v2H4V5h4l1-2zM6 9h12l-1 11a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L6 9zm3 2v9h2v-9H9zm4 0v9h2v-9h-2z"/></symbol>
+    <symbol id="i-doc" viewBox="0 0 24 24"><path d="M6 2h8l6 6v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm7 1.5V9h5.5L13 3.5zM8 12h8v1.5H8V12zm0 3h8v1.5H8V15zm0-6h4v1.5H8V9z"/></symbol>
+    <symbol id="i-target" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2a8 8 0 1 1 0 16 8 8 0 0 1 0-16zm0 3a5 5 0 1 0 0 10 5 5 0 0 0 0-10zm0 2a3 3 0 1 1 0 6 3 3 0 0 1 0-6z"/></symbol>
+    <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9 3a3 3 0 0 0-3 3v.3A3 3 0 0 0 4 9v2a3 3 0 0 0 1 2.2A3 3 0 0 0 6 18a3 3 0 0 0 3 3h1V3H9zm6 0h-1v18h1a3 3 0 0 0 3-3 3 3 0 0 0 1-4.8A3 3 0 0 0 20 11V9a3 3 0 0 0-2-2.7V6a3 3 0 0 0-3-3z"/></symbol>
+    <symbol id="i-bag" viewBox="0 0 24 24"><path d="M9 3h6l1 3h3a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h3l1-3zm1.5 1l-.7 2h4.4l-.7-2h-3zM6 8v11h12V8H6zm3 2a1 1 0 0 1 1 1v2a1 1 0 0 1-2 0v-2a1 1 0 0 1 1-1zm6 0a1 1 0 0 1 1 1v2a1 1 0 0 1-2 0v-2a1 1 0 0 1 1-1z"/></symbol>
+    <symbol id="i-signal" viewBox="0 0 24 24"><path d="M12 3v10.2A2 2 0 1 1 10 15.2V3h2zM7 7a6 6 0 0 0 0 8l1.4-1.4a4 4 0 0 1 0-5.2L7 7zm10 0l-1.4 1.4a4 4 0 0 1 0 5.2L17 15a6 6 0 0 0 0-8z"/></symbol>
+    <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M3 13l3-8h12l3 8v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-6zm2.2 0H9a3 3 0 0 0 6 0h3.8L16.5 7h-9L5.2 13zM12 3v5h-1.5v2.3L11 10.5l.5-.2V8H12V3z"/></symbol>
+    <symbol id="i-outbox" viewBox="0 0 24 24"><path d="M3 13l3-8h12l3 8v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-6zm2.2 0H9a3 3 0 0 0 6 0h3.8L16.5 7h-9L5.2 13zM11.25 10V4h1.5v6H11.25z"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M9.5 17L4 11.5 5.5 10l4 4 9-9L20 6.5z"/></symbol>
+    <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 2l10 18H2L12 2zm0 4L5.6 18h12.8L12 6zm-1 4h2v5h-2V10zm0 6h2v2h-2v-2z"/></symbol>
+    <symbol id="i-rocket" viewBox="0 0 24 24"><path d="M13 3c4 0 8 4 8 8l-4 4-4-4 4-4-4-4zm-2 9l4 4-5 5-1.5-4.5L4 21l3.5-4.5L3 15l5-5 3 2z"/></symbol>
+    <symbol id="i-cube" viewBox="0 0 24 24"><path d="M12 2l9 4.5v11L12 22l-9-4.5v-11L12 2zm0 2.3L5.3 7.4 12 10.5l6.7-3.1L12 4.3zM5 8.9v6.8l6 3v-6.8l-6-3zm14 0l-6 3v6.8l6-3V8.9z"/></symbol>
+    <symbol id="i-network" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 1 3 3 3 3 0 0 1-2 2.8V10h5a2 2 0 0 1 2 2v2.2A3 3 0 1 1 18 17.8V13h-5v3h-2v-3H6v4.8a3 3 0 1 1-2 0V12a2 2 0 0 1 2-2h5V7.8A3 3 0 0 1 12 2zm0 2a1 1 0 1 0 0 2 1 1 0 0 0 0-2zM5 17a1 1 0 1 0 0 2 1 1 0 0 0 0-2zm14 0a1 1 0 1 0 0 2 1 1 0 0 0 0-2z"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20V4h2v14h14v2H4zm4-2V10h3v8H8zm5 0V6h3v12h-3zm5 0v-5h3v5h-3z"/></symbol>
+    <symbol id="i-mail" viewBox="0 0 24 24"><path d="M3 5h18a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1zm1.5 2L12 11l7.5-4h-15zM4 8.3V17h16V8.3l-7.5 4L4 8.3z"/></symbol>
+    <symbol id="i-news" viewBox="0 0 24 24"><path d="M4 4h13a1 1 0 0 1 1 1v2h2a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm1 2v12h13V6H5zm2 2h6v2H7V8zm0 4h9v1.5H7V12zm0 3h9v1.5H7V15z"/></symbol>
+    <symbol id="i-microscope" viewBox="0 0 24 24"><path d="M9 2h2v8h2V6h2a4 4 0 0 1 0 8h-1v2h3v2H6v-2h4v-2a6 6 0 0 1-3-5.2c0-1 .3-2 .8-2.8H9V2zM6 20h14v2H4V9h2v11z"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M12 5c5 0 9 4 10 7-1 3-5 7-10 7S3 15 2 12c1-3 5-7 10-7zm0 2c-3.3 0-6.3 2.4-7.6 5 1.3 2.6 4.3 5 7.6 5s6.3-2.4 7.6-5C18.3 9.4 15.3 7 12 7zm0 1.5a3.5 3.5 0 1 1 0 7 3.5 3.5 0 0 1 0-7z"/></symbol>
+    <symbol id="i-pen" viewBox="0 0 24 24"><path d="M3 17.2V21h3.8L18 9.8 14.2 6 3 17.2zM20.7 7.1a1 1 0 0 0 0-1.4l-2.4-2.4a1 1 0 0 0-1.4 0l-1.9 1.9 3.8 3.8 1.9-1.9z"/></symbol>
+    <symbol id="i-compass" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2a8 8 0 1 1 0 16 8 8 0 0 1 0-16zm3.5 4.5L13 13l-4.5 1.5L11 10l4.5-1.5zM12 11a1 1 0 1 0 0 2 1 1 0 0 0 0-2z"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2l8 3v6c0 5-3.4 9.3-8 11-4.6-1.7-8-6-8-11V5l8-3zm0 2.1L6 6.4V11c0 3.9 2.5 7.4 6 8.9 3.5-1.5 6-5 6-8.9V6.4l-6-2.3zM11 9h2v4h-2V9zm0 5h2v2h-2v-2z"/></symbol>
+    <symbol id="i-translate" viewBox="0 0 24 24"><path d="M4 4h10v2h-4a12 12 0 0 0 1.3 4.4 12 12 0 0 0 2.5-3.4h2.1a14 14 0 0 1-3.1 4.3 13 13 0 0 0 2.5 2.6l-1.3 1.6a15 15 0 0 1-2.6-2.7 14 14 0 0 1-2.8 2.9L7.6 15a12 12 0 0 0 2.7-2.8A14 14 0 0 1 8.4 8H4V4zm14 6h2l3 10h-2l-.7-2.5h-3.6L16 20h-2l4-10zm0 5.5h2.4l-1.2-4.2-1.2 4.2z"/></symbol>
+    <symbol id="i-summarize" viewBox="0 0 24 24"><path d="M5 3h14a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm1 2v14h12V5H6zm2 2h8v2H8V7zm0 3.5h8v1.5H8V10.5zm0 3h5v1.5H8v-1.5z"/></symbol>
+    <symbol id="i-headset" viewBox="0 0 24 24"><path d="M12 3a8 8 0 0 0-8 8v6a3 3 0 0 0 3 3h2v-2H7a1 1 0 0 1-1-1v-6a6 6 0 1 1 12 0v6a1 1 0 0 1-1 1h-2v2h2a3 3 0 0 0 3-3v-6a8 8 0 0 0-8-8zm-3 8a1 1 0 0 0-1 1v2a1 1 0 0 0 2 0v-2a1 1 0 0 0-1-1zm6 0a1 1 0 0 0-1 1v2a1 1 0 0 0 2 0v-2a1 1 0 0 0-1-1z"/></symbol>
+    <symbol id="i-speech" viewBox="0 0 24 24"><path d="M4 4h16a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H8l-4 4V5a1 1 0 0 1 1-1zm1 2v11.2L8.2 14H19V6H5zm2 2h10v1.5H7V8zm0 3h8v1.5H7V11z"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24"><path d="M7 2h2v2h6V2h2v2h3a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3V2zm-2 5v13h14V7H5zm2 2h4v4H7V9z"/></symbol>
+    <symbol id="i-critic" viewBox="0 0 24 24"><path d="M3 3h8v8a4 4 0 0 1-8 0V3zm10 10h8v8a4 4 0 0 1-8 0v-8zM5 5v6a2 2 0 0 0 4 0V5H5zm10 10v6a2 2 0 0 0 4 0v-6h-4z"/></symbol>
+    <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 2v5H6v2a5 5 0 0 0 4 4.9V21h2v-7.1A5 5 0 0 0 16 9V7h-3V2H9zm5 5v2a3 3 0 0 1-3 3 3 3 0 0 1-3-3V7h6z"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 5h6l2 2h10a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1zm1 3v10h16V8H4z"/></symbol>
+    <symbol id="i-history" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zm0 2a7 7 0 1 1 0 14 7 7 0 0 1 0-14zm-1 3v5l4 2 .8-1.4-3.3-1.7V8H11z"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M11 4h2v7h7v2h-7v7h-2v-7H4v-2h7V4z"/></symbol>
+    <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M6 18a4 4 0 0 1-.6-8A6 6 0 0 1 17 9.3 4.5 4.5 0 0 1 18 18H6zm0-2h12a2.5 2.5 0 0 0 .3-5l-1.3-.3-.3-1.3A4 4 0 0 0 9 8.7l-.4 1.5L7 10a2 2 0 0 0-1 3.8L6 14v2z"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1 5h2v2h-2V7zm0 4h2v6h-2v-6z"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M2 21l21-9L2 3v7l15 2-15 2z"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><path d="M3 3h8v8H3V3zm10 0h8v8h-8V3zM3 13h8v8H3v-8zm10 0h8v8h-8v-8z"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M4 5h16v2H4V5zm0 6h16v2H4v-2zm0 6h16v2H4v-2z"/></symbol>
+  </defs>
+</svg>
+
+<header>
+  <h1><svg class="ico ico-lg"><use href="#i-terminal"/></svg> lollms-bot · Mission Control</h1>
+  <span class="pill" id="mesh-pill">mesh: …</span>
+  <span class="pill" id="agents-pill" title="agents · running"><svg class="ico"><use href="#i-cube"/></svg> —</span>
+  <span class="pill" id="connector-pill" title="swarm connector"><svg class="ico"><use href="#i-plug"/></svg> swarm: —</span>
+  <span class="pill" id="recording-pill"><svg class="ico"><use href="#i-record"/></svg> recording: off</span>
+  <span class="spacer"></span>
+  <button id="btn-refresh" title="Reload all state from the server"><svg class="ico"><use href="#i-refresh"/></svg> Refresh</button>
+  <button id="btn-test-all" title="Publish a test message to every agent's first mission topic"><svg class="ico"><use href="#i-send"/></svg> Test all</button>
+  <button id="btn-record" class="primary"><svg class="ico"><use href="#i-record"/></svg> Record</button>
+  <button id="btn-new-agent" class="primary"><svg class="ico"><use href="#i-puzzle"/></svg> New Agent</button>
+  <button id="btn-import"><svg class="ico"><use href="#i-package"/></svg> Import</button>
+</header>
+
+<!-- ── Left rail: navigation ──────────────────────────────────────── -->
+<nav id="rail">
+  <div class="brand">Navigation</div>
+  <button class="navlink active" data-view="overview"><svg class="ico"><use href="#i-grid"/></svg> Overview</button>
+  <button class="navlink" data-view="agents"><svg class="ico"><use href="#i-cube"/></svg> Agents <span class="badge" id="nav-agent-badge">0</span></button>
+  <button class="navlink" data-view="bus"><svg class="ico"><use href="#i-network"/></svg> Bus topics <span class="badge" id="nav-topic-badge">0</span></button>
+  <button class="navlink" data-view="swarm"><svg class="ico"><use href="#i-plug"/></svg> Swarm</button>
+  <button class="navlink" data-view="sessions"><svg class="ico"><use href="#i-history"/></svg> Sessions <span class="badge" id="nav-session-badge">0</span></button>
+  <div class="rail-foot">
+    <div id="rail-hint">Select a view.</div>
+  </div>
+</nav>
+
+<!-- ── Middle panel: context for the active view ──────────────────── -->
+<aside class="panel mid">
+
+  <!-- OVERVIEW VIEW -->
+  <div class="view active" id="view-overview">
+    <h2>Welcome</h2>
+    <div class="body">
+      <p style="color:var(--muted); font-size:12px; line-height:1.5; margin-top:0;">
+        This is the mesh control surface. An <strong>agent</strong> binds a
+        <em>handbag</em> (persona + tools) to a <em>model profile</em> and
+        listens on <em>mission topics</em> over the mesh bus. Nothing happens
+        until a message lands on a topic an agent is subscribed to.
+      </p>
+    </div>
+    <h2>Example Agents</h2>
+    <div class="body" id="example-agents"></div>
+    <h2>Onboarding</h2>
+    <div class="body" id="onboard-slot"></div>
+  </div>
+
+  <!-- AGENTS VIEW -->
+  <div class="view" id="view-agents">
+    <h2>Agents <span id="agent-count" style="color:var(--muted); font-weight:400; font-size:11px;"></span></h2>
+    <div class="body" id="diag-slot"></div>
+    <div class="body" id="agent-list">
+      <div class="empty-help">
+        <strong>No agents yet.</strong> An agent binds a <em>handbag</em>
+        (persona, tools, memory) to a <em>model profile</em> and listens on
+        mission topics.<br>
+        <button class="primary" onclick="openNewAgent()"><svg class="ico"><use href="#i-puzzle"/></svg> Create your first agent</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- BUS VIEW -->
+  <div class="view" id="view-bus">
+    <h2>Bus topics</h2>
+    <div class="body" id="topic-list">
+      <p style="color:var(--muted); font-size:12px;">No topics have carried messages yet. Send a test message to an agent to create the first topic.</p>
+    </div>
+    <p style="color:var(--muted); font-size:11px; padding:0 14px 14px; line-height:1.4;">
+      The bus is a durable SQLite-WAL topic log. Each row is a topic with the
+      number of messages it has carried. Use <em>Send test</em> on any agent,
+      or publish manually via the API, to exercise the chain.
+    </p>
+  </div>
+
+  <!-- SWARM VIEW -->
+  <div class="view" id="view-swarm">
+    <h2>Swarm connector</h2>
+    <div class="body">
+      <p style="color:var(--muted); font-size:12px; line-height:1.5; margin-top:0;">
+        The connector bridges an external platform (Discord, Slack,
+        lollms.com, ...) onto the mesh bus. <strong>Without a live connection
+        binding, the connector has nothing to ingest</strong> — no external
+        human traffic reaches the mesh, so agents listening on
+        <code>swarm.inbound</code> will remain idle.
+      </p>
+      <p style="color:var(--muted); font-size:12px; line-height:1.5;">
+        You can still exercise the swarm path with <em>Send test message</em>
+        below, which bypasses the platform and injects a message straight onto
+        the ingress topic.
+      </p>
+    </div>
+    <h2>Configuration</h2>
+    <div class="body" id="swarm-body">
+      <p style="color:var(--muted);">Loading swarm status…</p>
+    </div>
+  </div>
+
+  <!-- SESSIONS VIEW -->
+  <div class="view" id="view-sessions">
+    <h2>Recorded sessions</h2>
+    <div class="body" id="session-list"></div>
+    <p style="color:var(--muted); font-size:11px; padding:0 14px 14px; line-height:1.4;">
+      Press <em>Record</em> in the top bar to capture a session. The recorder
+      follows the bus and the registry and writes every message + status
+      change to a JSONL file for replay.
+    </p>
+  </div>
+</aside>
+
+<!-- ── Center: the graph ──────────────────────────────────────────── -->
+<main id="graph">
+  <svg id="svg"></svg>
+  <div id="legend">
+    <div class="row"><span class="status-dot running"></span> running</div>
+    <div class="row"><span class="status-dot pending"></span> pending</div>
+    <div class="row"><span class="status-dot failed"></span> killed / failed</div>
+    <div class="row"><span class="status-dot stopped"></span> stopped</div>
+    <div class="row" style="margin-top:6px;"><span style="border-top:2px dashed var(--muted); width:14px;"></span> remote node</div>
+  </div>
+</main>
+
+<!-- ── Right panel: details / logs / replay ───────────────────────── -->
+<aside class="panel right">
+  <div class="tabs">
+    <button class="active" data-tab="details">Details</button>
+    <button data-tab="logs">Logs</button>
+    <button data-tab="replay">Replay</button>
+  </div>
+  <div class="body" id="tab-details">
+    <p style="color:var(--muted);">Select a bot on the graph or in the agent list to see its details.</p>
+  </div>
+  <div class="body" id="tab-logs" style="display:none;">
+    <div class="log-view" id="log-output">(select a bot and its logs will appear here)</div>
+  </div>
+  <div class="body" id="tab-replay" style="display:none;">
+    <p style="color:var(--muted);">Select a recorded session in the Sessions view and press Play.</p>
+    <div id="replay-controls" style="margin-bottom:10px;"></div>
+    <div class="log-view" id="replay-output">(replay events will stream here)</div>
+  </div>
+</aside>
+
+<div id="toast"><div class="title"></div><div class="body"></div></div>
+
+<!-- New Agent modal -->
+<div class="modal-backdrop" id="modal-new-agent">
+  <div class="modal">
+    <h3><svg class="ico"><use href="#i-puzzle"/></svg> Compose a new agent</h3>
+    <p style="color:var(--muted); margin-top:-8px; margin-bottom:14px;">
+      An agent binds a <em>handbag</em> (persona, tools, skills, memory) to a
+      <em>model profile</em> and listens on the topics you assign it.
+    </p>
+    <div class="form-row">
+      <label class="fixed" style="width:120px;">Agent ID</label>
+      <input id="na-id" placeholder="e.g. email-triage" />
+    </div>
+    <div class="form-row">
+      <label class="fixed" style="width:120px;">Start from</label>
+      <select id="na-blueprint">
+        <option value="">(custom — pick a handbag below)</option>
+      </select>
+      <span id="na-blueprint-hint" style="color:var(--muted); font-size:11px; margin-left:6px;"></span>
+    </div>
+    <div class="form-row">
+      <label class="fixed" style="width:120px;">Handbag</label>
+      <select id="na-handbag"></select>
+    </div>
+    <div class="form-row">
+      <label class="fixed" style="width:120px;">Model Profile</label>
+      <select id="na-model"></select>
+    </div>
+    <div class="form-row">
+      <label class="fixed" style="width:120px;">Mission Topics</label>
+      <input id="na-topics" placeholder="email.inbox, review.tasks (comma-separated slugs)" />
+    </div>
+    <div id="na-topics-hint" style="margin:-4px 0 8px 128px; font-size:11px; color:var(--muted);">
+      Each topic is a slug (letters/digits/_/-/.), not a sentence. Without at
+      least one topic the agent will start but do nothing.
+    </div>
+    <div class="form-row">
+      <label class="fixed" style="width:120px;">Tags</label>
+      <input id="na-tags" placeholder="intake, qa (comma-separated)" />
+    </div>
+    <div class="form-row">
+      <label class="fixed" style="width:120px;">Autostart</label>
+      <input type="checkbox" id="na-autostart" checked style="width:auto;" />
+      <span style="color:var(--muted); font-size:11px;">Spawn immediately after registration</span>
+    </div>
+    <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:16px;">
+      <button onclick="closeNewAgent()">Cancel</button>
+      <button class="primary" id="na-create">Create Agent</button>
+    </div>
+  </div>
+</div>
+
+<!-- Import modal -->
+<div class="modal-backdrop" id="modal-import">
+  <div class="modal">
+    <h3><svg class="ico"><use href="#i-package"/></svg> Import a handbag bundle (.zip)</h3>
+    <p style="color:var(--muted);">Extracts into bots/&lt;bot_id&gt;/ and registers the bot spec when present.</p>
+    <input type="file" id="import-file" accept=".zip" />
+    <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:16px;">
+      <button onclick="document.getElementById('modal-import').classList.remove('show')">Cancel</button>
+      <button class="primary" id="btn-import-go">Import</button>
+    </div>
+  </div>
+</div>
+
+<!-- MCP server editor modal -->
+<div class="modal-backdrop" id="modal-mcp">
+  <div class="modal" style="width:560px;">
+    <h3><svg class="ico"><use href="#i-plug"/></svg> <span id="mcp-modal-title">MCP server</span></h3>
+    <p style="color:var(--muted); margin-top:-8px; font-size:12px; line-height:1.45;">
+      An MCP server lets this agent reach an external service
+      (Gmail, Outlook, IMAP, Postgres, a helpdesk, ...). Without one, a
+      "mail agent" cannot actually read your emails — it can only talk about
+      them from what the model already knows.
+    </p>
+    <input type="hidden" id="mcp-agent-id" />
+    <div class="form-row">
+      <label class="fixed" style="width:110px;">Server ID</label>
+      <input id="mcp-server-id" placeholder="gmail (letters/digits/_/-)" />
+    </div>
+    <div class="form-row">
+      <label class="fixed" style="width:110px;">Title</label>
+      <input id="mcp-title" placeholder="(optional display name)" />
+    </div>
+    <div class="form-row">
+      <label class="fixed" style="width:110px;">Description</label>
+      <input id="mcp-description" placeholder="(optional)" />
+    </div>
+    <div class="form-row">
+      <label class="fixed" style="width:110px;">Transport</label>
+      <select id="mcp-transport">
+        <option value="stdio">stdio (local subprocess)</option>
+        <option value="http">http</option>
+        <option value="sse">sse</option>
+      </select>
+      <label class="fixed" style="width:70px; text-align:right;">Enabled</label>
+      <input type="checkbox" id="mcp-enabled" checked style="width:auto;" />
+    </div>
+    <div id="mcp-stdio-fields">
+      <div class="form-row">
+        <label class="fixed" style="width:110px;">Command</label>
+        <input id="mcp-command" placeholder="npx / python / etc." />
+      </div>
+      <div class="form-row">
+        <label class="fixed" style="width:110px;">Args</label>
+        <input id="mcp-args" placeholder="-y @modelcontextprotocol/server-gmail" />
+      </div>
+      <div style="margin:6px 0 2px 110px; font-size:11px; color:var(--muted);">
+        Environment (KEY=value, one per line; use for API tokens / IMAP creds):
+      </div>
+      <textarea id="mcp-env" rows="3" style="font-family:monospace; font-size:11px;"
+        placeholder="GMAIL_TOKEN=your-oauth-token-here"></textarea>
+    </div>
+    <div id="mcp-http-fields" style="display:none;">
+      <div class="form-row">
+        <label class="fixed" style="width:110px;">URL</label>
+        <input id="mcp-url" placeholder="https://mcp.example.com/mcp" />
+      </div>
+      <div style="margin:6px 0 2px 110px; font-size:11px; color:var(--muted);">
+        Headers (KEY=value, one per line; use for auth):
+      </div>
+      <textarea id="mcp-headers" rows="3" style="font-family:monospace; font-size:11px;"
+        placeholder="Authorization=Bearer your-token-here"></textarea>
+    </div>
+    <div class="form-row">
+      <label class="fixed" style="width:110px;">Timeout (s)</label>
+      <input id="mcp-timeout" type="number" min="1" max="600" value="30" />
+    </div>
+    <div id="mcp-error" style="color:var(--danger); font-size:11px; min-height:14px; margin-top:4px;"></div>
+    <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:14px;">
+      <button onclick="document.getElementById('modal-mcp').classList.remove('show')">Cancel</button>
+      <button class="primary" onclick="saveMcpDescriptor()">
+        <svg class="ico"><use href="#i-check"/></svg> Save
+      </button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ────────────────────────────────────────────────────────────────────────────
+// Icon helper — the ONLY way the JS emits an icon.
+// ────────────────────────────────────────────────────────────────────────────
+function icon(name, cls) {
+  return '<svg class="ico ' + (cls || '') + '"><use href="#i-' + name + '"/></svg>';
+}
+
+// ── Self-check: refuse to boot if any required function was lost. ─────────
+(function _selfCheck() {
+  const required = [
+    '$', 'esc', 'toast', 'api', 'icon',
+    'refreshEnv', 'refreshBots', 'refreshTopics', 'refreshSessions',
+    'refreshHandbags', 'refreshModels',
+    'refreshAgentCatalog', 'refreshAgents',
+    'renderBotList', 'renderSessions', 'renderTopics',
+    'renderGraph', 'renderAgents', 'renderOverview', 'renderDiagnosis',
+    'renderBlueprints', 'instantiateBlueprint', 'mountExampleAgents',
+    'refreshSwarm', 'renderSwarm',
+    'selectBot', 'setTab', 'renderDetails', 'setView',
+    'markThinking', 'markTalking', 'markError',
+    'handleLiveMessage', 'openLiveSocket', 'fullRefresh',
+    'openNewAgent', 'closeNewAgent', 'testAgent', 'testAllAgents',
+    '_botStateClass', 'renderTopics', 'publishTo',
+  ];
+  window.addEventListener('DOMContentLoaded', () => {
+    const missing = required.filter(n => typeof globalThis[n] !== 'function');
+    if (missing.length) {
+      console.error(
+        '[hub-ui] FATAL: missing function(s): ' + missing.join(', ') +
+        ' — index.html is truncated or a function was accidentally deleted.'
+      );
+      const b = document.createElement('div');
+      b.style.cssText =
+        'position:fixed;top:0;left:0;right:0;background:#f85149;color:white;' +
+        'padding:12px 20px;font-family:monospace;z-index:9999;font-size:13px;';
+      b.textContent = 'Hub UI is broken — missing JS function(s): ' +
+        missing.join(', ') + '. Check the browser console.';
+      document.body.appendChild(b);
+    }
+  });
+})();
+
+const S = {
+  env: {},
+  bots: {},
+  topics: [],
+  sessions: [],
+  handbags: [],
+  models: [],
+  agents: [],
+  agentCatalog: { handbags: [], profiles: [], blueprints: [] },
+  swarm: null,
+  activity: {},
+  selectedBotId: null,
+  selectedSessionId: null,
+  layout: {},
+  replay: { playing: false, timer: null, events: [], pos: 0 },
+  view: 'overview',
+};
+
+function $(id) { return document.getElementById(id); }
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+function toast(title, body, kind) {
+  const el = $('toast');
+  const titleEl = el.querySelector('.title');
+  const kindIco = kind === 'error' ? 'warn' : (kind === 'ok' ? 'check' : 'terminal');
+  titleEl.innerHTML = icon(kindIco) + ' ' + esc(title);
+  el.querySelector('.body').textContent = body || '';
+  el.className = 'show ' + (kind || '');
+  setTimeout(() => el.classList.remove('show'), 3500);
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    const detail = (await r.text()).trim();
+    throw new Error(detail || (r.status + ' ' + r.statusText));
+  }
+  const ct = r.headers.get('content-type') || '';
+  return ct.includes('application/json') ? r.json() : r.text();
+}
+
+// ── Navigation ───────────────────────────────────────────────────────────
+function setView(name) {
+  S.view = name;
+  document.querySelectorAll('.navlink').forEach(b =>
+    b.classList.toggle('active', b.dataset.view === name));
+  document.querySelectorAll('.view').forEach(v =>
+    v.classList.toggle('active', v.id === 'view-' + name));
+  if (name === 'swarm' && typeof refreshSwarm === 'function') refreshSwarm();
+  if (name === 'bus' && typeof renderTopics === 'function') renderTopics();
+  const hints = {
+    overview: 'Start here. Pick an example or create an agent.',
+    agents: 'Every agent listens on the mission topics shown on its card.',
+    bus: 'Publish a test message to see the bus come alive.',
+    swarm: 'Only produces traffic when a live connection binding is attached.',
+    sessions: 'Record a session, then replay it on the right.',
+  };
+  if ($('rail-hint')) $('rail-hint').textContent = hints[name] || 'Select a view.';
+}
+document.querySelectorAll('.navlink').forEach(btn => {
+  btn.onclick = () => setView(btn.dataset.view);
+});
+
+// ── Refresh pulls ────────────────────────────────────────────────────────
+async function refreshEnv() {
+  try {
+    S.env = await api('/api/env');
+    $('mesh-pill').textContent = `mesh: ${S.env.mesh_id} · host: ${S.env.host}`;
+    const rec = S.env.recording;
+    const recPill = $('recording-pill');
+    recPill.innerHTML = rec
+      ? icon('record') + ` recording (${esc(S.env.recording_session)})`
+      : icon('record') + ' recording: off';
+    recPill.classList.toggle('ok', rec);
+    const recBtn = $('btn-record');
+    recBtn.innerHTML = rec
+      ? icon('stop') + ' Stop'
+      : icon('record') + ' Record';
+    recBtn.classList.toggle('danger', rec);
+    recBtn.classList.toggle('primary', !rec);
+  } catch (e) { /* keep UI alive */ }
+}
+async function refreshBots() {
+  try {
+    const data = await api('/api/bots');
+    S.bots = data.bots || {};
+    ensureLayout();
+    renderBotList();
+    renderGraph();
+  } catch (e) { console.warn('bots:', e); }
+}
+async function refreshTopics() {
+  try {
+    const data = await api('/api/bus/topics');
+    S.topics = data.topics || [];
+    renderTopics();
+  } catch (e) { /* ignore */ }
+}
+async function refreshSessions() {
+  try {
+    const data = await api('/api/sessions');
+    S.sessions = data.sessions || [];
+    renderSessions();
+  } catch (e) { /* ignore */ }
+}
+async function refreshHandbags() {
+  try {
+    const data = await api('/api/handbags');
+    S.handbags = data.handbags || [];
+  } catch (e) { /* ignore */ }
+}
+async function refreshModels() {
+  try {
+    const data = await api('/api/models');
+    S.models = data.profiles || [];
+  } catch (e) { /* ignore */ }
+}
+async function refreshAgentCatalog() {
+  try {
+    const data = await api('/api/agents/catalog');
+    S.agentCatalog = {
+      handbags: data.handbags || [],
+      profiles: data.profiles || [],
+      blueprints: data.blueprints || [],
+    };
+  } catch (e) {
+    S.agentCatalog = { handbags: [], profiles: [], blueprints: [] };
+  }
+  if (typeof renderBlueprints === 'function') renderBlueprints();
+  if (typeof mountExampleAgents === 'function') mountExampleAgents();
+}
+
+// ── Activity state machine ────────────────────────────────────────────────
+const SLEEP_AFTER_MS = 8000;
+const PENDING_GRACE_MS = 60_000;
+const INBOX_CAP = 50;
+const OUTBOX_CAP = 50;
+const SPARK_WINDOW = 120;
+const SPARK_TICK_MS = 1000;
+
+function _activity(botId) {
+  let a = S.activity[botId];
+  if (!a) {
+    a = {
+      state: 'sleep', last_activity: Date.now(),
+      pending_msg_id: null, pending_since: null,
+      last_reply_at: null, last_reply_ms: null,
+      inbox: [], outbox: [], spark: [],
+    };
+    S.activity[botId] = a;
+  }
+  if (!a.inbox) a.inbox = [];
+  if (!a.outbox) a.outbox = [];
+  if (!a.spark) a.spark = [];
+  if (a.pending_since === undefined) a.pending_since = null;
+  if (a.pending_msg_id === undefined) a.pending_msg_id = null;
+  if (a.last_reply_at === undefined) a.last_reply_at = null;
+  if (a.last_reply_ms === undefined) a.last_reply_ms = null;
+  return a;
+}
+function _pushBounded(arr, item, cap) {
+  arr.push(item);
+  while (arr.length > cap) arr.shift();
+}
+function _botTopics(botId) {
+  const b = S.bots[botId] || {};
+  const spec = b.spec || {};
+  return new Set(spec.inbound_routes || []);
+}
+function _pushSpark(botId, state) {
+  const a = _activity(botId);
+  a.spark.push(state);
+  if (a.spark.length > SPARK_WINDOW) a.spark.shift();
+}
+setInterval(() => {
+  for (const botId of Object.keys(S.bots)) {
+    const a = _activity(botId);
+    const now = Date.now();
+    if (a.state === 'talk' && now - a.last_activity > SLEEP_AFTER_MS) a.state = 'sleep';
+    if (a.state === 'think' && a.pending_since !== null &&
+        now - a.pending_since > PENDING_GRACE_MS) a.state = 'sleep';
+    _pushSpark(botId, a.state);
+  }
+  renderGraph();
+}, SPARK_TICK_MS);
+
+function markThinking(topic, envelope) {
+  const now = Date.now();
+  for (const botId of Object.keys(S.bots)) {
+    if (!_botTopics(botId).has(topic)) continue;
+    const a = _activity(botId);
+    a.state = 'think';
+    a.last_activity = now;
+    if (envelope) {
+      const text = (envelope.payload && envelope.payload.text) ??
+                   (typeof envelope.payload === 'string' ? envelope.payload : '');
+      _pushBounded(a.inbox, {
+        t: now, topic: topic, from: envelope.sender || '?',
+        id: envelope.id ?? null, text: (text && String(text).slice(0, 400)) || '',
+      }, INBOX_CAP);
+    }
+  }
+}
+function markTalking(botId, envelope) {
+  if (!S.bots[botId]) return;
+  const a = _activity(botId);
+  const now = Date.now();
+  if (a.state !== 'error') a.state = 'talk';
+  a.last_activity = now;
+  a.last_reply_at = now;
+  if (a.pending_since !== null) {
+    a.last_reply_ms = now - a.pending_since;
+    a.pending_since = null;
+    a.pending_msg_id = null;
+  }
+  if (envelope) {
+    const text = (envelope.payload && envelope.payload.text) ??
+                 (typeof envelope.payload === 'string' ? envelope.payload : '');
+    _pushBounded(a.outbox, {
+      t: now, topic: envelope.topic || '',
+      text: (text && String(text).slice(0, 400)) || '',
+      corr: envelope.correlation_id || null,
+      in_reply_to: (envelope.payload && envelope.payload.in_reply_to_msg_id) ?? null,
+    }, OUTBOX_CAP);
+  }
+}
+function markError(botId, envelope) {
+  if (!S.bots[botId]) return;
+  const a = _activity(botId);
+  a.state = 'error';
+  a.last_activity = Date.now();
+  a.pending_since = null;
+  if (envelope) {
+    const err = (envelope.payload && envelope.payload.error) || 'unknown error';
+    _pushBounded(a.outbox, {
+      t: Date.now(), topic: envelope.topic || '',
+      text: '[ERROR] ' + String(err).slice(0, 400),
+      corr: envelope.correlation_id || null,
+      in_reply_to: (envelope.payload && envelope.payload.in_reply_to_msg_id) ?? null,
+    }, OUTBOX_CAP);
+  }
+}
+
+async function refreshAgents() {
+  try {
+    const data = await api('/api/agents');
+    S.agents = data.agents || [];
+    renderAgents();
+    renderDiagnosis();
+    if (typeof renderBlueprints === 'function') renderBlueprints();
+    updateHeaderPills();
+  } catch (e) { /* keep last-known */ }
+}
+
+function updateHeaderPills() {
+  const total = (S.agents || []).length;
+  const running = (S.agents || []).filter(a => a.status === 'running').length;
+  const ap = $('agents-pill');
+  ap.innerHTML = icon('cube') + ` ${running}/${total} running`;
+  ap.classList.toggle('ok', total > 0 && running === total);
+  ap.classList.toggle('warn', total > 0 && running < total);
+
+  const conn = S.swarm || {};
+  const cfg = conn.config || {};
+  const st = conn.status || {};
+  const bindings = conn.bindings || [];
+  const cp = $('connector-pill');
+  if (!cfg.enabled) {
+    cp.innerHTML = icon('plug') + ' swarm: off';
+    cp.classList.remove('ok', 'warn');
+  } else if (!bindings.length) {
+    cp.innerHTML = icon('plug') + ' swarm: no binding';
+    cp.classList.add('warn');
+  } else if (st.running) {
+    cp.innerHTML = icon('plug') + ` swarm: ${esc(conn.adapter_platform || 'headless')}`;
+    cp.classList.add('ok');
+  } else {
+    cp.innerHTML = icon('plug') + ' swarm: idle';
+    cp.classList.remove('ok', 'warn');
+  }
+
+  if ($('nav-agent-badge')) $('nav-agent-badge').textContent = String(total);
+  if ($('nav-topic-badge')) $('nav-topic-badge').textContent = String((S.topics || []).length);
+  if ($('nav-session-badge')) $('nav-session-badge').textContent = String((S.sessions || []).length);
+}
+
+// ── Overview + diagnosis ─────────────────────────────────────────────────
+function renderOverview() {
+  renderOnboarding();
+}
+
+function _hasLiveBinding() {
+  const conn = S.swarm || {};
+  return (conn.bindings || []).length > 0;
+}
+function _swarmEnabled() {
+  const conn = S.swarm || {};
+  return !!(conn.config && conn.config.enabled);
+}
+
+function renderDiagnosis() {
+  const slot = $('diag-slot');
+  if (!slot) return;
+  const agents = S.agents || [];
+  if (agents.length === 0) {
+    slot.innerHTML = '';
+    return;
+  }
+  const idleNoTopics = agents.filter(a => !(a.mission_topics || []).length);
+  const runningNoTopics = idleNoTopics.filter(a => a.status === 'running');
+  const onlySwarmAgents = agents.every(a =>
+    (a.mission_topics || []).every(t => t.startsWith('swarm.')));
+  const connectorHasNoBinding = _swarmEnabled() && !_hasLiveBinding();
+
+  let html = '';
+  if (runningNoTopics.length > 0) {
+    html += `<div class="diag">
+      <h4>${icon('warn')} ${runningNoTopics.length} running agent(s) have no mission topics</h4>
+      <p>These agents are alive but idle: with no inbound topic, no message can ever reach them.</p>
+      <p class="why">Fix: click an agent below and set at least one mission topic (e.g. <code>email.inbox</code>), or recreate it from an example.</p>
+      <div class="cta">
+        <button onclick="document.getElementById('btn-new-agent').click()">${icon('puzzle')} Recreate with topics</button>
+      </div>
+    </div>`;
+  } else if (connectorHasNoBinding && onlySwarmAgents) {
+    html += `<div class="diag">
+      <h4>${icon('warn')} Agents idle because no live platform binding is attached</h4>
+      <p>All your agents watch <code>swarm.*</code> topics, but the swarm connector has no Discord/Slack/lollms.com binding to feed it.</p>
+      <p class="why">Nothing external can send them a message. Either (a) configure a connection binding in lollms-client, (b) start the connector with a binding, or (c) send a test message to prove the chain works.</p>
+      <div class="cta">
+        <button class="primary" onclick="testAllAgents()">${icon('send')} Send test message</button>
+        <button onclick="setView('swarm')">${icon('plug')} Open Swarm tab</button>
+      </div>
+    </div>`;
+  } else if (!connectorHasNoBinding && agents.length > 0) {
+    // Agents exist with topics; give a gentle "how to exercise" hint once.
+    const hasTraffic = (S.topics || []).some(t => (t.messages || 0) > 0);
+    if (!hasTraffic) {
+      html += `<div class="diag" style="border-color:var(--accent); background:linear-gradient(135deg,#0f1a2a 0%,#121a24 130%);">
+        <h4 style="color:var(--accent);">${icon('info')} No bus traffic yet</h4>
+        <p>Agents are running but no messages have flowed. Send a test to prove the message → agent → reply chain.</p>
+        <div class="cta">
+          <button class="primary" onclick="testAllAgents()">${icon('send')} Send test to all agents</button>
+        </div>
+      </div>`;
+    }
+  }
+  slot.innerHTML = html;
+}
+
+// ── Onboarding ───────────────────────────────────────────────────────────
+const ONBOARD_KEY = 'lollms-hub-onboard-dismissed-v2';
+function onboardingDone() { return localStorage.getItem(ONBOARD_KEY) === '1'; }
+function renderOnboarding() {
+  const slot = $('onboard-slot');
+  if (!slot) return;
+  if (onboardingDone()) { slot.innerHTML = ''; return; }
+  const stepHandbag = (S.agentCatalog.handbags || []).length > 0;
+  const stepProfile = (S.agentCatalog.profiles || []).length > 0 || (S.models || []).length > 0;
+  const stepCreated = (S.agents || []).length > 0;
+  const stepRunning = (S.agents || []).some(a => a.status === 'running');
+  const step = (n, done, title, desc, cta) => `
+    <div class="onboard-step${done ? ' done' : ''}">
+      <div class="num">${done ? icon('check') : n}</div>
+      <div class="desc"><strong>${title}</strong><em>${desc}</em>
+        ${cta && !done ? `<div style="margin-top:6px;">${cta}</div>` : ''}
+      </div>
+    </div>`;
+  slot.innerHTML = `
+    <div class="onboard-card">
+      <h3>${icon('rocket')} Get your first agent running</h3>
+      <p>Four steps to a live, message-receiving agent.</p>
+      ${step(1, stepHandbag, 'A handbag exists',
+        'A handbag is the agent’s identity: SOUL.md + tools + memory.',
+        !stepHandbag ? '<span style="color:var(--danger);font-size:11px;">None found — add one to ~/.lollms-bot/handbag/ with a SOUL.md, then Refresh.</span>' : '')}
+      ${step(2, stepProfile, 'A model profile exists',
+        'The LLM your agents will think with.',
+        !stepProfile ? '<span style="color:var(--danger);font-size:11px;">None found — run python -m lollms_client.lollms_config_cli_env.</span>' : '')}
+      ${step(3, stepCreated, 'Compose an agent',
+        'Pick a handbag + model + at least one mission topic.',
+        stepHandbag && stepProfile ? `<button class="primary" onclick="openNewAgent()">${icon('puzzle')} New Agent</button>` : '')}
+      ${step(4, stepRunning, 'Agent is running and receives traffic',
+        'Send a test message to prove the message → agent → reply chain.',
+        stepRunning ? `<button onclick="testAllAgents()">${icon('send')} Send test</button>` : '')}
+      <div class="onboard-actions">
+        <button onclick="localStorage.setItem('${ONBOARD_KEY}','1'); renderOnboarding();">Dismiss checklist</button>
+      </div>
+    </div>`;
+}
+
+// ── Contextual agent action buttons ─────────────────────────────────────
+// The visible controls depend on the bot's lifecycle state so the operator
+// is only ever shown actions that are valid RIGHT NOW (no dead "Start" on a
+// running bot, no "Pause" on a stopped one, no "Send test" to an idle bot).
+//
+//   running / starting  → Pause · Kill · Logs · Send test (running only)
+//   failed (killed)     → Restart · Kill · Delete · Logs
+//   stopped             → Start · Kill · Delete · Logs
+//   pending             → Start · Delete · Logs
+//   stopping            → Kill · Logs
+//
+// Kill and Delete are always danger-styled (crimson). "Send test" is shown
+// ONLY when the bot is live (running) AND has at least one mission topic —
+// a paused/stopped agent cannot answer, so offering it would be a lie. This
+// is the contextual-controls contract: every button the operator sees is one
+// that will actually do something meaningful in the current state.
+function _agentActions(a, status, hasTopics) {
+  const id = esc(a.agent_id);
+  const btn = (act, ico, label, extra) =>
+    '<button data-act="' + act + '" data-id="' + id + '"' +
+    (extra || '') + ' style="padding:2px 8px; font-size:11px;">' +
+    icon(ico) + ' ' + label + '</button>';
+  const topicAttr = (hasTopics && a.mission_topics[0])
+    ? ' data-topic="' + esc(a.mission_topics[0]) + '"' : '';
+  // Send test is STRICTLY gated on status === 'running'. A starting/stopping/
+  // stopped bot has no live subscriber to answer the ping.
+  const sendTest = (hasTopics && status === 'running')
+    ? btn('ping', 'send', 'Send test', topicAttr) : '';
+  const logs = btn('logs', 'doc', 'Logs');
+  const del = btn('delete', 'trash', 'Delete', ' class="danger"');
+  const kill = btn('kill', 'kill', 'Kill', ' class="danger"');
+  const pause = btn('stop', 'pause', 'Pause');
+  const start = btn('start', 'play', 'Start');
+  const restart = btn('restart', 'refresh', 'Restart');
+
+  let controls = '';
+  switch (status) {
+    case 'running':
+      // The canonical live-agent bar: pause it, kill it, see logs, test it.
+      controls = pause + kill + logs + sendTest;
+      break;
+    case 'starting':
+      // Booting up: Pause (a graceful stop on the way up) + Kill as the hard
+      // stop. No Send test yet — the subscriber isn't attached until RUNNING.
+      controls = pause + kill + logs;
+      break;
+    case 'stopping':
+      // Already shutting down: only Kill (force) is meaningful.
+      controls = kill + logs;
+      break;
+    case 'failed':
+      // Killed/crashed: revive via Restart, or kill again (idempotent, keeps
+      // it terminal), or remove it entirely.
+      controls = restart + kill + del + logs;
+      break;
+    case 'pending':
+      // Registered but never launched: Start it (or remove).
+      controls = start + del + logs;
+      break;
+    case 'stopped':
+      // Stopped cleanly: Start to run again, or Kill to force it into the
+      // terminal FAILED state, or Delete to unregister. No Send test.
+      controls = start + kill + del + logs;
+      break;
+    default:
+      controls = start + del + logs;
+      break;
+  }
+  return '<div class="actions">' + controls + '</div>';
+}
+
+// ── Agents rendering ─────────────────────────────────────────────────────
+function renderAgents() {
+  const root = $('agent-list');
+  const count = $('agent-count');
+  if (!root) return;
+  if (!S.agents || S.agents.length === 0) {
+    if (count) count.textContent = '';
+    root.innerHTML = '<p style="color:var(--muted);">No agents yet. Click New Agent to compose one.</p>';
+    return;
+  }
+  if (count) count.textContent = '(' + S.agents.length + ')';
+  root.innerHTML = S.agents.map(a => {
+    const status = a.status || 'unknown';
+    const active = a.agent_id === S.selectedBotId ? ' active' : '';
+    const hasTopics = a.mission_topics && a.mission_topics.length > 0;
+    const topic = hasTopics ? a.mission_topics.join(', ') : '—';
+    const model = a.llm_profile || 'default';
+    const hb = a.handbag_path || '—';
+    const shortHb = hb.split(/[\\/]/).slice(-2).join('/');
+    const act = _activity(a.agent_id);
+    const spark = (act.spark || []).slice(-120).map(k =>
+      '<div class="cell ' + esc(k) + '"></div>').join('');
+    const killed = status === 'failed';
+    let hint = '';
+    if (!hasTopics) {
+      hint = '<div class="idle-hint">' + icon('warn') +
+        ' No mission topics — this agent can never receive a message.</div>';
+    } else if (status === 'running' && (act.state === 'sleep' || !act.state)) {
+      hint = '<div class="idle-hint silent">' + icon('info') +
+        ' Idle — waiting for a message on its topic(s).</div>';
+    }
+    const errBox = killed && a.error
+      ? '<div class="err">' + esc(a.error) + '</div>'
+      : '';
+    const statusPill = killed
+      ? '<span style="display:inline-flex; align-items:center; gap:3px; padding:0 7px; border-radius:999px; ' +
+          'background:rgba(255,45,85,.2); color:#ff2d55; font-weight:700; font-size:10px; letter-spacing:.04em; ' +
+          'animation:killed-pulse 2.2s ease-in-out infinite;">' +
+          icon('kill') + ' KILLED</span>'
+      : '<span class="status-dot ' + esc(status) + '"></span>';
+    const killedHint = killed
+      ? '<div class="idle-hint" style="color:#ff2d55;">' + icon('warn') +
+          ' Terminated — nothing is running. Press Restart to revive, or Delete to remove.</div>'
+      : '';
+    const health = '<div class="agent-health' + (killed ? ' killed' : '') + '">' +
+      '<div><strong>Status:</strong> ' + statusPill +
+      (a.pid ? ' · pid ' + a.pid : '') +
+      '</div>' + errBox + killedHint + hint +
+      _agentActions(a, status, hasTopics) +
+      '</div>';
+    return '<div class="list-item' + active + (killed ? ' is-killed' : '') + '" data-agent-id="' + esc(a.agent_id) + '">' +
+      '<div class="name"><span class="status-dot ' + esc(status) + '"></span>' + esc(a.agent_id) + '</div>' +
+      '<div class="sub">' + icon('brain') + ' ' + esc(model) + ' · ' + icon('bag') + ' ' + esc(shortHb) + '</div>' +
+      '<div class="sub">' + icon('signal') + ' ' + esc(topic) + '</div>' +
+      '<div class="spark">' + (spark || '<div class="cell sleep"></div>') + '</div>' +
+      health +
+      '</div>';
+  }).join('');
+  root.querySelectorAll('[data-agent-id]').forEach(el => {
+    el.onclick = (ev) => {
+      if (ev.target.tagName === 'BUTTON' || ev.target.closest('button')) return;
+      selectBot(el.dataset.agentId);
+    };
+  });
+  root.querySelectorAll('button[data-act]').forEach(btn => {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      const id = btn.dataset.id;
+      const act = btn.dataset.act;
+      if (act === 'logs') { selectBot(id); setTab('logs'); renderLogs(); return; }
+      if (act === 'ping') { testAgent(id, btn.dataset.topic); return; }
+      if (act === 'kill') { _agentAction(id, 'kill'); return; }
+      if (act === 'delete') { _agentAction(id, 'delete'); return; }
+      _agentAction(id, act);
+    };
+  });
+}
+
+async function _agentAction(id, act) {
+  // Kill and delete are destructive: confirm first with a text that explains
+  // exactly what will happen (kill = terminate process, keep definition;
+  // delete = remove the bot from the mesh entirely).
+  if (act === 'kill') {
+    if (!confirm('KILL ' + id + '?\n\nThis force-terminates the process immediately.\n' +
+                 'The bot stays registered as KILLED and will NOT auto-restart.\n' +
+                 'You can Restart it later or Delete it.')) return;
+  } else if (act === 'delete') {
+    if (!confirm('DELETE ' + id + '?\n\nThis removes the bot from the mesh registry.\n' +
+                 'Its log + discussion files are kept on disk.\nThis cannot be undone from the UI.')) return;
+  }
+  const isDelete = act === 'delete';
+  const url = isDelete
+    ? '/api/agents/' + encodeURIComponent(id)
+    : '/api/agents/' + encodeURIComponent(id) + '/' + act;
+  try {
+    await api(url, { method: isDelete ? 'DELETE' : 'POST' });
+    if (act === 'kill') {
+      toast('Killed', id + ' was force-terminated (it will not auto-restart).', 'error');
+    } else if (isDelete) {
+      toast('Deleted', id + ' removed from the mesh.', 'ok');
+    } else {
+      toast('OK', id + ' ' + act + ' requested.', 'ok');
+    }
+    if (isDelete && S.selectedBotId === id) S.selectedBotId = null;
+    await refreshAgents();
+    await refreshBots();
+    await refreshTopics();
+    renderDetails();
+  } catch (e) {
+    // The agents API has no /delete route today; fall back to the /api/bots
+    // DELETE endpoint which is the canonical registry unregister path.
+    if (isDelete) {
+      try {
+        await api('/api/bots/' + encodeURIComponent(id), { method: 'DELETE' });
+        toast('Deleted', id + ' removed from the mesh.', 'ok');
+        if (S.selectedBotId === id) S.selectedBotId = null;
+        await refreshAgents();
+        await refreshBots();
+        await refreshTopics();
+        renderDetails();
+        return;
+      } catch (e2) {
+        toast('Delete failed', String(e2.message || e2), 'error');
+        return;
+      }
+    }
+    toast('Agent action failed', String(e.message), 'error');
+  }
+}
+
+// ── Test (publish) ───────────────────────────────────────────────────────
+async function testAgent(agentId, topic) {
+  const agent = (S.agents || []).find(a => a.agent_id === agentId);
+  const target = topic || (agent && agent.mission_topics && agent.mission_topics[0]);
+  if (!target) { toast('No topic', agentId + ' has no mission topic to test.', 'error'); return; }
+  const corr = 'hubtest-' + Date.now().toString(36);
+  try {
+    await api('/api/bus/publish', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        topic: target, sender: 'hub',
+        payload: {
+          text: 'Hello from the hub — this is a test message. Please reply ' +
+                'briefly to confirm you are listening on "' + target + '".',
+          correlation_hint: corr,
+        },
+      }),
+    });
+    toast('Test message → "' + target + '"',
+      'Watch ' + agentId + ': it turns amber (thinking) then green when the ' +
+      'reply lands. Deep models can take 5–30s. Set view = Agents to watch it.',
+      'ok');
+    await refreshTopics();
+    setView('agents');
+  } catch (e) {
+    toast('Test failed', String(e.message), 'error');
+  }
+}
+
+async function testAllAgents() {
+  const withTopics = (S.agents || []).filter(a => (a.mission_topics || []).length > 0);
+  if (!withTopics.length) {
+    toast('Nothing to test', 'No agent has a mission topic.', 'error');
+    return;
+  }
+  let ok = 0, fail = 0;
+  for (const a of withTopics) {
+    try {
+      await api('/api/bus/publish', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          topic: a.mission_topics[0], sender: 'hub',
+          payload: { text: 'Hub test to ' + a.agent_id +
+            ' — please reply briefly to confirm you are listening.' },
+        }),
+      });
+      ok++;
+    } catch (e) { fail++; }
+  }
+  toast('Test messages sent',
+    ok + ' agent(s) triggered' + (fail ? ' · ' + fail + ' failed' : '') +
+    '. Watch the graph — agents turn amber then green.', 'ok');
+  await refreshTopics();
+  setView('agents');
+}
+
+// ── Blueprints ───────────────────────────────────────────────────────────
+const BP_ICONS = {
+  'email-triage': 'mail', 'news-curator': 'news', 'research-buddy': 'microscope',
+  'code-reviewer': 'eye', 'meeting-scribe': 'pen', 'personal-assistant': 'compass',
+  'validator': 'shield', 'swarm-orchestrator': 'network', 'translator': 'translate',
+  'summarizer': 'summarize', 'data-analyst': 'chart', 'support-agent': 'headset',
+  'sentiment-monitor': 'speech', 'planner': 'calendar', 'critic': 'critic',
+};
+function _bpIcon(blueprintId) { return icon(BP_ICONS[blueprintId] || 'cube'); }
+
+function renderBlueprints() {
+  const host = $('example-agents');
+  if (!host) return;
+  const bps = (S.agentCatalog && S.agentCatalog.blueprints) || [];
+  if (!bps.length) {
+    host.innerHTML = '<div class="bp-empty">No example agents — the blueprint catalog failed to load.</div>';
+    return;
+  }
+  const existing = new Set((S.agents || []).map(a => a.agent_id));
+  host.innerHTML = bps.map(bp => {
+    const exists = existing.has(bp.blueprint_id);
+    return '<div class="bp-card' + (exists ? ' exists' : '') + '" ' +
+      'data-bp-id="' + esc(bp.blueprint_id) + '" title="' + esc(bp.description) + '">' +
+      '<div class="bp-icon">' + _bpIcon(bp.blueprint_id) + '</div>' +
+      '<div><div class="bp-name">' + esc(bp.name) + '</div>' +
+      '<div class="bp-desc">' + esc(bp.description) + '</div></div>' +
+    '</div>';
+  }).join('');
+  host.querySelectorAll('.bp-card').forEach(card => {
+    if (card.classList.contains('exists')) return;
+    card.onclick = () => instantiateBlueprint(card.dataset.bpId);
+  });
+}
+function mountExampleAgents() { renderBlueprints(); }
+
+async function instantiateBlueprint(blueprintId) {
+  const bp = (S.agentCatalog.blueprints || []).find(b => b.blueprint_id === blueprintId);
+  if (!bp) { toast('Unknown blueprint', blueprintId, 'error'); return; }
+  try {
+    const res = await api('/api/agents', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ agent_id: blueprintId, blueprint_id: blueprintId, autostart: true }),
+    });
+    if (res.start_error) {
+      toast('Agent created (start failed)', blueprintId + ': ' + res.start_error, 'error');
+    } else {
+      toast('Agent created', bp.name + ' is up. Send it a test message!', 'ok');
+    }
+    await refreshAgents();
+    await refreshBots();
+    renderBlueprints();
+    setView('agents');
+  } catch (e) {
+    toast('Could not create example agent', String(e.message || e), 'error');
+  }
+}
+
+// ── New Agent modal ──────────────────────────────────────────────────────
+async function openNewAgent() {
+  await refreshAgentCatalog();
+  $('na-id').value = '';
+  $('na-topics').value = '';
+  $('na-tags').value = '';
+  $('na-autostart').checked = true;
+  const hb = S.agentCatalog.handbags || [];
+  const pr = S.agentCatalog.profiles || [];
+  const bps = S.agentCatalog.blueprints || [];
+  $('na-handbag').innerHTML = hb.length
+    ? hb.map(h => '<option value="' + esc(h.path) + '">' + esc(h.name) + '</option>').join('')
+    : '<option value="">(no handbags discovered — create one first)</option>';
+  $('na-model').innerHTML = pr.length
+    ? pr.map(m => '<option value="' + esc(m.name) + '">' + esc(m.name) +
+        ' · ' + esc(m.binding||'') + '/' + esc(m.model||'') + '</option>').join('')
+    : '<option value="default">default</option>';
+  const bpSelect = $('na-blueprint');
+  bpSelect.innerHTML = '<option value="">(custom — pick a handbag below)</option>' +
+    bps.map(b => '<option value="' + esc(b.blueprint_id) + '">' + esc(b.name) + '</option>').join('');
+  $('na-blueprint-hint').textContent = '';
+  bpSelect.onchange = () => {
+    const bp = bps.find(b => b.blueprint_id === bpSelect.value);
+    const hint = $('na-blueprint-hint');
+    if (!bp) { hint.textContent = ''; return; }
+    hint.textContent = bp.description;
+    if (!$('na-topics').value.trim() && bp.default_topics) {
+      $('na-topics').value = (bp.default_topics || []).join(', ');
+    }
+    if (!$('na-tags').value.trim() && bp.tags) {
+      $('na-tags').value = (bp.tags || []).join(', ');
+    }
+  };
+  $('modal-new-agent').classList.add('show');
+}
+function closeNewAgent() { $('modal-new-agent').classList.remove('show'); }
+
+const TOPIC_RE = /^[a-zA-Z0-9][-a-zA-Z0-9_.]{0,127}$/;
+function _normalizeTopics(raw) {
+  const out = [], seen = new Set();
+  for (const part of String(raw || '').split(',')) {
+    const t = part.trim();
+    if (!t) continue;
+    if (!TOPIC_RE.test(t)) {
+      return { error: 'Invalid topic "' + t + '": use a slug like "email.inbox".' };
+    }
+    if (!seen.has(t)) { seen.add(t); out.push(t); }
+  }
+  return { topics: out };
+}
+document.getElementById('na-create').onclick = async () => {
+  const id = $('na-id').value.trim();
+  if (!id) { toast('Missing ID', 'Give the agent an agent_id.', 'error'); return; }
+  const blueprintId = $('na-blueprint').value;
+  const handbagPath = $('na-handbag').value;
+  if (!blueprintId && !handbagPath) {
+    toast('Missing source', 'Pick a blueprint or a handbag.', 'error'); return;
+  }
+  const topics = _normalizeTopics($('na-topics').value);
+  if (topics.error) { toast('Invalid mission topics', topics.error, 'error'); return; }
+  if (topics.topics.length === 0) {
+    toast('No mission topics',
+      'An agent without a topic will start but never receive traffic. ' +
+      'Add at least one (e.g. email.inbox).', 'error');
+    return;
+  }
+  const body = {
+    agent_id: id,
+    llm_profile: $('na-model').value || null,
+    mission_topics: topics.topics,
+    tags: $('na-tags').value.split(',').map(s => s.trim()).filter(Boolean),
+    autostart: !!$('na-autostart').checked,
+  };
+  if (blueprintId) body.blueprint_id = blueprintId;
+  else body.handbag_path = handbagPath;
+  try {
+    const res = await api('/api/agents', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    closeNewAgent();
+    if (res.start_error) {
+      toast('Agent created (start failed)', id + ': ' + res.start_error, 'error');
+    } else {
+      toast('Agent created', id + ' is up. Send it a test!', 'ok');
+    }
+    await refreshAgents();
+    await refreshBots();
+    setView('agents');
+  } catch (e) {
+    toast('Create agent failed', String(e.message), 'error');
+  }
+};
+
+// ── Import ───────────────────────────────────────────────────────────────
+$('btn-import').onclick = () => {
+  $('import-file').value = '';
+  $('modal-import').classList.add('show');
+};
+$('btn-import-go').onclick = async () => {
+  const f = $('import-file').files[0];
+  if (!f) { toast('No file', 'Pick a .zip bundle.', 'error'); return; }
+  try {
+    const data = await api('/api/handbags/import', { method: 'POST', body: f });
+    $('modal-import').classList.remove('show');
+    toast('Imported', (data.bundle && data.bundle.bot_spec ? data.bundle.bot_spec.bot_id : '?') + ' installed.', 'ok');
+    await refreshBots();
+  } catch (e) {
+    toast('Import failed', String(e.message), 'error');
+  }
+};
+
+// ── Recording ────────────────────────────────────────────────────────────
+$('btn-record').onclick = async () => {
+  const isRec = !!S.env.recording;
+  try {
+    const res = await api(isRec ? '/api/recording/stop' : '/api/recording/start', { method: 'POST' });
+    toast('Recording', (isRec ? 'stopped: ' : 'started: ') + (res.session_id || '?'), 'ok');
+    await refreshEnv();
+    await refreshSessions();
+  } catch (e) {
+    toast('Recording error', String(e.message), 'error');
+  }
+};
+$('btn-refresh').onclick = () => fullRefresh();
+$('btn-test-all').onclick = () => testAllAgents();
+$('btn-new-agent').onclick = () => openNewAgent();
+
+// ── Bus topics ───────────────────────────────────────────────────────────
+function renderTopics() {
+  const root = $('topic-list');
+  if (!root) return;
+  const topics = S.topics || [];
+  if (!topics.length) {
+    root.innerHTML = '<p style="color:var(--muted); font-size:12px;">No topics have carried messages yet. ' +
+      'Send a test message to an agent to create the first topic.</p>';
+    return;
+  }
+  root.innerHTML = topics.map(t => {
+    const msgs = t.messages || 0;
+    const subs = t.subscribers || 0;
+    return '<div class="topic-row">' +
+      '<span class="ico" style="color:var(--accent);">' + icon('signal') + '</span>' +
+      '<span class="topic-name">' + esc(t.topic) + '</span>' +
+      '<span class="meta">' + msgs + ' msg · ' + subs + ' sub</span>' +
+      '<button onclick="publishTo(\'' + esc(t.topic).replace(/'/g, "\\'") + '\')">' + icon('send') + ' Publish</button>' +
+      '</div>';
+  }).join('');
+}
+async function publishTo(topic) {
+  try {
+    await api('/api/bus/publish', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ topic, sender: 'hub', payload: { text: 'Ping on ' + topic } }),
+    });
+    toast('Published', 'Message sent to "' + topic + '"', 'ok');
+    await refreshTopics();
+  } catch (e) {
+    toast('Publish failed', String(e.message), 'error');
+  }
+}
+
+// ── Swarm ────────────────────────────────────────────────────────────────
+async function refreshSwarm() {
+  try {
+    const [status, bindings] = await Promise.all([
+      api('/api/swarm/status'),
+      api('/api/swarm/bindings'),
+    ]);
+    S.swarm = {
+      config: status.config || {},
+      status: status.status || null,
+      bindings: (bindings && bindings.bindings) || [],
+      adapter_platform: status.adapter_platform || null,
+      error: (bindings && bindings.error) || null,
+    };
+  } catch (e) {
+    S.swarm = { config: {}, status: null, bindings: [], adapter_platform: null, error: String(e.message || e) };
+  }
+  renderSwarm();
+  updateHeaderPills();
+}
+
+function renderSwarm() {
+  const root = $('swarm-body');
+  if (!root) return;
+  const s = S.swarm || { config: {}, status: null, bindings: [] };
+  const cfg = s.config || {};
+  const enabled = !!cfg.enabled;
+  const running = !!(s.status && s.status.running);
+  const bindings = s.bindings || [];
+
+  let statusHtml;
+  if (s.error) {
+    statusHtml = '<span style="color:var(--danger);">' + esc(s.error) + '</span>';
+  } else if (!bindings.length) {
+    statusHtml = '<span style="color:var(--warn);">No live connection bindings — no external platform can reach the mesh. ' +
+      'Configure one in lollms-client: <code>python -m lollms_client.lollms_config_cli_env</code></span>';
+  } else if (running) {
+    statusHtml = '<span style="color:var(--ok);">' + icon('plug') + ' running · adapter: ' +
+      esc(s.adapter_platform || '(headless)') + '</span>';
+  } else {
+    statusHtml = '<span style="color:var(--muted);">' + icon('pause') + ' disabled</span>';
+  }
+
+  const bindingOptions = bindings.length
+    ? '<option value="">(headless — ingest via /api/swarm/ingest only)</option>' +
+      bindings.map(b => '<option value="' + esc(b.name) + '"' +
+        (b.name === cfg.connection_name ? ' selected' : '') + '>' +
+        esc(b.name) + ' · ' + esc(b.class) + (b.connected ? ' (online)' : ' (idle)') +
+        '</option>').join('')
+    : '<option value="">(no bindings configured)</option>';
+
+  root.innerHTML =
+    '<div class="kv"><div class="k">State</div><div class="v">' + statusHtml + '</div></div>' +
+    '<div class="kv"><div class="k">Bindings</div><div class="v">' +
+      (bindings.length ? bindings.length + ' configured' : '<span style="color:var(--warn);">none</span>') +
+    '</div></div>' +
+    (s.status ? (
+      '<div class="kv"><div class="k">Ingress topic</div><div class="v">' + esc(s.status.ingress_topic) + '</div></div>' +
+      '<div class="kv"><div class="k">Reply topic</div><div class="v">' + esc(s.status.reply_topic) + '</div></div>' +
+      '<div class="kv"><div class="k">Pending</div><div class="v">' + esc(s.status.pending) + '</div></div>'
+    ) : '') +
+    '<div class="form-row" style="margin-top:10px;">' +
+      '<label class="fixed" style="width:110px;">Enabled</label>' +
+      '<input type="checkbox" id="sw-enabled" ' + (enabled ? 'checked' : '') + ' style="width:auto;">' +
+    '</div>' +
+    '<div class="form-row">' +
+      '<label class="fixed" style="width:110px;">Connection</label>' +
+      '<select id="sw-conn">' + bindingOptions + '</select>' +
+    '</div>' +
+    '<div class="form-row">' +
+      '<label class="fixed" style="width:110px;">Ingress topic</label>' +
+      '<input id="sw-ingress" value="' + esc(cfg.ingress_topic || 'swarm.inbound') + '">' +
+    '</div>' +
+    '<div class="form-row">' +
+      '<label class="fixed" style="width:110px;">Timeout (s)</label>' +
+      '<input id="sw-timeout" type="number" min="5" max="600" value="' + esc(cfg.reply_timeout_seconds || 120) + '">' +
+    '</div>' +
+    '<div style="display:flex; gap:6px; margin-top:10px; flex-wrap:wrap;">' +
+      '<button class="primary" id="sw-save">' + icon('check') + ' Save & apply</button>' +
+      '<button id="sw-ingest">' + icon('send') + ' Send test message</button>' +
+    '</div>';
+
+  $('sw-save').onclick = async () => {
+    const body = {
+      enabled: !!$('sw-enabled').checked,
+      connection_name: $('sw-conn').value || '',
+      ingress_topic: $('sw-ingress').value.trim() || 'swarm.inbound',
+      reply_timeout_seconds: Math.max(5, parseInt($('sw-timeout').value || '120', 10)),
+    };
+    try {
+      const res = await api('/api/swarm/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      toast('Swarm config saved',
+        (res.status && res.status.running) ? 'connector running' : 'connector stopped', 'ok');
+      await refreshSwarm();
+    } catch (e) {
+      toast('Swarm config failed', String(e.message || e), 'error');
+    }
+  };
+  $('sw-ingest').onclick = async () => {
+    const text = prompt('Send a test message through the swarm connector (simulates a human):');
+    if (!text) return;
+    try {
+      const res = await api('/api/swarm/ingest', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, sender: 'hub-test', platform: 'hub' }),
+      });
+      toast('Test message sent',
+        'Watch the graph — the orchestrator should turn green. Token: ' +
+        (res.reply_token || '?').slice(0, 8) + '…', 'ok');
+    } catch (e) {
+      toast('Swarm ingest failed', String(e.message || e), 'error');
+    }
+  };
+}
+
+// ── Details / Logs / Replay ──────────────────────────────────────────────
+function selectBot(botId) {
+  S.selectedBotId = botId;
+  document.querySelectorAll('[data-agent-id]').forEach(el =>
+    el.classList.toggle('active', el.dataset.agentId === botId));
+  renderDetails();
+  renderLogs();
+}
+function setTab(name) {
+  ['details', 'logs', 'replay'].forEach(t => {
+    const el = $('tab-' + t);
+    if (el) el.style.display = (t === name) ? 'block' : 'none';
+  });
+  document.querySelectorAll('.tabs button').forEach(b =>
+    b.classList.toggle('active', b.dataset.tab === name));
+}
+document.querySelectorAll('.tabs button').forEach(btn => {
+  btn.onclick = () => setTab(btn.dataset.tab);
+});
+
+function _conversationInspector(botId) {
+  const a = _activity(botId);
+  if (!a) return '';
+  const when = (ms) => { if (!ms) return '—'; return new Date(ms).toLocaleTimeString(); };
+  const lastActivity = Math.max(a.last_activity || 0, a.last_reply_at || 0);
+  const replyLatency = a.last_reply_ms != null ? ` (last reply took ${a.last_reply_ms} ms)` : '';
+  const inboxRows = (a.inbox || []).slice(-5).reverse().map(m =>
+    '<div style="margin:4px 0; padding:4px 6px; background:#0d1117; border-left:2px solid var(--warn); border-radius:2px;">' +
+      '<div style="font-size:10px; color:var(--muted);">' + esc(when(m.t)) +
+      ' · topic=' + esc(m.topic) + ' · from=' + esc(m.from) +
+      (m.id ? ' · msg#' + m.id : '') + '</div>' +
+      '<div style="font-size:11px; white-space:pre-wrap;">' + esc(m.text || '(no text field)') + '</div>' +
+    '</div>').join('') ||
+    '<div style="color:var(--muted); font-size:11px;">(no messages received yet — send a test to see traffic)</div>';
+  const outboxRows = (a.outbox || []).slice(-5).reverse().map(m =>
+    '<div style="margin:4px 0; padding:4px 6px; background:#0d1117; border-left:2px solid ' +
+      (String(m.text || '').startsWith('[ERROR]') ? 'var(--danger)' : 'var(--ok)') + '; border-radius:2px;">' +
+      '<div style="font-size:10px; color:var(--muted);">' + esc(when(m.t)) +
+      ' · topic=' + esc(m.topic) +
+      (m.corr ? ' · corr=' + esc(m.corr) : '') +
+      (m.in_reply_to ? ' · reply_to#' + esc(m.in_reply_to) : '') + '</div>' +
+      '<div style="font-size:11px; white-space:pre-wrap;">' + esc(m.text || '(empty)') + '</div>' +
+    '</div>').join('') || '<div style="color:var(--muted); font-size:11px;">(no replies yet)</div>';
+  return (
+    '<div style="margin-top:14px; border-top:1px solid var(--border); padding-top:10px;">' +
+      '<div class="kv"><div class="k">Last activity</div><div class="v">' +
+        esc(when(lastActivity)) + replyLatency + '</div></div>' +
+      '<h4 style="margin:10px 0 4px; font-size:11px; color:var(--muted); text-transform:uppercase; display:flex; align-items:center; gap:4px;">' +
+        icon('inbox') + ' Received (last 5)</h4>' + inboxRows +
+      '<h4 style="margin:10px 0 4px; font-size:11px; color:var(--muted); text-transform:uppercase; display:flex; align-items:center; gap:4px;">' +
+        icon('outbox') + ' Replied (last 5)</h4>' + outboxRows +
+    '</div>'
+  );
+}
+
+// ── Capability editor (MCP servers + tools - INTERACTIVE) ─────────────────
+// MCP servers are how an agent reaches the outside world — a Mail Agent needs
+// a Gmail/Outlook/IMAP MCP server to actually read an inbox; a data agent may
+// need a Postgres MCP; a support agent a helpdesk MCP. Without authoring these
+// from the UI the operator would have to hand-edit YAML — this is the whole
+// difference between a useful agent and a demo.
+//
+// Secret handling:
+//   * The GET endpoint returns descriptor `env`/`headers` VALUES as "***".
+//   * When the operator saves, any value still "***" is treated as "keep the
+//     stored secret" — the real value is never exposed, and never wiped.
+//   * The descriptor is validated server-side; a bad one is rejected wholesale
+//     (previous file restored), never partially applied.
+//
+// This panel does NOT embed credentials in SOUL.md or the prompt; the MCP
+// server owns them in its own env. So an LLM prompt-leak attack cannot
+// exfiltrate the operator's Gmail token through a chat reply.
+function _capabilitiesInspector(agent) {
+  if (!agent) return '';
+  const mcp = agent.mcp_servers || [];
+  const tools = agent.tools || [];
+  const warnings = agent.mcp_warnings || [];
+  const idSafe = esc(agent.agent_id);
+
+  const mcpRows = mcp.map(s => {
+    const label = s.title || s.server_id;
+    const target = s.transport === 'stdio'
+      ? (s.command ? '<code style="font-size:10px;">' + esc(s.command) +
+          (s.args && s.args.length ? ' ' + esc(s.args.join(' ')) : '') + '</code>' : '')
+      : (s.url ? '<code style="font-size:10px;">' + esc(s.url) + '</code>' : '');
+    const err = s.error
+      ? '<div style="color:var(--danger); font-size:10px; margin-top:2px;">⚠ ' + esc(s.error) + '</div>'
+      : '';
+    // `_describe_handbag_capabilities()` (read path) returns full `env`/
+    // `headers` dicts (values redacted); the dedicated editor endpoints use
+    // `env_keys`/`header_keys`. Accept either so the summary and the editor
+    // stay consistent no matter which endpoint produced the entry.
+    const envCount = Array.isArray(s.env_keys) ? s.env_keys.length
+      : (s.env && typeof s.env === 'object' ? Object.keys(s.env).length : 0);
+    const envKeys = envCount ? ' · ' + envCount + ' env var(s)' : '';
+    return '<div style="padding:5px 7px; margin:3px 0; background:#0d1117; ' +
+        'border-left:2px solid ' + (s.error ? 'var(--danger)' : 'var(--accent)') + '; ' +
+        'border-radius:2px; font-size:11px; display:flex; align-items:flex-start; gap:6px;">' +
+      '<div style="flex:1; min-width:0;">' +
+        '<strong>' + esc(label) + '</strong>' +
+        (s.transport ? ' <span style="color:var(--muted);">· ' + esc(s.transport) + '</span>' : '') +
+        (s.enabled === false ? ' <span style="color:var(--warn);">(disabled)</span>' : '') +
+        (target ? ' <div style="margin-top:1px;">' + target + '</div>' : '') +
+        '<div style="color:var(--muted); font-size:10px;">id: ' + esc(s.server_id) + envKeys + '</div>' +
+        err +
+      '</div>' +
+      '<button data-mcp-edit="' + esc(s.server_id) + '" style="padding:1px 6px; font-size:10px;" title="Edit">' +
+        icon('pen') + '</button>' +
+      '<button data-mcp-del="' + esc(s.server_id) + '" class="danger" style="padding:1px 6px; font-size:10px;" title="Remove">' +
+        icon('trash') + '</button>' +
+    '</div>';
+  }).join('');
+
+  const toolRows = tools.map(t =>
+    '<code style="display:inline-block; margin:2px 4px 2px 0; font-size:10px; ' +
+      'background:#21262d; padding:1px 5px; border-radius:3px;">' + esc(t) + '</code>').join('');
+
+  const warnRows = warnings.map(w =>
+    '<div style="font-size:10.5px; color:var(--warn);">' + esc(w) + '</div>').join('');
+
+  return (
+    '<div class="caps-panel" data-agent-id="' + idSafe + '" style="margin-top:8px; ' +
+        'padding:8px; background:#0d1117; border:1px solid var(--border); border-radius:5px;">' +
+      '<div style="display:flex; align-items:center; gap:4px; font-size:10.5px; ' +
+        'color:var(--muted); margin-bottom:4px; text-transform:uppercase; letter-spacing:.05em;">' +
+        icon('plug') + ' MCP servers (' + mcp.length + ')' +
+        '<span style="flex:1;"></span>' +
+        '<button data-mcp-add="" style="padding:1px 7px; font-size:10px;">' + icon('plus') + ' Add</button>' +
+      '</div>' +
+      (mcpRows || '<div style="font-size:11px; color:var(--muted);">No MCP servers — ' +
+        'an agent reaching the outside world (e.g. Gmail/Outlook) needs one. ' +
+        'Click Add.</div>') +
+      '<div style="font-size:10.5px; color:var(--muted); margin:10px 0 4px; ' +
+        'display:flex; align-items:center; gap:4px; text-transform:uppercase; letter-spacing:.05em;">' +
+        icon('puzzle') + ' Tools (' + tools.length + ')</div>' +
+      (toolRows || '<div style="font-size:11px; color:var(--muted);">No tool libraries in this handbag.</div>') +
+      (warnRows ? '<div style="margin-top:6px;">' + warnRows + '</div>' : '') +
+      '<div style="font-size:10px; color:var(--muted); margin-top:8px; ' +
+        'border-top:1px dashed var(--border); padding-top:6px; line-height:1.4;">' +
+        'Credentials live in the MCP descriptor\'s env/headers — never in ' +
+        'SOUL.md, so a prompt-leak cannot exfiltrate them. Restart the agent ' +
+        'to apply changes.' +
+      '</div>' +
+    '</div>'
+  );
+}
+
+// Open the MCP editor modal. Loads the current descriptor (if editing) via
+// GET so pre-existing secret values are shown only as "***" sentinels.
+async function openMcpEditor(agentId, serverId) {
+  await refreshAgentCatalog();
+  $('mcp-modal-title').textContent = serverId ? ('Edit MCP: ' + serverId) : 'Add MCP server';
+  $('mcp-agent-id').value = agentId;
+  $('mcp-server-id').value = serverId || '';
+  $('mcp-server-id').disabled = !!serverId;  // id is immutable once created
+  $('mcp-title').value = '';
+  $('mcp-description').value = '';
+  $('mcp-transport').value = 'stdio';
+  $('mcp-enabled').checked = true;
+  $('mcp-command').value = '';
+  $('mcp-args').value = '';
+  $('mcp-url').value = '';
+  $('mcp-env').value = '';
+  $('mcp-headers').value = '';
+  $('mcp-timeout').value = '30';
+  $('mcp-error').textContent = '';
+  _updateMcpTransportFields();
+  if (serverId) {
+    try {
+      const data = await api('/api/agents/' + encodeURIComponent(agentId) +
+        '/mcp/' + encodeURIComponent(serverId));
+      const d = data.descriptor || {};
+      $('mcp-title').value = d.title || '';
+      $('mcp-description').value = d.description || '';
+      $('mcp-transport').value = d.transport || 'stdio';
+      $('mcp-enabled').checked = d.enabled !== false;
+      $('mcp-command').value = d.command || '';
+      $('mcp-args').value = (d.args || []).join(' ');
+      $('mcp-url').value = d.url || '';
+      $('mcp-env').value = _kvToText(d.env || {});
+      $('mcp-headers').value = _kvToText(d.headers || {});
+      $('mcp-timeout').value = d.timeout_seconds || 30;
+      _updateMcpTransportFields();
+    } catch (e) {
+      $('mcp-error').textContent = String(e.message || e);
+    }
+  }
+  $('modal-mcp').classList.add('show');
+}
+
+function _kvToText(obj) {
+  return Object.entries(obj).map(([k, v]) => k + '=' + v).join('\n');
+}
+function _textToKv(text) {
+  const out = {};
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s) continue;
+    const eq = s.indexOf('=');
+    if (eq < 0) continue;
+    out[s.slice(0, eq).trim()] = s.slice(eq + 1).trim();
+  }
+  return out;
+}
+function _updateMcpTransportFields() {
+  const t = $('mcp-transport').value;
+  const isStdio = t === 'stdio';
+  $('mcp-stdio-fields').style.display = isStdio ? 'block' : 'none';
+  $('mcp-http-fields').style.display = isStdio ? 'none' : 'block';
+}
+document.getElementById('mcp-transport').addEventListener('change', _updateMcpTransportFields);
+
+async function saveMcpDescriptor() {
+  const agentId = $('mcp-agent-id').value;
+  const serverId = $('mcp-server-id').value.trim();
+  if (!agentId || !serverId) {
+    $('mcp-error').textContent = 'server_id is required';
+    return;
+  }
+  const transport = $('mcp-transport').value;
+  const body = {
+    title: $('mcp-title').value.trim() || undefined,
+    description: $('mcp-description').value.trim() || undefined,
+    enabled: !!$('mcp-enabled').checked,
+    transport,
+    timeout_seconds: Math.max(1, parseInt($('mcp-timeout').value || '30', 10)),
+  };
+  if (transport === 'stdio') {
+    body.command = $('mcp-command').value.trim() || undefined;
+    body.args = ($('mcp-args').value.trim() ? $('mcp-args').value.trim().split(/\s+/) : []);
+    const env = _textToKv($('mcp-env').value);
+    if (Object.keys(env).length) body.env = env;
+  } else {
+    body.url = $('mcp-url').value.trim() || undefined;
+    const headers = _textToKv($('mcp-headers').value);
+    if (Object.keys(headers).length) body.headers = headers;
+  }
+  // Strip undefined so YAML stays clean.
+  for (const k of Object.keys(body)) if (body[k] === undefined) delete body[k];
+
+  try {
+    await api('/api/agents/' + encodeURIComponent(agentId) + '/mcp/' +
+      encodeURIComponent(serverId), {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    $('modal-mcp').classList.remove('show');
+    toast('MCP saved', serverId + ' configured. Restart the agent to apply.', 'ok');
+    await refreshAgents();
+    renderDetails();
+  } catch (e) {
+    $('mcp-error').textContent = String(e.message || e);
+  }
+}
+
+async function deleteMcpDescriptor(agentId, serverId) {
+  if (!confirm('Remove MCP server "' + serverId + '" from this agent?')) return;
+  try {
+    await api('/api/agents/' + encodeURIComponent(agentId) + '/mcp/' +
+      encodeURIComponent(serverId), { method: 'DELETE' });
+    toast('MCP removed', serverId + ' deleted.', 'ok');
+    await refreshAgents();
+    renderDetails();
+  } catch (e) {
+    toast('Delete failed', String(e.message || e), 'error');
+  }
+}
+
+// Delegate clicks from the capability panel (single handler, added once).
+document.addEventListener('click', (ev) => {
+  const editBtn = ev.target.closest('[data-mcp-edit]');
+  const delBtn = ev.target.closest('[data-mcp-del]');
+  const addBtn = ev.target.closest('[data-mcp-add]');
+  const panel = ev.target.closest('.caps-panel');
+  if (!panel) return;
+  const agentId = panel.dataset.agentId;
+  if (editBtn) { ev.preventDefault(); openMcpEditor(agentId, editBtn.dataset.mcpEdit); }
+  else if (delBtn) { ev.preventDefault(); deleteMcpDescriptor(agentId, delBtn.dataset.mcpDel); }
+  else if (addBtn) { ev.preventDefault(); openMcpEditor(agentId, ''); }
+});
+
+function renderDetails() {
+  const root = $('tab-details');
+  if (!root) return;
+  const botId = S.selectedBotId;
+  if (!botId) {
+    root.innerHTML = '<p style="color:var(--muted);">Select a bot on the graph or in the agent list.</p>';
+    return;
+  }
+  const entry = S.bots[botId];
+  if (!entry) {
+    root.innerHTML = '<p style="color:var(--muted);">Bot "' + esc(botId) + '" is not registered in the bus view.</p>';
+    return;
+  }
+  const spec = entry.spec || {};
+  const agent = (S.agents || []).find(a => a.agent_id === botId);
+  const topics = (agent && agent.mission_topics) || spec.inbound_routes || [];
+  const hasTopics = topics.length > 0;
+  const status = entry.status || '—';
+  // This right panel is a READ-ONLY INSPECTOR. All lifecycle control
+  // (Start / Stop / Restart / Kill / Delete) lives exclusively on the agent
+  // card in the middle panel — one single place to control a bot, so the two
+  // surfaces can never drift out of sync. What belongs here is state
+  // introspection and the conversation log, nothing that mutates the bot.
+  const killed = status === 'failed';
+  const statusBadge = killed
+    ? '<span style="display:inline-flex; align-items:center; gap:4px; padding:2px 9px; border-radius:999px; ' +
+        'background:rgba(255,45,85,.18); color:#ff2d55; font-weight:700; font-size:11px; letter-spacing:.04em; ' +
+        'animation:killed-pulse 2.2s ease-in-out infinite;">' +
+        icon('kill') + ' KILLED</span>'
+    : '<span style="display:inline-flex; align-items:center; gap:4px; padding:2px 9px; border-radius:999px; ' +
+        'background:#21262d; font-weight:600; font-size:11px;">' +
+        '<span class="status-dot ' + esc(status) + '"></span> ' + esc(String(status).toUpperCase()) + '</span>';
+  // A killed bot ALWAYS shows the crimson termination block — even when the
+  // supervisor recorded no error text. Otherwise a kill with an empty reason
+  // (some code paths set FAILED without a message) would look like a merely
+  // stopped bot, defeating the whole point of the crimson state.
+  const errorBlock = killed
+    ? '<div style="margin-top:10px; padding:9px; border:1px solid rgba(255,45,85,.45); border-radius:5px; ' +
+        'background:rgba(255,45,85,.07); box-shadow:inset 3px 0 0 #ff2d55;">' +
+        '<div style="font-size:10.5px; color:#ff2d55; font-weight:700; margin-bottom:3px; ' +
+          'display:flex; align-items:center; gap:4px;">' + icon('kill') + ' TERMINATED — kill reason / runtime error</div>' +
+        '<div style="font-size:10.5px; color:var(--text); white-space:pre-wrap; font-family:monospace;">' +
+          esc(entry.error || '(no error recorded — the bot was force-terminated)') + '</div>' +
+        '<div style="font-size:10.5px; color:var(--muted); margin-top:5px; line-height:1.4;">' +
+          'This bot is dead and will NOT auto-restart. Use the card controls to Restart, or Delete to remove it.' +
+        '</div>' +
+      '</div>'
+    : (entry.error
+        ? '<div class="kv"><div class="k">Last Error</div><div class="v" style="color:var(--danger); white-space:pre-wrap;">' + esc(entry.error) + '</div></div>'
+        : '');
+  root.innerHTML =
+    '<h3 style="margin-top:0; display:flex; align-items:center; gap:8px;">' +
+      icon('cube') + esc(botId) + statusBadge + '</h3>' +
+    '<div class="kv"><div class="k">PID</div><div class="v">' + esc(entry.pid || '—') + '</div></div>' +
+    '<div class="kv"><div class="k">Host</div><div class="v">' + esc(entry.host || '—') + '</div></div>' +
+    '<div class="kv"><div class="k">Handbag</div><div class="v">' + esc(spec.handbag_path || '—') + '</div></div>' +
+    '<div class="kv"><div class="k">Model Profile</div><div class="v">' + esc(spec.llm_profile || 'default') + '</div></div>' +
+    '<div class="kv"><div class="k">Mission Topics</div><div class="v">' +
+      (hasTopics ? esc(topics.join(', ')) : '<span style="color:var(--warn);">none — cannot receive messages</span>') +
+    '</div></div>' +
+    _capabilitiesInspector(agent) +
+    errorBlock +
+    _conversationInspector(botId) +
+    '<p style="color:var(--muted); font-size:10.5px; margin-top:12px; line-height:1.4; ' +
+      'border-top:1px solid var(--border); padding-top:8px;">' +
+      'Controls live on the agent card in the middle panel.' +
+    '</p>';
+}
+
+async function renderLogs() {
+  const root = $('log-output');
+  if (!root) return;
+  if (!S.selectedBotId) { root.textContent = '(select a bot)'; return; }
+  try {
+    const text = await api('/api/bots/' + encodeURIComponent(S.selectedBotId) + '/logs?tail=400');
+    root.textContent = text || '(no logs yet)';
+  } catch (e) {
+    root.textContent = 'Failed to load logs: ' + (e.message || e);
+  }
+}
+
+// ── Sessions / replay ────────────────────────────────────────────────────
+function renderSessions() {
+  const root = $('session-list');
+  if (!root) return;
+  if (!S.sessions || !S.sessions.length) {
+    root.innerHTML = '<p style="color:var(--muted);">No recordings yet. Press Record to start one.</p>';
+    return;
+  }
+  root.innerHTML = S.sessions.map(s => {
+    const kb = Math.round((s.size_bytes || 0) / 1024);
+    const when = new Date((s.mtime || 0) * 1000).toLocaleString();
+    return '<div class="list-item" data-session-id="' + esc(s.session_id) + '">' +
+      '<div class="name">' + icon('history') + esc(s.session_id) + '</div>' +
+      '<div class="sub">' + kb + ' KB · ' + esc(when) + '</div></div>';
+  }).join('');
+  root.querySelectorAll('[data-session-id]').forEach(el => {
+    el.onclick = () => playSession(el.dataset.sessionId);
+  });
+  updateHeaderPills();
+}
+
+async function playSession(sessionId) {
+  S.selectedSessionId = sessionId;
+  setTab('replay');
+  try {
+    const data = await api('/api/sessions/' + encodeURIComponent(sessionId) + '/events?block=true');
+    S.replay.events = data.events || [];
+    S.replay.pos = 0;
+    if (!S.replay.events.length) {
+      $('replay-output').textContent = '(empty session)';
+      return;
+    }
+    $('replay-controls').innerHTML =
+      '<button id="replay-play">' + icon('play') + ' Play</button>' +
+      '<button id="replay-stop" style="margin-left:6px;">' + icon('stop') + ' Stop</button>';
+    $('replay-play').onclick = () => _replayRun();
+    $('replay-stop').onclick = () => _replayStop();
+    $('replay-output').textContent = 'Session "' + sessionId + '" loaded — ' +
+      S.replay.events.length + ' events. Press Play.';
+  } catch (e) {
+    toast('Replay failed', String(e.message || e), 'error');
+  }
+}
+function _replayRun() {
+  if (S.replay.playing) return;
+  S.replay.playing = true;
+  S.replay.pos = 0;
+  const tick = () => {
+    if (!S.replay.playing) return;
+    if (S.replay.pos >= S.replay.events.length) { _replayStop(); return; }
+    const e = S.replay.events[S.replay.pos++];
+    const out = $('replay-output');
+    if (out) out.textContent += '\n[' + (e.kind || '?') + '] ' +
+      (e.topic || e.bot_id || '') + ' :: ' +
+      JSON.stringify(e.payload || e.status || '').slice(0, 200);
+    const delay = (e.delay || 0) * 1000;
+    S.replay.timer = setTimeout(tick, Math.min(delay, 800));
+  };
+  tick();
+}
+function _replayStop() {
+  S.replay.playing = false;
+  if (S.replay.timer) { clearTimeout(S.replay.timer); S.replay.timer = null; }
+  const out = $('replay-output');
+  if (out) out.textContent += '\n\n(replay stopped)';
+}
+
+// ── WebSocket live feed ──────────────────────────────────────────────────
+function handleLiveMessage(data) {
+  if (!data || !data.type) return;
+  if (data.type === 'snapshot') {
+    S.bots = data.bots || {};
+    S.topics = data.topics || [];
+    ensureLayout();
+    renderGraph();
+    renderBotList();
+    renderTopics();
+    return;
+  }
+  if (data.type === 'message') {
+    const payload = data.payload || {};
+    const isReply = !!payload.in_reply_to_msg_id && S.bots[data.sender] &&
+                    data.topic && data.topic.endsWith('.reply');
+    const isError = data.topic && data.topic.endsWith('.error') && S.bots[data.sender];
+    if (isError) markError(data.sender, data);
+    else if (isReply) markTalking(data.sender, data);
+    else if (data.topic) markThinking(data.topic, data);
+    _markEdgeHot(data.sender, data.topic);
+    const t = (S.topics || []).find(x => x.topic === data.topic);
+    if (t) {
+      t._senders = t._senders || [];
+      if (data.sender && t._senders.indexOf(data.sender) < 0) t._senders.push(data.sender);
+    }
+    renderGraph();
+  }
+}
+
+let _ws = null, _wsRetry = 0;
+function openLiveSocket() {
+  if (_ws && _ws.readyState <= 1) return;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  try { _ws = new WebSocket(proto + '//' + location.host + '/ws/events'); }
+  catch (e) { setTimeout(openLiveSocket, 4000); return; }
+  _ws.onopen = () => { _wsRetry = 0; };
+  _ws.onmessage = (ev) => {
+    try { handleLiveMessage(JSON.parse(ev.data)); }
+    catch (e) { console.warn('ws parse', e); }
+  };
+  _ws.onclose = () => {
+    _wsRetry = Math.min(_wsRetry + 1, 10);
+    setTimeout(openLiveSocket, 1000 * _wsRetry);
+  };
+  _ws.onerror = () => {};
+}
+
+// ── Full refresh ─────────────────────────────────────────────────────────
+async function fullRefresh() {
+  const tasks = [];
+  const maybe = (n) => { if (typeof window[n] === 'function') tasks.push(window[n]()); };
+  ['refreshEnv', 'refreshBots', 'refreshAgents', 'refreshTopics',
+   'refreshSessions', 'refreshHandbags', 'refreshModels',
+   'refreshAgentCatalog', 'refreshSwarm'].forEach(maybe);
+  await Promise.all(tasks);
+  renderOnboarding();
+  renderDiagnosis();
+  renderOverview();
+  updateHeaderPills();
+}
+
+// ── Boot ─────────────────────────────────────────────────────────────────
+(async () => {
+  await refreshEnv();
+  await Promise.all([refreshHandbags(), refreshModels()]);
+  await refreshAgentCatalog();
+  await fullRefresh();
+  setView('overview');
+  openLiveSocket();
+  setInterval(refreshBots, 4000);
+  setInterval(refreshAgents, 4000);
+  setInterval(refreshTopics, 4000);
+  setInterval(refreshSessions, 8000);
+  setInterval(refreshEnv, 5000);
+  setInterval(refreshSwarm, 8000);
+})();
+</script>
+<!--
+  Fallback runtime block — a second script tag so a truncated first block can
+  still load the load-bearing graph/refresher functions.
+-->
+<script>
+function ensureLayout() {
+  const ids = Object.keys(S.bots || {}).sort();
+  if (ids.length === 0) { S.layout = {}; return; }
+  const W = 900, H = 600, cx = W / 2, cy = H / 2;
+  const SINGLE_RING_MAX = 7;
+  const innerCount = ids.length <= SINGLE_RING_MAX ? ids.length : SINGLE_RING_MAX;
+  const outerCount = ids.length - innerCount;
+  const innerRadius = outerCount > 0 ? Math.min(W, H) * 0.18 : Math.min(W, H) * 0.35;
+  const outerRadius = Math.min(W, H) * 0.40;
+  const positions = {};
+  ids.slice(0, innerCount).forEach((id, i) => {
+    const angle = (i / innerCount) * Math.PI * 2 - Math.PI / 2;
+    positions[id] = { x: cx + innerRadius * Math.cos(angle), y: cy + innerRadius * Math.sin(angle) };
+  });
+  if (outerCount > 0) {
+    ids.slice(innerCount).forEach((id, i) => {
+      const angle = ((i + 0.5) / outerCount) * Math.PI * 2 - Math.PI / 2;
+      positions[id] = { x: cx + outerRadius * Math.cos(angle), y: cy + outerRadius * Math.sin(angle) };
+    });
+  }
+  S.layout = positions;
+}
+
+function renderGraph() {
+  const svg = document.getElementById('svg');
+  if (!svg) return;
+  svg.setAttribute('viewBox', '0 0 900 600');
+  svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+  const bots = Object.values(S.bots || {});
+  const parts = [];
+  const botIds = new Set(bots.map(b => (b && b.spec && b.spec.bot_id) || ''));
+  for (const bot of bots) {
+    const spec = (bot && bot.spec) || {};
+    const botId = spec.bot_id;
+    if (!botId || !S.layout[botId]) continue;
+    const me = S.layout[botId];
+    const routes = spec.inbound_routes || [];
+    for (const t of S.topics || []) {
+      if (routes.indexOf(t.topic) < 0) continue;
+      const senders = t._senders || [];
+      for (const s of senders) {
+        if (!botIds.has(s) || !S.layout[s] || s === botId) continue;
+        const src = S.layout[s];
+        const hot = (typeof _edgeIsHot === 'function') && _edgeIsHot(s, t.topic);
+        parts.push('<line class="edge' + (hot ? ' active' : '') + '" x1="' +
+          src.x + '" y1="' + src.y + '" x2="' + me.x + '" y2="' + me.y + '"></line>');
+      }
+    }
+  }
+  for (const bot of bots) {
+    const spec = (bot && bot.spec) || {};
+    const botId = spec.bot_id;
+    if (!botId || !S.layout[botId]) continue;
+    const pos = S.layout[botId];
+    const status = (typeof _botStateClass === 'function')
+      ? _botStateClass(bot) : (bot.status || 'pending');
+    const act = (typeof _activity === 'function') ? _activity(botId) : { state: 'sleep' };
+    // Activity emotions (think/talk) only apply while the bot is LIVE.
+    // A killed/stopped/failed bot must never animate as if it were working —
+    // that would falsely suggest the agent is still processing messages.
+    const live = status === 'running' || status === 'starting' || status === 'pending';
+    const emotion = (live && act.state && act.state !== 'sleep') ? ' ' + act.state : '';
+    const cls = 'node ' + status + emotion +
+      (bot.host && bot.host !== (S.env && S.env.host) ? ' remote' : '');
+    parts.push('<g class="' + cls + '" data-bot-id="' + esc(botId) + '" ' +
+      'transform="translate(' + pos.x + ',' + pos.y + ')">' + _avatarSvg() +
+      '<text y="38">' + esc(botId) + '</text></g>');
+  }
+  svg.innerHTML = parts.join('');
+  svg.querySelectorAll('g.node').forEach(g => {
+    g.style.cursor = 'pointer';
+    g.onclick = () => selectBot(g.dataset.botId);
+  });
+}
+
+const _edgeHotMap = {};
+function _edgeIsHot(sender, topic) {
+  const t = _edgeHotMap[sender + '\u0000' + topic];
+  return !!t && (Date.now() - t) < 1200;
+}
+function _markEdgeHot(sender, topic) {
+  if (!sender || !topic) return;
+  _edgeHotMap[sender + '\u0000' + topic] = Date.now();
+}
+
+function _avatarSvg() {
+  return (
+    '<circle class="halo" r="26"></circle>' +
+    '<rect class="avatar-head" x="-16" y="-14" width="32" height="28" rx="6"></rect>' +
+    '<line class="avatar-antenna" x1="0" y1="-14" x2="0" y2="-22"></line>' +
+    '<circle class="avatar-tip" cx="0" cy="-24" r="2.5"></circle>' +
+    '<circle class="avatar-eye" cx="-6" cy="0" r="2.4"></circle>' +
+    '<circle class="avatar-eye" cx="6"  cy="0" r="2.4"></circle>' +
+    '<path class="avatar-mouth" d="M -6 8 Q 0 11 6 8"></path>' +
+    '<g class="smoke"><text x="18" y="-14">~</text>' +
+    '<text x="22" y="-20">~</text><text x="14" y="-24">~</text></g>'
+  );
+}
+
+// Classify a bot into a CSS state class. Precedence matters: a KILLED bot
+// must never be reported as merely "failed" (that state auto-restarts on
+// some supervisors). We detect kill by the supervisor's error signature.
+function _botStateClass(bot) {
+  const status = (bot && bot.status) || 'pending';
+  const error = String((bot && bot.error) || '').toLowerCase();
+  if (status === 'failed') {
+    // supervisor.kill() writes FAILED with the operator's explicit intent;
+    // a self-declared FAILED carries a startup error instead. We treat any
+    // FAILED as "killed" visually (crimson skull) because both need the same
+    // operator attention: nothing is running and nothing will restart on
+    // its own. The health panel distinguishes the two with precise wording.
+    return 'killed';
+  }
+  return status;
+}
+
+function renderBotList() {
+  if (typeof renderAgents === 'function') renderAgents();
+}
+</script>
+</body>
+</html>
