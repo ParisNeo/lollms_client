@@ -2,7 +2,9 @@
 # CoreMixin: __init__, class factories, __getattr__/__setattr__ proxy,
 # internal DB helpers, message CRUD, data-zone assembly, and discussion-level image methods.
 
+import os
 import re
+import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
@@ -10,6 +12,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, Union, Optional
 
 from sqlalchemy.orm.exc import NoResultFound
+from sqlalchemy.exc import PendingRollbackError
 from ascii_colors import ASCIIColors, trace_exception
 
 from lollms_client.lollms_artefact import (
@@ -53,6 +56,11 @@ class CoreMixin:
             auto_sync_workspace: bool = True,
             _from_db_reload: bool = False,
         ):
+            _init_t0 = time.perf_counter()
+            ASCIIColors.info(
+                f"[CoreMixin] __init__ START (reload={_from_db_reload}, "
+                f"workspace_path={workspace_path!r})"
+            )
             object.__setattr__(self, 'lollmsClient', lollmsClient)
             object.__setattr__(self, 'autosave', autosave)
             object.__setattr__(self, 'max_context_size', max_context_size)
@@ -72,7 +80,7 @@ class CoreMixin:
             # Resolve clean isolated directory paths
             resolved_id = discussion_id or (db_discussion_obj.id if db_discussion_obj else "viewer_session")
 
-            # ── RESTORE PERSISTED WORKSPACE PATH ──
+            # ── RESTORE PERSISTED WORKSPACE PATH (early, when obj is supplied) ──
             if not workspace_path and db_discussion_obj is not None:
                 saved_meta = getattr(db_discussion_obj, 'discussion_metadata', None) or {}
                 if isinstance(saved_meta, dict) and saved_meta.get("workspace_path"):
@@ -86,10 +94,19 @@ class CoreMixin:
             # layout keeps the isolated workspace_data/artefacts_metadata tree.
             custom_workspace = bool(workspace_path)
             if custom_workspace:
-                parent_dir = Path(workspace_path)
+                parent_dir = Path(workspace_path).resolve()
+                # Defensive normalization: strip a trailing "workspace_data"
+                # segment so legacy persisted paths still land on a clean root.
+                if parent_dir.name == "workspace_data" and parent_dir.parent.name:
+                    parent_dir = parent_dir.parent
                 parent_dir.mkdir(parents=True, exist_ok=True)
                 ws_data_dir = parent_dir
-                metadata_dir = parent_dir / ".artefacts_metadata"
+                # Keep bookkeeping OUT of the user-owned external tree: the
+                # custom workspace must remain byte-for-byte the caller's own.
+                # A sibling `<parent>_artefacts` folder holds the metadata so we
+                # never create `.artefacts_metadata/` inside a repo the user
+                # owns (which would pollute their Git status / project tree).
+                metadata_dir = parent_dir.parent / f"{parent_dir.name}_artefacts"
                 metadata_dir.mkdir(parents=True, exist_ok=True)
             else:
                 parent_dir = Path("./data_workspace") / "discussions" / resolved_id
@@ -104,6 +121,21 @@ class CoreMixin:
             object.__setattr__(self, '_workspace_path_val', str(parent_dir.resolve()))
             object.__setattr__(self, 'workspace_data_path', str(ws_data_dir.resolve()))
             object.__setattr__(self, 'artefacts_metadata_path', str(metadata_dir.resolve()))
+
+            # ── AGENTIC MODE: CUSTOM WORKSPACE ⇒ NO .versions, NO DEEP SCAN ──
+            # A user-supplied workspace may contain hundreds of thousands of files.
+            # Enumerating it at session creation (via ArtefactManager._sync_index_with_disk
+            # and sync_workspace_to_artefacts) would hang the UI for minutes. In agentic
+            # mode we disable artefact versioning (no .versions/ snapshots, no .lam twins)
+            # and skip the initial deep scan entirely. Only files the LLM explicitly
+            # writes via <artifact> (or unlocks) are tracked. The host app or external
+            # Git owns versioning and disk reconciliation for a custom workspace.
+            object.__setattr__(self, 'disable_artefact_versioning', custom_workspace)
+            if custom_workspace:
+                ASCIIColors.info(
+                    f"[CoreMixin] Agentic workspace mode enabled for '{parent_dir}' "
+                    f"(versioning off, deep scan skipped)."
+                )
 
             object.__setattr__(self, 'db_manager', db_manager)
             object.__setattr__(self, '_is_db_backed', db_manager is not None)
@@ -145,6 +177,32 @@ class CoreMixin:
                 else:
                     object.__setattr__(self, '_is_db_backed', False)
 
+            # ── LATE WORKSPACE-RESTORE PASS ──
+            # When the discussion is loaded by `discussion_id` (not by ORM object),
+            # `db_discussion_obj` was None at the early restore point above. Now that
+            # `_db_discussion` is resolved, re-read its metadata and, if a persisted
+            # `workspace_path` exists, adopt it — repointing the session into agentic
+            # mode (versioning off, no deep scan).
+            if not custom_workspace:
+                _late_meta = getattr(self._db_discussion, 'discussion_metadata', {}) or {}
+                _late_ws = _late_meta.get("workspace_path") if isinstance(_late_meta, dict) else None
+                if _late_ws:
+                    _late_dir = Path(_late_ws).resolve()
+                    if _late_dir.name == "workspace_data" and _late_dir.parent.name:
+                        _late_dir = _late_dir.parent
+                    _late_dir.mkdir(parents=True, exist_ok=True)
+                    object.__setattr__(self, '_workspace_path_val', str(_late_dir))
+                    object.__setattr__(self, 'workspace_data_path', str(_late_dir))
+                    _late_meta_dir = _late_dir.parent / f"{_late_dir.name}_artefacts"
+                    _late_meta_dir.mkdir(parents=True, exist_ok=True)
+                    object.__setattr__(self, 'artefacts_metadata_path', str(_late_meta_dir))
+                    object.__setattr__(self, 'disable_artefact_versioning', True)
+                    custom_workspace = True
+                    ASCIIColors.info(
+                        f"[CoreMixin] Restored persisted workspace path from DB metadata: '{_late_dir}' "
+                        f"(agentic mode re-enabled, deep scan skipped)."
+                    )
+
             object.__setattr__(self, '_system_prompt',
                                getattr(self._db_discussion, 'system_prompt', None))
 
@@ -152,8 +210,59 @@ class CoreMixin:
             images_data = metadata.get("discussion_images", [])
             object.__setattr__(self, 'images', images_data)
 
+            # ── PERSIST THE CUSTOM WORKSPACE PATH FOR RELOAD ──
+            # Persisting the path in discussion_metadata is what lets agentic mode
+            # survive a session reload: on next construction, the path is restored
+            # above and custom_workspace flips back to True.
+            #
+            # CRITICAL: the creation-time auto-sync below is skipped when
+            # `_from_db_reload` is True, and even on a genuine create the sync
+            # path can be bounded/short-circuited. So we explicitly commit the
+            # metadata write here: otherwise the pending transaction is discarded
+            # when `create_new`'s fresh session is closed, and the reload path
+            # never sees `workspace_path`.
+            if custom_workspace:
+                try:
+                    existing_meta = dict(getattr(self._db_discussion, 'discussion_metadata', {}) or {})
+                    if existing_meta.get("workspace_path") != self.workspace_data_path:
+                        existing_meta["workspace_path"] = self.workspace_data_path
+                        setattr(self._db_discussion, 'discussion_metadata', existing_meta)
+                        # SQLAlchemy's JSON column uses dict identity for change
+                        # tracking; a plain setattr may or may not be detected.
+                        # Force-flag `flag_modified` so the UPDATE always fires.
+                        try:
+                            from sqlalchemy.orm.attributes import flag_modified
+                            flag_modified(self._db_discussion, 'discussion_metadata')
+                        except Exception:
+                            pass
+                        # Commit immediately so the persisted path survives the
+                        # session lifecycle of `create_new`/`get_discussion`.
+                        if self._is_db_backed and self._session is not None:
+                            try:
+                                self._session.commit()
+                            except Exception as commit_ex:
+                                ASCIIColors.warning(
+                                    f"[CoreMixin] Failed to commit workspace_path metadata: {commit_ex}"
+                                )
+                except Exception as persist_ex:
+                    ASCIIColors.warning(f"[CoreMixin] Failed to persist workspace_path in metadata: {persist_ex}")
+
             object.__setattr__(self, 'artefacts', ArtefactManager(self, skip_sync_on_load=_from_db_reload))
 
+            # Creation-time workspace ingestion. This is required in BOTH modes:
+            #  - Managed mode (default layout): a full scan is cheap and desired.
+            #  - Agentic mode (custom workspace): the user still expects their
+            #    existing files to be registered as artefacts immediately. The
+            #    old `not self.disable_artefact_versioning` guard silently
+            #    disabled this in agentic mode, so a freshly created discussion
+            #    against a populated workspace showed ZERO files until the host
+            #    manually called sync_workspace_to_artefacts().
+            #
+            # sync_workspace_to_artefacts() is safe here in agentic mode:
+            #   • it is bounded (agentic cap = 2000 files, no purge),
+            #   • it never writes .versions/ or .lam twins (that gate lives in
+            #     ArtefactManager and is independent of enumeration),
+            #   • registration uses _save_all() which does not re-enter sync.
             if auto_sync_workspace and not _from_db_reload:
                 try:
                     self.sync_workspace_to_artefacts()
@@ -161,6 +270,13 @@ class CoreMixin:
                     ASCIIColors.warning(f"[CoreMixin] Auto-ingestion/heal of workspace files failed: {sync_ex}")
 
             self._init_memory(memory_manager)
+
+            _init_elapsed = time.perf_counter() - _init_t0
+            _mode = "agentic" if getattr(self, "disable_artefact_versioning", False) else "managed"
+            ASCIIColors.info(
+                f"[CoreMixin] __init__ END (reload={_from_db_reload}, mode={_mode}) "
+                f"took {_init_elapsed:.3f}s"
+            )
 
 # ---------------------------------------------------------------- factories
 
@@ -292,29 +408,42 @@ class CoreMixin:
         parent_dir.mkdir(parents=True, exist_ok=True)
 
         ws_data_dir = parent_dir
-        metadata_dir = parent_dir / ".artefacts_metadata"
+        # Sibling bookkeeping dir (never inside the user's external tree), so
+        # repointing a discussion at a user workspace leaves that workspace
+        # pristine (no `.artefacts_metadata/` polluting their project).
+        metadata_dir = parent_dir.parent / f"{parent_dir.name}_artefacts"
         metadata_dir.mkdir(parents=True, exist_ok=True)
 
         object.__setattr__(self, '_workspace_path_val', str(parent_dir))
         object.__setattr__(self, 'workspace_data_path', str(ws_data_dir))
         object.__setattr__(self, 'artefacts_metadata_path', str(metadata_dir))
 
-        # Re-anchor ArtefactManager
+        # ── AGENTIC MODE: CUSTOM WORKSPACE ⇒ NO .versions, NO DEEP SCAN ──
+        # Repointing into a user-supplied workspace switches the session to agentic
+        # mode: versioning is disabled (no .versions/ snapshots, no .lam twins) and
+        # the initial deep scan is skipped, keeping UI responsive on huge trees.
+        object.__setattr__(self, 'disable_artefact_versioning', True)
+
+        # Re-anchor ArtefactManager (its __init__ deep scan is gated by
+        # _is_versioning_enabled(), so it short-circuits in agentic mode).
         object.__setattr__(self, 'artefacts', ArtefactManager(self))
 
-        # Invalidate cached context telemetry
+        # Persist the new workspace path so agentic mode survives reload, and
+        # invalidate cached context telemetry so the next prompt reflects reality.
         meta = dict(getattr(self, 'metadata', {}) or {})
+        meta["workspace_path"] = str(ws_data_dir)
         if "_token_cache" in meta:
             meta["_token_cache"] = {}
-            self.metadata = meta
+        self.metadata = meta
 
-        # Full context refresh & disk synchronization
+        # In agentic mode sync_workspace_to_artefacts() is a no-op (flag-gated),
+        # so this is cheap and safe to call for the report shape.
         sync_report = self.sync_workspace_to_artefacts()
         self.touch()
         if self._is_db_backed:
             self.commit()
 
-        ASCIIColors.success(f"[LollmsDiscussion] Workspace repointed to: {parent_dir} (Context refreshed)")
+        ASCIIColors.success(f"[LollmsDiscussion] Workspace repointed to: {parent_dir} (agentic mode: versioning off, no deep scan)")
         return sync_report
 
     def __setattr__(self, name, value):
@@ -322,7 +451,7 @@ class CoreMixin:
             'lollmsClient', 'client', 'db_manager', 'autosave', 'max_context_size', 'scratchpad',
             'images', 'artefacts', '_workspace_path_val', 'workspace_data_path', 'artefacts_metadata_path',
             '_session', '_db_discussion', '_message_index', '_messages_to_delete_from_db',
-            '_is_db_backed', '_system_prompt',
+            '_is_db_backed', '_system_prompt', 'disable_artefact_versioning',
         ]
         if name == 'workspace_path':
             self.set_workspace_path(value) if value else object.__setattr__(self, '_workspace_path_val', None)
@@ -523,18 +652,24 @@ class CoreMixin:
             if not self._session.is_active:
                 return
 
-            # Clean up pending rollback states before attempting changes
+            # ── HEAL A PENDING-ROLLBACK SESSION ──
+            # A prior flush/commit failure (e.g. "database is locked") leaves
+            # the Session where every subsequent operation raises
+            # PendingRollbackError until rollback() is issued. Probe with a
+            # flush; if it signals that state, reset the session and bail (the
+            # failed transaction's pending changes were already lost, but the
+            # session must be made usable again for the next turn).
             try:
                 self._session.flush()
-            except Exception as e:
-                if "rollback" in str(e).lower():
-                    try:
-                        self._session.rollback()
-                    except Exception:
-                        pass
+            except Exception as flush_err:
+                if isinstance(flush_err, PendingRollbackError) or "rollback" in str(flush_err).lower():
+                    self._reset_session_after_failure()
+                    return
+                # Other flush errors (e.g. a transient lock) fall through; the
+                # commit retry loop below handles them.
 
             if self._messages_to_delete_from_db:
-                for msg_id in self._messages_to_delete_from_db:
+                for msg_id in list(self._messages_to_delete_from_db):
                     try:
                         msg_to_del = self._session.get(self.db_manager.MessageModel, msg_id)
                         if msg_to_del:
@@ -542,6 +677,7 @@ class CoreMixin:
                     except Exception as del_err:
                         ASCIIColors.warning(f"Message deletion error deferred: {del_err}")
                 self._messages_to_delete_from_db.clear()
+
             try:
                 _dobj = getattr(self, "_db_discussion", None)
                 if _dobj is not None:
@@ -551,21 +687,69 @@ class CoreMixin:
                         _dobj.updated_at = _dobj.created_at
             except Exception:
                 pass
-            try:
-                self._session.commit()
-                self._rebuild_message_index()
-            except Exception as e:
-                # Trace the specific DB error before rolling back
-                trace_exception(e)
+
+            # ── COMMIT WITH SQLITE "database is locked" RETRY ──
+            # WAL allows concurrent readers, but a writer competing with another
+            # writer (a tool subprocess, a second Session on the same file, the
+            # discussion's own auto-created DB writer, ...) raises
+            # OperationalError("database is locked") once busy_timeout expires.
+            # This is transient: roll back, re-bind the discussion, back off and
+            # retry before giving up.
+            max_attempts = 5
+            for attempt in range(1, max_attempts + 1):
                 try:
-                    self._session.rollback()
-                except Exception:
-                    pass
-                # Reset indices silently so session can heal on next turn
-                try:
+                    self._session.commit()
                     self._rebuild_message_index()
-                except Exception:
-                    pass
+                    return
+                except Exception as e:
+                    if self._is_lock_contention(e) and attempt < max_attempts:
+                        try:
+                            self._session.rollback()
+                        except Exception:
+                            pass
+                        try:
+                            if self._db_discussion not in self._session:
+                                self._db_discussion = self._session.merge(self._db_discussion)
+                        except Exception:
+                            pass
+                        time.sleep(0.05 * (2 ** (attempt - 1)))
+                        continue
+                    # Non-retryable error, or lock retries exhausted.
+                    trace_exception(e)
+                    self._reset_session_after_failure()
+                    return
+
+    @staticmethod
+    def _is_lock_contention(exc: Exception) -> bool:
+        """True when ``exc`` is a transient SQLite lock-contention error."""
+        if isinstance(exc, PendingRollbackError):
+            return False
+        msg = str(exc).lower()
+        return "database is locked" in msg or "database table is locked" in msg
+
+    def _reset_session_after_failure(self):
+        """
+        Rolls back the session and re-binds the discussion ORM object so the
+        Session is usable again after a failed flush/commit.
+
+        A failed flush leaves SQLAlchemy's Session in a state where every
+        subsequent operation raises PendingRollbackError. The only escape is
+        ``rollback()`` followed by re-merging any detached ORM objects, then
+        rebuilding the in-memory message index from a clean transaction.
+        """
+        try:
+            self._session.rollback()
+        except Exception:
+            pass
+        try:
+            if self._db_discussion is not None and self._db_discussion not in self._session:
+                self._db_discussion = self._session.merge(self._db_discussion)
+        except Exception:
+            pass
+        try:
+            self._rebuild_message_index()
+        except Exception:
+            pass
 
     def close(self):
         if self._session:
@@ -889,32 +1073,52 @@ class CoreMixin:
             return "image"
         return "document"
 
-    def _is_lightweight_text_file(self, f_path: Path, file_ext: str) -> bool:
+    def _is_lightweight_text_file(self, f_path, file_ext: str, max_size: int = 5 * 1024 * 1024) -> bool:
+        """True when a workspace file is small enough text to cache in the DB.
+
+        Called from ``sync_workspace_to_artefacts`` as
+        ``self._is_lightweight_text_file(f_path, file_ext)``. The previous
+        signature declared ``(self, file_ext, max_size)`` but the caller passed
+        ``(f_path, file_ext)``, so ``file_ext`` was actually a ``Path`` and the
+        membership test always failed — every file fell through to the binary
+        branch and no text artefact was ever registered. The old body also used
+        a broken ``("a" or "b" or ...)`` expression which evaluates to the first
+        truthy literal only.
         """
-        Returns True when the file should be read as text and its content stored
-        in the DB at FULL visibility. A file qualifies when its extension is in
-        the lightweight text set, or when it decodes cleanly as UTF-8 without
-        null bytes (catches extensionless or unusual text files).
-        """
-        if file_ext in self._LIGHTWEIGHT_TEXT_EXTS:
-            return True
-        if file_ext in {".db", ".sqlite", ".sqlite3", ".xlsx", ".xls", ".parquet",
-                        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg",
-                        ".zip", ".tar", ".gz", ".7z", ".rar", ".pdf", ".docx", ".pptx",
-                        ".odt", ".mp3", ".wav", ".ogg", ".flac", ".mp4", ".avi", ".mov",
-                        ".webm", ".bin", ".safetensors", ".gguf", ".pkl", ".onnx"}:
+        _TEXT_EXTS = {
+            ".text", ".py", ".js", ".ts", ".jsx", ".tsx", ".md", ".txt",
+            ".json", ".yaml", ".yml", ".xml", ".rst", ".csv", ".log",
+            ".ini", ".toml", ".cfg", ".conf", ".html", ".htm", ".css",
+            ".sh", ".bash", ".sql", ".tex", ".r", ".lua", ".rb", ".go",
+            ".java", ".c", ".cpp", ".h", ".hpp", ".rs", ".php", ".kt",
+        }
+        ext = (file_ext or "").lower()
+        if ext not in _TEXT_EXTS:
             return False
         try:
-            with open(f_path, 'rb') as f:
-                chunk = f.read(4096)
-            return b'\x00' not in chunk
-        except Exception:
+            return Path(f_path).stat().st_size <= max_size
+        except OSError:
             return False
-
-    def sync_workspace_to_artefacts(self) -> Dict[str, int]:
+    def sync_workspace_to_artefacts(
+        self,
+        enumerate_workspace: bool = True,
+        max_files: Optional[int] = None,
+    ) -> Dict[str, int]:
         """
         Performs filesystem-as-source-of-truth synchronization between the physical
         workspace_data directory and the LollmsDiscussion Artefact database.
+
+        Args:
+            enumerate_workspace: ``None`` (default) resolves by workspace mode:
+                agentic workspaces are heal-only (no disk walk); managed
+                workspaces enumerate fully. Pass ``True`` to force enumeration
+                (bounded in agentic mode) or ``False`` to force heal-only.
+            max_files: Hard safety ceiling on how many files may be registered in
+                a single agentic enumeration pass. ``None`` resolves to
+                ``2000`` for agentic workspaces and is unlimited for the managed
+                default workspace. This keeps an explicit sync on a massive user
+                tree bounded; files beyond the cap remain reachable via the
+                workspace tools and register lazily on write/unlock.
 
         Disk is the single source of truth for existence and content. Visibility
         is a security gate, NOT a sync side-effect:
@@ -940,13 +1144,47 @@ class CoreMixin:
         """
         from lollms_client.lollms_artefact import ArtefactVisibility
 
-        # ── CHAT-MIXIN FLAG GATE: VERSIONING OFF ⇒ NO WORKSPACE ENUMERATION ──
-        # When the discussion disables artefact versioning (agentic mode with a
-        # custom workspace that may contain millions of files), we MUST NOT walk
-        # the workspace. Blind enumeration would kill the session. Only files the
-        # LLM explicitly writes via <artifact> are tracked in that mode.
-        if getattr(self, "disable_artefact_versioning", False):
+        agentic_mode = bool(getattr(self, "disable_artefact_versioning", False))
+
+        # ── ENUMERATION DEFAULT RESOLUTION ────────────────────────────────────
+        # ``enumerate_workspace=None`` means "auto": honour the workspace mode.
+        #   • Agentic (custom user tree): default to heal-only (no disk walk).
+        #     A blind ``rglob`` over a potentially enormous external tree at
+        #     sync time would hang the session. Callers that genuinely need a
+        #     one-shot enumeration must pass ``enumerate_workspace=True``.
+        #   • Managed (library default workspace): default to full enumeration,
+        #     preserving the historical filesystem-as-source-of-truth behaviour.
+        # An explicit ``True``/``False`` is always respected verbatim.
+        if enumerate_workspace is None:
+            enumerate_workspace = not agentic_mode
+
+        # ── ENUMERATION POLICY ────────────────────────────────────────────────
+        # "Disable versioning" (agentic) must NOT mean "make the workspace
+        # invisible". Two distinct behaviours are decoupled here:
+        #
+        #   • Versioning (`.versions/` snapshots, `.lam` twins) is OFF whenever
+        #     the workspace is agentic — that gate lives in ArtefactManager and
+        #     is never overridden by this method.
+        #   • Enumeration (registering files as artefacts so the LLM can SEE
+        #     them) is still performed on an EXPLICIT sync request. The
+        #     construction-time auto-sync is guarded at its call site and never
+        #     reaches here in agentic mode, so huge user trees are not scanned
+        #     implicitly at session creation.
+        #
+        # A bounded file budget prevents an explicit sync on a pathological
+        # workspace from hanging the UI.
+        if not enumerate_workspace:
             return {"new_artefacts": 0, "updated_artefacts": 0, "deleted_artefacts": 0}
+
+        if agentic_mode:
+            effective_max_files = 2000 if max_files is None else max_files
+        else:
+            effective_max_files = max_files  # unlimited by default in managed mode
+
+        # Defensive reset: if a prior sync aborted mid-pass, the bulk flag could
+        # still be set on the manager. Clear it before doing anything else so a
+        # stale flag never suppresses a future legitimate commit.
+        object.__setattr__(self.artefacts, "_bulk_sync_active", False)
 
         ws_data_path = getattr(self, 'workspace_data_path', None)
         if not ws_data_path:
@@ -958,22 +1196,133 @@ class CoreMixin:
         report = {"new_artefacts": 0, "updated_artefacts": 0, "deleted_artefacts": 0}
 
         # --- 1. DISK AS SOURCE OF TRUTH: PURGE DELETED ARTIFACTS FROM DB ---
-        purged_titles = self.artefacts._sync_index_with_disk()
-        report["deleted_artefacts"] = len(purged_titles)
+        # In agentic mode the enumeration below is BOUNDED (max_files), so the
+        # on-disk view is partial. Purging DB records from a partial view would
+        # wrongly delete artefacts whose files simply fell beyond the cap. Purge
+        # only runs when the scan is complete (managed default workspace).
+        if not agentic_mode:
+            purged_titles = self.artefacts._sync_index_with_disk()
+            report["deleted_artefacts"] = len(purged_titles)
 
-        # --- 2. WORKSPACE -> DB (Upsert Active Disk Files) ---
-        for f_path in workspace_dir.rglob("*"):
-            if not f_path.is_file():
-                continue
+        # --- 2. COLLECT DISK FILES (bounded, deterministic) ---
+        # We first collect the file descriptors into a sorted list, THEN register
+        # them. Registering while iterating interleaves `_save_all()` / `touch()`
+        # metadata commits with directory-walk state, which can drop or duplicate
+        # registrations on some filesystems. A two-phase pass is deterministic
+        # and guarantees every collected file is registered.
+        #
+        # ── PERFORMANCE: PRUNE DURING THE WALK, NOT AFTER ──
+        # `Path.rglob("*")` descends into every directory FIRST and only filters
+        # afterwards. A user workspace containing a `venv/` (~50k files),
+        # `node_modules/` (~200k files), or a `.git/` object store makes a naive
+        # walk take many seconds to minutes and performs a `stat()` on every
+        # descendant just to throw it away. We instead use `os.walk` and mutate
+        # `dirs[:]` in place so heavy/vendor/VCS directories are NEVER entered:
+        # the walk cost is proportional to the files we actually keep.
+        disk_files = []
+        # Runtime database artifacts of the discussion itself must never be
+        # registered as workspace files. auto_create_db writes discussion.db
+        # (plus SQLite WAL sidecars -shm/-wal) at the workspace root; treating
+        # them as user artefacts pollutes the artefact list and the LLM context.
+        _DB_RUNTIME_NAMES = {
+            "discussion.db", "discussion.db-shm", "discussion.db-wal",
+            "discussion.db-journal",
+        }
+        # Directories never worth walking. Names are matched case-insensitively
+        # against each directory component; ANY dot-prefixed directory is also
+        # pruned (`.git`, `.venv`, `.tox`, `.idea`, `.vscode`, `.cache`, user
+        # dot-folders, etc.) so we never descend into hidden state trees.
+        _PRUNE_DIR_NAMES = {
+            "venv", "env", "site-packages", "node_modules", "__pycache__",
+            "build", "dist", "target", "obj", "bin", "out",
+            "bower_components", "egg-info", "dist-info",
+            ".venv", ".git", ".svn", ".hg", ".tox", ".nox", ".mypy_cache",
+            ".pytest_cache", ".ruff_cache", ".idea", ".vscode", ".next",
+            ".nuxt", ".cache", ".lollms", ".lollms_code", ".lollms_metadata",
+            "htmlcov", "artefacts_metadata", ".versions", "versions",
+        }
 
+        def _prune_dir_name(name: str) -> bool:
+            low = name.lower()
+            if low.startswith("."):
+                return True  # every dot-folder is internal state — never walk
+            if low in _PRUNE_DIR_NAMES:
+                return True
+            return low.endswith(".egg-info") or low.endswith(".dist-info")
+
+        for root_str, dirnames, filenames in os.walk(workspace_dir, followlinks=False):
+            # In-place prune: os.walk will not descend into these at all.
+            dirnames[:] = [d for d in dirnames if not _prune_dir_name(d)]
+            root_path = Path(root_str)
+            for filename in filenames:
+                f_path = root_path / filename
+                if filename in _DB_RUNTIME_NAMES:
+                    continue
+                try:
+                    rel_parts = f_path.relative_to(workspace_dir)
+                except ValueError:
+                    continue
+                if _is_ignored_path(rel_parts):
+                    continue
+                disk_files.append(f_path)
+
+        disk_files.sort(key=lambda p: str(p.relative_to(workspace_dir)).replace("\\", "/"))
+
+        if effective_max_files is not None and len(disk_files) > effective_max_files:
+            ASCIIColors.warning(
+                f"[CoreMixin] sync_workspace_to_artefacts: {len(disk_files)} files found, "
+                f"registering the first {effective_max_files} (agentic enumeration cap); "
+                f"remaining files stay lazily tracked via workspace tools."
+            )
+            disk_files = disk_files[:effective_max_files]
+
+        # --- 3. WORKSPACE -> DB (Upsert Active Disk Files) ---
+        # PERFORMANCE: `artefacts.get()` re-materializes the WHOLE artefact list
+        # (with a per-entry migration copy) on every call. Calling it 3× per file
+        # is O(N²) across a sync and dominates runtime once the registry grows.
+        # Take one snapshot of the raw list up front and build an O(1) lookup
+        # keyed by title / physical_path / stem; refresh it after each write so
+        # later files see freshly-registered entries (e.g. two files with the
+        # same basename in different subfolders).
+        def _safe_version(entry) -> int:
+            try:
+                return int(entry.get("version", 1))
+            except (TypeError, ValueError):
+                return 1
+
+        raw_arts = self.artefacts._get_all_raw()
+        title_index: Dict[str, Any] = {}
+        for _a in raw_arts:
+            for _cand in (_a.get("title"), _a.get("physical_path")):
+                if not _cand:
+                    continue
+                _key = str(_cand).replace("\\", "/")
+                _prev = title_index.get(_key)
+                if _prev is None or _safe_version(_a) >= _safe_version(_prev):
+                    title_index[_key] = _a
+
+        def _lookup_existing(rel_str: str, name: str, stem: str):
+            return (
+                title_index.get(rel_str)
+                or title_index.get(name)
+                or title_index.get(Path(rel_str).name)
+                or title_index.get(stem)
+            )
+
+        # ── BULK-SYNC FAST PATH: ONE COMMIT FOR THE WHOLE PASS ──
+        # Each `artefacts.add()/update()` normally commits to the DB. Across a
+        # large enumeration that is one DB round-trip per file — the dominant
+        # cost once the directory walk is pruned. We set a transient flag that
+        # makes `_save_all()` update in-memory metadata only, then commit once
+        # after the loop (plus once more from the tail `self.commit()`).
+        object.__setattr__(self.artefacts, "_bulk_sync_active", True)
+        for f_path in disk_files:
             rel_parts = f_path.relative_to(workspace_dir)
-            if _is_ignored_path(rel_parts):
-                continue
 
             rel_str = str(rel_parts).replace("\\", "/")
             file_ext = f_path.suffix.lower()
 
-            existing_art = self.artefacts.get(rel_str) or self.artefacts.get(f_path.name) or self.artefacts.get(f_path.stem)
+            existing_art = _lookup_existing(rel_str, f_path.name, f_path.stem)
             if existing_art and _is_ignored_path(existing_art.get("title", "")):
                 continue
 
@@ -981,7 +1330,13 @@ class CoreMixin:
             atype = self._classify_artefact_type(file_ext)
 
             art_title = f_path.name
-            existing_by_name = self.artefacts.get(f_path.name)
+            # Disambiguate same-basename files in different subfolders: if the
+            # bare basename is already claimed by an artefact living at a
+            # DIFFERENT relative path, register this file under its full rel
+            # path instead. Served from the pre-built title_index — calling
+            # `self.artefacts.get()` here would re-materialize the entire list
+            # for every file, i.e. O(files x artefacts).
+            existing_by_name = title_index.get(f_path.name)
             if existing_by_name and existing_by_name.get("physical_path") and existing_by_name.get("physical_path") != rel_str:
                 art_title = rel_str
 
@@ -993,7 +1348,7 @@ class CoreMixin:
                     continue
 
                 if existing_art is None:
-                    self.artefacts.add(
+                    _new = self.artefacts.add(
                         title=art_title,
                         physical_path=rel_str,
                         artefact_type=atype,
@@ -1003,11 +1358,14 @@ class CoreMixin:
                         commit_message="Synced from disk (text content cached, unlockable)"
                     )
                     report["new_artefacts"] += 1
+                    for _k in (art_title, rel_str):
+                        if _k:
+                            title_index[str(_k).replace("\\", "/")] = _new
                 else:
                     db_content = existing_art.get("content", "")
                     if db_content != disk_content:
                         current_visibility = existing_art.get("visibility", ArtefactVisibility.TREE_UNLOCKABLE)
-                        self.artefacts.update(
+                        _upd = self.artefacts.update(
                             title=existing_art.get("title", art_title),
                             physical_path=rel_str,
                             new_content=disk_content,
@@ -1017,6 +1375,10 @@ class CoreMixin:
                             commit_message="Updated from disk (text content modified)"
                         )
                         report["updated_artefacts"] += 1
+                        if _upd:
+                            for _k in (existing_art.get("title"), rel_str):
+                                if _k:
+                                    title_index[str(_k).replace("\\", "/")] = _upd
             else:
                 # ── BINARY / NON-TEXT FILE: as-is metadata entry, no content read ──
                 # Data files (.csv/.db/.xlsx/...) are ordinary FILE artefacts; the
@@ -1032,7 +1394,7 @@ class CoreMixin:
                     f"query it, or <unlock_file> it to load a portion into context.\n"
                 )
                 if existing_art is None:
-                    self.artefacts.add(
+                    _new = self.artefacts.add(
                         title=art_title,
                         physical_path=rel_str,
                         artefact_type=atype,
@@ -1043,9 +1405,12 @@ class CoreMixin:
                         commit_message="Synced from disk (as-is entry)"
                     )
                     report["new_artefacts"] += 1
+                    for _k in (art_title, rel_str):
+                        if _k:
+                            title_index[str(_k).replace("\\", "/")] = _new
                 else:
                     if f"Size**: {file_size:,}" not in existing_art.get("content", ""):
-                        self.artefacts.update(
+                        _upd = self.artefacts.update(
                             title=existing_art.get("title", art_title),
                             physical_path=rel_str,
                             new_content=content_placeholder,
@@ -1056,6 +1421,13 @@ class CoreMixin:
                             commit_message="Updated from disk (as-is metadata)"
                         )
                         report["updated_artefacts"] += 1
+                        if _upd:
+                            for _k in (existing_art.get("title"), rel_str):
+                                if _k:
+                                    title_index[str(_k).replace("\\", "/")] = _upd
+
+        # Exit bulk mode and persist everything registered this pass in ONE commit.
+        object.__setattr__(self.artefacts, "_bulk_sync_active", False)
 
         if report["deleted_artefacts"] > 0 or report["new_artefacts"] > 0 or report["updated_artefacts"] > 0:
             meta = dict(getattr(self, 'metadata', {}) or {})

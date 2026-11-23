@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-23 14:26]
+
+- chore: remove temporary verification scripts and refine discussion module
+
 ## [2026-11-23 03:34]
 
 - chore(release): bump version to 1.22.15

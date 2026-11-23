@@ -35,6 +35,12 @@ _IGNORED_DIRS = {
 }
 
 
+# ── Module-level cache state (declared eagerly so that _get_workspace_root
+# can be probed BEFORE init_tools_library ever runs, without NameError). ──
+_CACHED_WORKSPACE_ROOT: Optional[Path] = None
+_TOOL_BINDING = None
+
+
 def init_tools_library(tool_binding=None, **kwargs):
     """Initializes the workspace tools library and caches the workspace root.
 

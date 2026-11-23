@@ -481,8 +481,28 @@ class ArtefactManager:
         object.__setattr__(self, '_discussion', discussion)
         object.__setattr__(self, 'keep_deleted_versions', getattr(discussion, 'keep_deleted_versions', False))
 
-        if not skip_sync_on_load:
+        # Agentic mode (custom workspace) disables versioning; _sync_index_with_disk()
+        # is itself flag-gated, but short-circuit here too to avoid any overhead.
+        if not skip_sync_on_load and self._is_versioning_enabled():
             self._sync_index_with_disk()
+        elif self._is_agentic_workspace():
+            # Self-heal: purge any stale .versions/ tree left behind by a previous
+            # buggy run inside the user's external workspace. Agentic mode owns no
+            # versioning state there, so the folder is pure garbage.
+            self._purge_stale_versions_dir()
+
+    def _purge_stale_versions_dir(self) -> None:
+        """Remove a stray .versions/ tree from an external agentic workspace."""
+        try:
+            stray = self._get_versions_root()
+            if stray.exists() and stray.is_dir():
+                import shutil
+                shutil.rmtree(str(stray), ignore_errors=True)
+                ASCIIColors.warning(
+                    f"[ArtefactManager] Purged stale '.versions/' from agentic workspace: {stray}"
+                )
+        except Exception as purge_ex:
+            ASCIIColors.warning(f"[ArtefactManager] Stale .versions/ purge skipped: {purge_ex}")
 
     @staticmethod
     def _sanitize_path_segments(path_str: str) -> str:
@@ -503,17 +523,48 @@ class ArtefactManager:
         return (base_ws / self._discussion.id / "workspace_data").resolve()
 
     def _get_versions_root(self) -> Path:
+        # In agentic mode this path is never created or written; callers that
+        # read it first check `_is_versioning_enabled()`. Returning the nominal
+        # path keeps read-only legacy lookups safe (they simply find nothing).
         return self._get_workspace_root() / ".versions"
+
+
+    def _is_agentic_workspace(self) -> bool:
+        """Determine whether this workspace is in agentic mode (no .versions/, no .lam).
+
+        Precedence (highest wins):
+          1. ``discussion.disable_artefact_versioning`` — an EXPLICIT bool set by the
+             host (``CoreMixin.__init__`` / ``set_workspace_path``). ``True`` forces
+             agentic mode; ``False`` forces discussion mode. An explicit flag is
+             always authoritative in BOTH directions.
+          2. Structural fallback, used ONLY when the attribute is absent (legacy
+             discussions reloaded from a pre-flag database): a workspace that is not
+             the library-managed ``.../discussions/<id>/workspace_data`` layout is
+             treated as an external, user-owned tree → agentic. This safety net
+             guarantees ``.versions/`` is never created inside an unknown user tree.
+        """
+        explicit = getattr(self._discussion, "disable_artefact_versioning", None)
+        if explicit is not None:
+            return bool(explicit)
+        # Attribute genuinely absent (legacy reload): fall back to structural detection.
+        try:
+            ws_root = self._get_workspace_root()
+        except Exception:
+            return True  # cannot resolve → never risk writing .versions
+        if ws_root.name == "workspace_data" and ws_root.parent.name == "discussions":
+            return False
+        return True
+
 
     def _is_versioning_enabled(self) -> bool:
         """Chat-mixin flag gate: True when .versions/ snapshots and .lam twins are allowed.
 
-        When the discussion sets ``disable_artefact_versioning=True`` (agentic mode
-        with potentially millions of workspace files), the ArtefactManager must
-        never create, read, or sync the ``.versions/`` folder. The host application
+        When the discussion is in agentic mode (``disable_artefact_versioning=True``
+        OR an external/user-supplied workspace), the ArtefactManager must never
+        create, read, or sync the ``.versions/`` folder. The host application
         (or external Git) owns versioning there.
         """
-        return not getattr(self._discussion, "disable_artefact_versioning", False)
+        return not self._is_agentic_workspace()
 
     def _resolve_confined_path(self, relative_path: str, ensure_parent: bool = False) -> Path:
         """
@@ -577,6 +628,14 @@ class ArtefactManager:
 
         return ""
 
+    # Keys every persisted artefact record is guaranteed to carry once migrated.
+    _REQUIRED_ARTEFACT_KEYS = frozenset({
+        "id", "type", "title", "content", "images", "image_media_types",
+        "audios", "videos", "zip", "language", "url", "tags", "visibility",
+        "status", "active", "version", "content_source", "created_at",
+        "updated_at", "commit_message", "version_tags",
+    })
+
     def _get_all_raw(self) -> List[Dict]:
         metadata = self._discussion.metadata or {}
         raw = metadata.get("_artefacts", [])
@@ -584,6 +643,15 @@ class ArtefactManager:
         dirty = False
         migrated = []
         for a in raw:
+            # Per-record fast-path: a record that already carries every required
+            # key AND has no stray 'physical_data' needs NO copy and NO field
+            # probing. This keeps the O(N*20) migration scan off the hot
+            # add()/update() path for modern records (the common case), while
+            # legacy records still flow through the full migration below.
+            if "physical_data" not in a and self._REQUIRED_ARTEFACT_KEYS <= a.keys():
+                migrated.append(a)
+                continue
+
             fixed = a.copy()
             if "physical_data" in fixed:
                 fixed.pop("physical_data")
@@ -697,8 +765,16 @@ class ArtefactManager:
             # may be synced. Writing .versions/{uuid}/ snapshots and .lam twins per
             # file is prohibitively costly. The host application (or external Git)
             # owns versioning there. We write ONLY the active file, nothing else.
-            versioning_enabled = self._is_versioning_enabled()
+            #
+            # HARD GUARD: recompute the agentic decision once, here, and reuse it
+            # for every branch of this method. A single source of truth prevents
+            # any later divergence from re-opening the .versions/ write path.
+            _agentic = self._is_agentic_workspace()
+            versioning_enabled = not _agentic
             if versioning_enabled:
+                # Never create .versions/ if the resolved versions root would land
+                # outside a managed default layout... but for extra safety we also
+                # verify the workspace itself isn't agentic (already implied).
                 versions_root.mkdir(parents=True, exist_ok=True)
 
             path_source = physical_path or title
@@ -740,13 +816,9 @@ class ArtefactManager:
                 except Exception:
                     pass
 
-            # ── MODE SPLIT: VERSION SNAPSHOTS & .LAM ARE DISCUSSION-MODE ONLY ──
-            # In agentic mode (disable_artefact_versioning=True), thousands of files
-            # may be synced. Writing .versions/{uuid}/ snapshots and .lam twins per
-            # file is prohibitively costly. The host application (or external Git)
-            # owns versioning there. We write ONLY the active file, nothing else.
-            versioning_enabled = self._is_versioning_enabled()
-
+            # Reuse the single agentic decision computed at the top of this method
+            # (`_agentic` / `versioning_enabled`). Do NOT recompute here — a second
+            # `_is_versioning_enabled()` call was a divergence risk and is removed.
             file_basename = Path(filename).name
             file_stem = Path(filename).stem
             file_ext_part = Path(filename).suffix
@@ -834,9 +906,23 @@ class ArtefactManager:
             ASCIIColors.warning(f"Failed to sync artifact '{title}' to disk: {e}")
 
     def _save_all(self, artefacts: List[Dict]):
+        current = (self._discussion.metadata or {}).get("_artefacts")
+        # Fast-path: if the caller passes the exact list object already stored,
+        # the JSON column will serialize identical bytes on commit — pure waste.
+        # (Other callers guard their own write via an `if changed` check; this
+        # protects the in-place-mutation path from accidental redundant commits.)
+        if current is artefacts:
+            return
         new_meta = (self._discussion.metadata or {}).copy()
         new_meta["_artefacts"] = artefacts
         self._discussion.metadata = new_meta
+        # Bulk-sync fast path: during a workspace enumeration we register many
+        # files in one pass. Committing per file turns an N-file sync into N DB
+        # round-trips (the dominant cost on large trees). When the caller wraps
+        # the pass in `_bulk_sync_active`, we persist the in-memory metadata only
+        # and let the caller issue ONE commit at the end.
+        if getattr(self, "_bulk_sync_active", False):
+            return
         if hasattr(self._discussion, "touch"):
             self._discussion.touch()
         if hasattr(self._discussion, "commit"):
@@ -908,6 +994,29 @@ class ArtefactManager:
     ) -> Dict[str, Any]:
         title = self._sanitize_path_segments(title)
 
+        # ── RUNTIME-ARTEFACT REJECTION (belt-and-suspenders) ──
+        # The discussion's own SQLite database (and its WAL sidecars) plus the
+        # internal `.artefacts_metadata` bookkeeping folder are runtime state,
+        # never user artefacts. Reject them here so NO registration path (disk
+        # sync, import, external tool) can pollute the artefact list or context.
+        _RUNTIME_TITLES = {
+            "discussion.db", "discussion.db-shm", "discussion.db-wal",
+            "discussion.db-journal", ".artefacts_metadata",
+        }
+        _t_name = Path(title).name
+        if _t_name in _RUNTIME_TITLES:
+            return {
+                "id": str(uuid.uuid4()),
+                "title": title,
+                "type": artefact_type,
+                "version": version,
+                "content": "",
+                "visibility": ArtefactVisibility.HIDDEN,
+                "status": ArtefactStatus.STABLE,
+                "active": False,
+                "skipped_runtime_file": True,
+            }
+
         raw_physical_path = extra_data.pop("physical_path", None)
         if raw_physical_path:
             physical_path = self._sanitize_path_segments(raw_physical_path)
@@ -964,34 +1073,73 @@ class ArtefactManager:
                     break
 
             if existing_art:
-                existing_art['content_source'] = 'disk'
-                existing_art['content'] = ""
-                existing_art['type'] = artefact_type
-                existing_art['physical_path'] = physical_path
-                existing_art['updated_at'] = datetime.utcnow().isoformat()
-                if language is not None:
-                    existing_art['language'] = language
-                existing_art['images'] = images or existing_art.get('images', [])
-                existing_art['image_media_types'] = image_media_types or existing_art.get('image_media_types', [])
-                if file_ext is not None:
-                    existing_art['file_ext'] = file_ext
-                for k, v in extra_data.items():
-                    existing_art[k] = v
-                version = existing_art.get('version', 1)
+                # ── NO-OP FAST-PATH (agentic mode) ──
+                # `add()` runs once per file during a workspace sync. For an
+                # already-registered, UNCHANGED file the legacy path still
+                # re-serialized the entire `_artefacts` array (O(N) DB commit)
+                # AND rewrote the same bytes to disk. That is the dominant cost
+                # on large trees. We compute the target state first, and skip
+                # both the commit and the disk write when nothing meaningful
+                # changed. Only `updated_at` would have differed — and that is a
+                # bookkeeping churn, not a real mutation.
+                target_type           = artefact_type
+                target_content        = ""
+                target_content_source = "disk"
+                target_physical_path  = physical_path
+                target_language       = language if language is not None else existing_art.get('language')
+                target_images         = images if images is not None else existing_art.get('images', [])
+                target_mtypes         = image_media_types if image_media_types is not None else existing_art.get('image_media_types', [])
+                target_file_ext       = file_ext if file_ext is not None else existing_art.get('file_ext')
 
                 if _is_ignored_path(physical_path or title):
-                    existing_art['visibility'] = ArtefactVisibility.HIDDEN
-                    existing_art['active'] = False
+                    target_visibility = ArtefactVisibility.HIDDEN
+                    target_active     = False
                 elif visibility:
-                    existing_art['visibility'] = visibility
-                    existing_art['active'] = (visibility == ArtefactVisibility.FULL)
+                    target_visibility = visibility
+                    target_active     = (visibility == ArtefactVisibility.FULL)
                 elif active is not None:
-                    existing_art['active'] = active
-                    existing_art['visibility'] = ArtefactVisibility.FULL if active else ArtefactVisibility.HIDDEN
+                    target_active     = active
+                    target_visibility = ArtefactVisibility.FULL if active else ArtefactVisibility.HIDDEN
+                else:
+                    target_visibility = existing_art.get('visibility')
+                    target_active     = existing_art.get('active', False)
 
-                self._save_all(artefacts)
+                changed = (
+                    existing_art.get('content_source')       != target_content_source
+                    or existing_art.get('content')           != target_content
+                    or existing_art.get('type')              != target_type
+                    or existing_art.get('physical_path')     != target_physical_path
+                    or existing_art.get('language')          != target_language
+                    or existing_art.get('images')            != target_images
+                    or existing_art.get('image_media_types') != target_mtypes
+                    or existing_art.get('file_ext')          != target_file_ext
+                    or existing_art.get('visibility')        != target_visibility
+                    or existing_art.get('active')            != target_active
+                    or any(existing_art.get(k) != v for k, v in extra_data.items())
+                )
 
-                if existing_art.get("visibility") != ArtefactVisibility.HIDDEN:
+                if changed:
+                    existing_art['content_source']    = target_content_source
+                    existing_art['content']           = target_content
+                    existing_art['type']              = target_type
+                    existing_art['physical_path']     = target_physical_path
+                    existing_art['language']          = target_language
+                    existing_art['images']            = target_images
+                    existing_art['image_media_types'] = target_mtypes
+                    existing_art['file_ext']          = target_file_ext
+                    existing_art['visibility']        = target_visibility
+                    existing_art['active']            = target_active
+                    existing_art['updated_at']        = datetime.utcnow().isoformat()
+                    for k, v in extra_data.items():
+                        existing_art[k] = v
+                    self._save_all(artefacts)
+
+                version = existing_art.get('version', 1)
+
+                # Disk write is only needed when something actually changed, OR
+                # the caller handed us explicit byte payload (they want the file
+                # written regardless of metadata state).
+                if (changed or physical_data is not None) and existing_art.get("visibility") != ArtefactVisibility.HIDDEN:
                     self._sync_to_disk_workspace(
                         title, content, version, artefact_type, language, file_ext,
                         physical_data=physical_data, physical_path=physical_path,
@@ -1030,7 +1178,17 @@ class ArtefactManager:
             mtypes = mtypes + ["image/jpeg"] * (len(imgs) - len(mtypes))
 
         now = datetime.utcnow().isoformat()
-        token_count = self._discussion.lollmsClient.count_tokens(content) if (self._discussion and self._discussion.lollmsClient) else len(content) // 4
+        # Token counting is TELEMETRY, never a hard requirement: an artefact
+        # must be storable even when the client exists but no LLM binding is
+        # active (e.g. an offline host doing disk sync, a mock client in tests).
+        # count_tokens() raises RuntimeError("LLM binding not initialized.") in
+        # that state, so we fall back to the chars/4 heuristic.
+        token_count = len(content) // 4
+        try:
+            if self._discussion and getattr(self._discussion, "lollmsClient", None):
+                token_count = self._discussion.lollmsClient.count_tokens(content)
+        except Exception:
+            token_count = len(content) // 4
         
         content_source = "disk" if disable_versioning else "db"
         db_content = content
@@ -1160,19 +1318,23 @@ class ArtefactManager:
                 bump_version=False
             )
 
-        try:
-            physical_path = latest.get("physical_path") or title
-            clean_path = self._sanitize_path_segments(physical_path)
-            filename = self._get_filename_with_ext(clean_path, atype, latest.get("language"), latest.get("file_ext"))
-            name_part, _ = os.path.splitext(filename) if '.' in filename else (filename, "")
+        # In agentic mode (external workspace) there is no .versions/ tree; the
+        # logical .lam descriptor lives only in the artefact metadata, so we must
+        # never create or write into a .versions/ folder inside the user's tree.
+        if self._is_versioning_enabled():
+            try:
+                physical_path = latest.get("physical_path") or title
+                clean_path = self._sanitize_path_segments(physical_path)
+                filename = self._get_filename_with_ext(clean_path, atype, latest.get("language"), latest.get("file_ext"))
+                name_part, _ = os.path.splitext(filename) if '.' in filename else (filename, "")
 
-            art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
-            lam_path = self._get_versions_root() / art_id / f"{name_part}.lam"
+                art_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, clean_path))
+                lam_path = self._get_versions_root() / art_id / f"{name_part}.lam"
 
-            lam_path.parent.mkdir(parents=True, exist_ok=True)
-            lam_path.write_text(new_lam_content, encoding="utf-8", errors="ignore")
-        except Exception as e:
-            ASCIIColors.warning(f"Failed to write .lam file to disk for '{title}': {e}")
+                lam_path.parent.mkdir(parents=True, exist_ok=True)
+                lam_path.write_text(new_lam_content, encoding="utf-8", errors="ignore")
+            except Exception as e:
+                ASCIIColors.warning(f"Failed to write .lam file to disk for '{title}': {e}")
 
         return updated_art
 

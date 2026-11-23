@@ -14,8 +14,26 @@ class _MessageWrapper:
     Internal wrapper to normalize dictionary-based and object-based messages 
     into a consistent interface for HistoryManager.
     """
+    @staticmethod
+    def _safe_attr(obj: Any, name: str, default: Any) -> Any:
+        """
+        Fetch an attribute without ever propagating a descriptor/accessor error.
+
+        Guards against malformed class bodies (e.g. a doubled ``@property`` that
+        leaves the descriptor object itself as the value) so that a single bad
+        message can never abort the whole history export.
+        """
+        try:
+            value = getattr(obj, name, default)
+        except Exception:
+            return default
+        if isinstance(value, property):
+            return default
+        return default if value is None and default is not None else value
+
     def __init__(self, msg: Union[Dict, Any]):
         self._original_msg = msg
+        require = self._safe_attr
         if isinstance(msg, dict):
             self.id = msg.get("id", "")
             self.sender = msg.get("sender", msg.get("role", ""))
@@ -26,14 +44,16 @@ class _MessageWrapper:
             self.images = msg.get("images", [])
             self.active_images = msg.get("active_images", [])
         else:
-            self.id = getattr(msg, "id", "")
-            self.sender = getattr(msg, "sender", getattr(msg, "role", ""))
-            self.sender_type = getattr(msg, "sender_type", getattr(msg, "role", ""))
-            self.content = getattr(msg, "content", "")
-            self.parent_id = getattr(msg, "parent_id", None)
-            self.metadata = getattr(msg, "metadata", {})
-            self.images = getattr(msg, "images", [])
-            self.active_images = getattr(msg, "active_images", [])
+            self.id = require(msg, "id", "")
+            self.sender = require(msg, "sender", require(msg, "role", ""))
+            self.sender_type = require(msg, "sender_type", require(msg, "role", ""))
+            self.content = require(msg, "content", "")
+            self.parent_id = require(msg, "parent_id", None)
+            metadata = require(msg, "metadata", {})
+            self.metadata = metadata if isinstance(metadata, dict) else {}
+            self.images = require(msg, "images", [])
+            active_images = require(msg, "active_images", [])
+            self.active_images = active_images if isinstance(active_images, list) else []
 
     def get_active_images(self) -> list:
         if hasattr(self._original_msg, 'get_active_images'):

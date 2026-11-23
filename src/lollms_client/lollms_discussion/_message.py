@@ -69,10 +69,22 @@ class LollmsMessage:
         self._discussion.touch()
 
     @property
-    def metadata(self) -> Dict[str, Any]:
-        """Dictionary of message metadata."""
+    def metadata(self) -> dict:
+        """Arbitrary message metadata (forwarded to the ORM backing store)."""
         return getattr(self._db_message, 'message_metadata', {}) or {}
 
+    @property
+    def generation_info(self) -> dict:
+        """Generation provenance + timing stats attached to this message.
+
+        Returns a dict with (among others) ``personality_name``, ``model_name``,
+        ``profile_name``, ``binding_name``, ``reasoning_effort``,
+        ``time_to_first_token_s``, ``generation_time_s``, ``generated_tokens``,
+        and ``mean_tokens_per_second``. Empty when the message predates this
+        metadata or was produced outside the LLM generation loop (e.g. a plain
+        user message).
+        """
+        return dict(self.metadata.get("generation") or {})
     @metadata.setter
     def metadata(self, value: Dict[str, Any]) -> None:
         setattr(self._db_message, 'message_metadata', value)

@@ -11442,6 +11442,32 @@ class ChatMixin:
         #    - This ensures the LLM has full situational awareness without overwhelming the context.
 
         virtual_history = []
+        # ── GENERATION PROVENANCE + TIMING TELEMETRY ──────────────────────
+        # Capture which personality/model/profile produced this turn and its
+        # timing stats (TTFT, generation time, tokens/sec). A discussion may
+        # mix personas and models, so stats are attached per assistant message
+        # via `_persist_round_state` → ai_msg.metadata["generation"].
+        try:
+            from ._generation_telemetry import GenerationTelemetry
+            _tel = GenerationTelemetry(
+                personality=personality,
+                lollms_client=self.lollmsClient,
+                reasoning_effort=reasoning_effort,
+            )
+            _tel.begin_round()
+            object.__setattr__(self, "_active_generation_telemetry", _tel)
+            _user_stream_cb = streaming_callback
+            if _user_stream_cb is not None:
+                def _telemetry_stream_callback(chunk, msg_type=None, meta=None):
+                    try:
+                        if isinstance(chunk, str):
+                            _tel.on_chunk(chunk)
+                    except Exception:
+                        pass
+                    return _user_stream_cb(chunk, msg_type, meta)
+                streaming_callback = _telemetry_stream_callback
+        except Exception as _tel_init_err:
+            ASCIIColors.warning(f"[LOLLMS_DEBUG] generation telemetry init failed: {_tel_init_err}")
         object.__setattr__(self, "_vh_append", virtual_history.append)
 
         # ── 🔄 ACTION-WINDOW RECOLLECTION PROTOCOL (Placeholder-Free) ──
@@ -11751,6 +11777,14 @@ class ChatMixin:
                         for vh in virtual_history
                     ]
                     meta = dict(ai_msg.metadata or {})
+                    _tel = getattr(self, "_active_generation_telemetry", None)
+                    if _tel is not None:
+                        try:
+                            _tel.end_round()
+                            meta["generation"] = _tel.snapshot()
+                            _tel.begin_round()
+                        except Exception as _tel_err:
+                            ASCIIColors.warning(f"[LOLLMS_DEBUG] generation telemetry persist failed: {_tel_err}")
                     meta["turn_status"] = status_override or ("cancelled" if was_cancelled else "in_progress")
                     meta["current_round"] = round_count
                     meta["virtual_history"] = vh_serializable

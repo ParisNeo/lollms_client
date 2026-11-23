@@ -82,6 +82,27 @@ handled transparently:
   the normal mutation path, so any user edit upgrades the row automatically.
 - **No user action is required** — old `.db` files just work.
 
+### 📚 Full Metadata Reference
+
+For a complete reference on metadata (storage columns, reserved keys, image groupings,
+generation telemetry, `virtual_history` replay, safe read/write patterns, and JSON
+export/import round-trips), see **[METADATA.md](./METADATA.md)**.
+
+**Quick reference:**
+
+| Level | Public accessor | ORM column | Convenience setter |
+| :--- | :--- | :--- | :--- |
+| Discussion | `discussion.metadata` | `discussion_metadata` | `set_metadata_item(name, value)` |
+| Message | `msg.metadata` | `message_metadata` | `set_metadata_item(name, value, discussion)` |
+
+Both are JSON columns (default `{}`), coerced to plain `dict` on read. Only
+JSON-serializable values survive persistence. Metadata is application state — it is
+**never** injected into the LLM context. Reserved discussion keys: `workspace_path`,
+`title`, `_token_cache`, `last_synopsis_fingerprint`. Reserved message keys:
+`generation` (surfaced read-only via `msg.generation_info`), `image_groups` /
+`image_generation_groups` (drive `active_images`), and `virtual_history` (replayed on
+export).
+
 It is composed of ten orthogonal mixins:
 1.  **`CoreMixin`**: Lifecycle, ORM proxy, message CRUD, and thread-safe DB commits.
 2.  **`ChatMixin`**: The persona-aware agentic reasoning loop (Orchestrator/Worker modes), tool execution orchestration, stream parsing, and the scientific debug-dump instrumentation layer.
