@@ -853,10 +853,32 @@ class OllamaBinding(LollmsLLMBinding):
             trace_exception(ex)
             raise RuntimeError(f"Embedding failed: {ex!s}") from ex
 
+    # Hosts that identify the Ollama Cloud subscription service. `api.ollama.com`
+    # is the model-serving endpoint while `ollama.com` is the account/billing host.
+    _CLOUD_HOST_MARKERS = ("ollama.com", "api.ollama.com")
+
+    @property
+    def is_default_local_host(self) -> bool:
+        """True when host_address is the stock local Ollama endpoint."""
+        return (self.host_address or "").rstrip("/").lower() == self.DEFAULT_HOST_ADDRESS.rstrip("/").lower()
+
     @property
     def is_cloud_subscription(self) -> bool:
-        """True when host_address points to the Ollama Cloud subscription service."""
-        return "ollama.com" in (self.host_address or "").lower()
+        """
+        True when the binding targets the Ollama Cloud subscription service.
+
+        Cloud is assumed when an API key (service_key) is configured and the host
+        is either an explicit *.ollama.com host OR the default local host (in which
+        case we infer the user simply provided a cloud key without overriding the
+        host — a very common configuration). A local server without a key is not cloud.
+        """
+        host = (self.host_address or "").lower()
+        if any(marker in host for marker in self._CLOUD_HOST_MARKERS):
+            return True
+        # A configured API key on the stock local host implies Ollama Cloud usage.
+        if self.service_key and self.is_default_local_host:
+            return True
+        return False
 
     @property
     def supports_vision(self) -> bool:
@@ -950,7 +972,11 @@ class OllamaBinding(LollmsLLMBinding):
         if not self.is_cloud_subscription:
             return {
                 "status": False,
-                "message": "Balance is only available for Ollama Cloud (host_address containing 'ollama.com'). Local Ollama servers have no balance endpoint.",
+                "message": (
+                    "Balance is only available for Ollama Cloud subscriptions. Configure an Ollama "
+                    "Cloud API key (service_key) or point host_address at 'https://ollama.com'. "
+                    "Local Ollama servers have no balance endpoint."
+                ),
             }
 
         now = time.time()
