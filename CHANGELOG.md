@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-23 22:06]
+
+- docs: add context token reporting guide
+
 ## [2026-11-23 21:31]
 
 - fix(ollama): improve cloud subscription detection and error messaging
