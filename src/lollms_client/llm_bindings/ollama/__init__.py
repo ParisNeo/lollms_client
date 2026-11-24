@@ -165,6 +165,11 @@ class OllamaBinding(LollmsLLMBinding):
         self._active_client: "ollama.Client | None" = None
         self._client_lock = threading.Lock()
         self._balance_cache: dict = {"ts": 0.0, "data": None}
+        # Optional independent credentials for the account billing/balance endpoint.
+        # The model-serving API key is not always accepted by the account web API
+        # (https://ollama.com); a session cookie or account-scoped token may be needed.
+        self.balance_cookie = kwargs.get("balance_cookie") or os.environ.get("OLLAMA_BALANCE_COOKIE")
+        self.balance_api_key = kwargs.get("balance_api_key") or os.environ.get("OLLAMA_BALANCE_API_KEY")
 
     def _resolve_think_setting(
         self,
@@ -471,6 +476,7 @@ class OllamaBinding(LollmsLLMBinding):
                     response_stream = client.chat(**chat_kwargs)
                     tracker = _ThinkingStreamTracker()
                     in_raw_think_content = False
+                    suppressed_reasoning_parts = []
 
                     for chunk in response_stream:
                         if self.is_cancelled():
@@ -867,15 +873,23 @@ class OllamaBinding(LollmsLLMBinding):
         """
         True when the binding targets the Ollama Cloud subscription service.
 
-        Cloud is assumed when an API key (service_key) is configured and the host
-        is either an explicit *.ollama.com host OR the default local host (in which
-        case we infer the user simply provided a cloud key without overriding the
-        host — a very common configuration). A local server without a key is not cloud.
+        Cloud is assumed when:
+
+            * ``host_address`` is an explicit ``*.ollama.com`` host, OR
+            * an explicit balance credential (``balance_cookie`` / ``balance_api_key``)
+            is configured, OR
+            * a ``service_key`` is configured while ``host_address`` is the stock
+            local endpoint (the user supplied a cloud key without overriding host).
+
+        This is intentionally based on binding configuration only — no ambient
+        environment variables — so the balance query always reflects how *this*
+        binding is set up.
         """
         host = (self.host_address or "").lower()
         if any(marker in host for marker in self._CLOUD_HOST_MARKERS):
             return True
-        # A configured API key on the stock local host implies Ollama Cloud usage.
+        if getattr(self, "balance_cookie", None) or getattr(self, "balance_api_key", None):
+            return True
         if self.service_key and self.is_default_local_host:
             return True
         return False
@@ -928,120 +942,350 @@ class OllamaBinding(LollmsLLMBinding):
             return None
 
     def _extract_cloud_balance(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        extracted: Dict[str, Any] = {}
-        available = self._coerce_balance_value(
-            data.get("availableBalance")
-            or data.get("balance")
-            or data.get("available_balance")
-        )
-        if available is None:
-            nested = data.get("data")
-            if isinstance(nested, dict):
-                available = self._coerce_balance_value(
-                    nested.get("availableBalance")
-                    or nested.get("balance")
-                    or nested.get("available_balance")
-                )
-        if available is not None:
-            extracted["balance"] = available
+            """
+            Normalizes the documented /api/balance payload.
 
-        included = self._coerce_balance_value(data.get("included"))
-        purchased = self._coerce_balance_value(data.get("purchased"))
-        if included is not None:
-            extracted["included"] = included
-        if purchased is not None:
-            extracted["purchased"] = purchased
-        if "balance" not in extracted and (included is not None or purchased is not None):
-            extracted["balance"] = (included or 0.0) + (purchased or 0.0)
-        return extracted
+            Standard shape::
+
+                {
+                  "included":  {"balance_usd": 12.34, "allowance_usd": 20.0,
+                                "period": {"from": "...", "until": "..."}},
+                  "purchased": {"balance_usd": 25}
+                }
+
+            Legacy plans substitute ``included`` with ``session``/``weekly`` blocks
+            carrying ``remaining_percent`` (0-100) and ``resets_at``.
+            """
+            extracted: Dict[str, Any] = {}
+
+            def _first_present(mapping: Dict[str, Any], *keys: str) -> Any:
+                """Returns the first value whose key exists (0.0 is a valid value)."""
+                for key in keys:
+                    if key in mapping and mapping[key] is not None:
+                        return mapping[key]
+                return None
+
+            included = data.get("included")
+            if isinstance(included, dict):
+                included_balance = self._coerce_balance_value(included.get("balance_usd"))
+                if included_balance is not None:
+                    extracted["included"] = included_balance
+                allowance = self._coerce_balance_value(included.get("allowance_usd"))
+                if allowance is not None:
+                    extracted["included_allowance"] = allowance
+                period = included.get("period")
+                if isinstance(period, dict):
+                    extracted["period"] = period
+                for bucket in ("session", "weekly"):
+                    block = included.get(bucket)
+                    if isinstance(block, dict):
+                        remaining_percent = block.get("remaining_percent")
+                        if remaining_percent is not None:
+                            extracted[f"included_{bucket}_remaining_percent"] = remaining_percent
+                        resets_at = block.get("resets_at")
+                        if resets_at is not None:
+                            extracted[f"included_{bucket}_resets_at"] = resets_at
+
+            purchased = data.get("purchased")
+            if isinstance(purchased, dict):
+                purchased_balance = self._coerce_balance_value(purchased.get("balance_usd"))
+                if purchased_balance is not None:
+                    extracted["purchased"] = purchased_balance
+
+            # Legacy flat shapes kept for robustness against older/team payloads.
+            # NOTE: no `or`-chain on numeric values — a genuine 0.0 balance is valid
+            # and must not fall through to a sibling field.
+            if "included" not in extracted:
+                legacy_included = self._coerce_balance_value(
+                    _first_present(data, "availableBalance", "available_balance")
+                )
+                if legacy_included is not None:
+                    extracted["included"] = legacy_included
+            if "balance" not in extracted:
+                flat_balance = self._coerce_balance_value(
+                    _first_present(data, "balance", "credits", "credit")
+                )
+                if flat_balance is not None:
+                    extracted["balance"] = flat_balance
+
+            if "balance" not in extracted and ("included" in extracted or "purchased" in extracted):
+                extracted["balance"] = (extracted.get("included") or 0.0) + (extracted.get("purchased") or 0.0)
+
+            return extracted
+
+    @staticmethod
+    def _sanitize_token(raw: Optional[str]) -> Optional[str]:
+        """Strips whitespace, surrounding quotes and a leading 'Bearer ' prefix."""
+        if not raw:
+            return None
+        cleaned = str(raw).strip()
+        if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
+            cleaned = cleaned[1:-1].strip()
+        if cleaned.lower().startswith("bearer "):
+            cleaned = cleaned[7:].strip()
+        return cleaned or None
+
+    def _balance_candidate_tokens(self) -> list[tuple[str, str]]:
+            """
+            Ordered ``(token, source)`` candidates for the balance request.
+
+            Only credentials **configured on this binding** are used (never ambient
+            environment variables, which caused stale keys to shadow the working
+            one). Precedence:
+
+              1. ``balance_api_key`` — explicit override, if the caller supplied one.
+              2. ``service_key`` — the very same key already used for inference.
+
+            Tokens are sanitized and deduplicated by value.
+            """
+            raw_sources = (
+                (self.balance_api_key, "balance_api_key"),
+                (self.service_key, "service_key"),
+            )
+            seen: set[str] = set()
+            candidates: list[tuple[str, str]] = []
+            for raw, source in raw_sources:
+                token = self._sanitize_token(raw)
+                if token and token not in seen:
+                    seen.add(token)
+                    candidates.append((token, source))
+            return candidates
+
+    @staticmethod
+    def _balance_headers_for(token: str) -> Dict[str, str]:
+        """Builds the auth headers for a specific balance token."""
+        return {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+
+    def _balance_headers(self) -> Dict[str, str]:
+        """Backward-compatible wrapper returning the primary token's headers."""
+        candidates = self._balance_candidate_tokens()
+        if not candidates:
+            return {"Accept": "application/json"}
+        return self._balance_headers_for(candidates[0][0])
+
+    def _balance_urls(self) -> list[str]:
+            """
+            Returns the only documented balance endpoint.
+
+            The Ollama Cloud API reference explicitly documents
+            ``GET https://ollama.com/api/balance`` using the same
+            ``Authorization: Bearer <token>`` key as inference. Probing alternate
+            hosts wastes the shared 10 requests/minute rate-limit budget, so we
+            target the canonical URL exclusively.
+            """
+            return [_OLLAMA_CLOUD_BALANCE_URL]
 
     def get_user_balance(self) -> Dict[str, Any]:
-        """
-        Queries the account balance from the Ollama Cloud subscription service
-        (GET https://ollama.com/api/balance). Never raises; always returns a dict.
+            """
+            Queries the account balance from ``GET https://ollama.com/api/balance``.
 
-        Available only when host_address points to ollama.com and a service key
-        is configured. Results are cached for a short window to respect the
-        endpoint's shared 10 requests/minute rate limit.
-        """
-        if not self.service_key:
-            return {
+            Auth is a plain ``Authorization: Bearer <token>`` header where ``<token>``
+            is an Ollama Cloud account API key. Only credentials **configured on this
+            binding** are used (no ambient environment variables):
+
+              1. ``balance_api_key`` — explicit override, if supplied.
+              2. ``service_key`` — the same key already used for inference.
+
+            The first token that returns 200 wins; the winning source is reported via
+            ``auth_source`` so future debugging is trivial. Never raises; always
+            returns a dict. Rate budget (10 req/min shared across keys/devices) is
+            respected via a 30s cache and a single-endpoint query.
+            """
+            if not self.is_cloud_subscription:
+                message = (
+                    "Balance is only available for Ollama Cloud subscriptions. "
+                    "Configure an Ollama Cloud service_key on this binding or point "
+                    "host_address at 'https://ollama.com'. Local Ollama servers have "
+                    "no balance endpoint."
+                )
+                ASCIIColors.error(f"[OllamaBinding.get_user_balance] {message}")
+                return {"status": False, "message": message}
+
+            now = time.time()
+            cached = self._balance_cache.get("data")
+            if cached is not None and now - self._balance_cache.get("ts", 0.0) < _BALANCE_CACHE_TTL_S:
+                return cached
+
+            candidates = self._balance_candidate_tokens()
+            if not candidates:
+                message = (
+                    "No credential configured on this binding. Set service_key (or "
+                    "balance_api_key) to your Ollama Cloud account API key."
+                )
+                ASCIIColors.error(f"[OllamaBinding.get_user_balance] {message}")
+                return {"status": False, "message": message}
+
+            url = _OLLAMA_CLOUD_BALANCE_URL
+            attempted_sources: list[str] = []
+            last_error: Dict[str, Any] = {}
+
+            for token, source in candidates:
+                attempted_sources.append(source)
+                masked = (
+                    f"{token[:6]}…{token[-4:]}(len={len(token)})"
+                    if len(token) > 12
+                    else f"(len={len(token)})"
+                )
+                ASCIIColors.info(
+                    f"[OllamaBinding.get_user_balance] Source '{source}' -> {url} {masked}"
+                )
+                try:
+                    response = requests.get(
+                        url,
+                        headers=self._balance_headers_for(token),
+                        verify=self.verify_ssl_certificate,
+                        timeout=15,
+                    )
+                except requests.exceptions.RequestException as e:
+                    last_error = {
+                        "status": False,
+                        "message": f"Failed to reach {url} using '{source}': {e}",
+                    }
+                    ASCIIColors.error(f"[OllamaBinding.get_user_balance] {last_error['message']}")
+                    continue
+
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    try:
+                        retry_seconds = int(retry_after) if retry_after is not None else None
+                    except ValueError:
+                        retry_seconds = None
+                    message = (
+                        "Rate limited by the Ollama Cloud balance endpoint "
+                        "(10 requests/minute shared across API keys and devices)."
+                    )
+                    ASCIIColors.warning(
+                        f"[OllamaBinding.get_user_balance] {message} retry_after={retry_seconds}"
+                    )
+                    return {
+                        "status": False,
+                        "message": message,
+                        "retry_after": retry_seconds,
+                        "status_code": 429,
+                    }
+
+                if response.status_code in (401, 403):
+                    last_error = {
+                        "status": False,
+                        "message": (
+                            f"{url} rejected '{source}' (HTTP {response.status_code}, "
+                            f"body={response.text.strip()[:200]!r}). The configured "
+                            "service_key is not accepted by the account balance endpoint. "
+                            "Verify it is the account API key from "
+                            "https://ollama.com/settings/keys (team/org inference keys "
+                            "may be rejected here), or set balance_api_key explicitly "
+                            "on this binding."
+                        ),
+                        "status_code": response.status_code,
+                    }
+                    ASCIIColors.error(f"[OllamaBinding.get_user_balance] {last_error['message']}")
+                    continue
+
+                if response.status_code != 200:
+                    last_error = {
+                        "status": False,
+                        "message": (
+                            f"{url} returned HTTP {response.status_code} "
+                            f"for source '{source}'."
+                        ),
+                        "status_code": response.status_code,
+                    }
+                    ASCIIColors.error(
+                        f"[OllamaBinding.get_user_balance] {last_error['message']} "
+                        f"body={response.text.strip()[:300]!r}"
+                    )
+                    continue
+
+                try:
+                    data = response.json()
+                except ValueError:
+                    last_error = {
+                        "status": False,
+                        "message": f"{url} returned non-JSON for source '{source}'.",
+                        "status_code": 200,
+                    }
+                    ASCIIColors.error(
+                        f"[OllamaBinding.get_user_balance] {last_error['message']} "
+                        f"body={response.text.strip()[:300]!r}"
+                    )
+                    continue
+
+                ASCIIColors.debug(
+                    f"[OllamaBinding.get_user_balance] Raw payload: "
+                    f"{json.dumps(data, default=str)[:1000]}"
+                )
+                result: Dict[str, Any] = {
+                    "status": True,
+                    "data": data,
+                    "endpoint": url,
+                    "auth_source": source,
+                }
+                extracted = self._extract_cloud_balance(data) if isinstance(data, dict) else {}
+
+                if "balance" in extracted:
+                    result["balance"] = extracted["balance"]
+                    detail_parts: list[str] = []
+                    included_val = extracted.get("included")
+                    purchased_val = extracted.get("purchased")
+                    if included_val is not None:
+                        detail_parts.append(f"included=${included_val:.2f}")
+                    if purchased_val is not None:
+                        detail_parts.append(f"purchased=${purchased_val:.2f}")
+                    detail = f" ({', '.join(detail_parts)})" if detail_parts else ""
+                    ASCIIColors.success(
+                        f"[OllamaBinding.get_user_balance] Balance: "
+                        f"${extracted['balance']:.2f}{detail}"
+                    )
+
+                for key in (
+                    "included",
+                    "included_allowance",
+                    "purchased",
+                    "included_session_remaining_percent",
+                    "included_weekly_remaining_percent",
+                    "included_session_resets_at",
+                    "included_weekly_resets_at",
+                    "period",
+                    "grants_count",
+                ):
+                    if key in extracted:
+                        result[key] = extracted[key]
+
+                has_legacy_plan = any(k.endswith("_remaining_percent") for k in extracted)
+                if "balance" not in extracted and not has_legacy_plan:
+                    message = (
+                        "Balance endpoint succeeded but no recognizable balance field "
+                        "(included.balance_usd / purchased.balance_usd / legacy "
+                        "included.session.remaining_percent) was found in the payload."
+                    )
+                    ASCIIColors.warning(
+                        f"[OllamaBinding.get_user_balance] {message} "
+                        f"Payload keys: "
+                        f"{list(data.keys()) if isinstance(data, dict) else type(data)}"
+                    )
+                    result["message"] = message
+                elif has_legacy_plan and "balance" not in extracted:
+                    result["balance"] = None
+                    result["legacy_plan"] = True
+
+                self._balance_cache = {"ts": now, "data": result}
+                return result
+
+            failure: Dict[str, Any] = dict(last_error) if last_error else {
                 "status": False,
-                "message": "No API key configured. An Ollama Cloud API key is required to query the balance.",
+                "message": "Unable to obtain balance from any configured credential.",
             }
-        if not self.is_cloud_subscription:
-            return {
-                "status": False,
-                "message": (
-                    "Balance is only available for Ollama Cloud subscriptions. Configure an Ollama "
-                    "Cloud API key (service_key) or point host_address at 'https://ollama.com'. "
-                    "Local Ollama servers have no balance endpoint."
-                ),
-            }
-
-        now = time.time()
-        cached = self._balance_cache.get("data")
-        if cached is not None and now - self._balance_cache.get("ts", 0.0) < _BALANCE_CACHE_TTL_S:
-            return cached
-
-        headers = {"Authorization": f"Bearer {self.service_key}"}
-        try:
-            response = requests.get(
-                _OLLAMA_CLOUD_BALANCE_URL,
-                headers=headers,
-                verify=self.verify_ssl_certificate,
-                timeout=15,
+            failure["attempted_sources"] = attempted_sources
+            failure["message"] = (
+                f"{failure.get('message', '')} Tried binding credentials: "
+                f"{', '.join(attempted_sources)}. Ensure service_key is the Ollama "
+                "Cloud account API key from https://ollama.com/settings/keys, or set "
+                "balance_api_key explicitly on this binding."
             )
-        except requests.exceptions.RequestException as e:
-            return {"status": False, "message": f"Failed to fetch balance from Ollama Cloud: {e}"}
-
-        if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After")
-            try:
-                retry_seconds = int(retry_after) if retry_after is not None else None
-            except ValueError:
-                retry_seconds = None
-            return {
-                "status": False,
-                "message": "Rate limited by the Ollama Cloud balance endpoint (10 requests/minute, shared across API keys and devices).",
-                "retry_after": retry_seconds,
-                "status_code": 429,
-            }
-
-        if response.status_code == 400:
-            return {
-                "status": False,
-                "message": "Ollama Cloud rejected the balance request (400). Unsupported or repeated query parameters are not allowed.",
-                "status_code": 400,
-            }
-
-        if response.status_code != 200:
-            return {
-                "status": False,
-                "message": f"Ollama Cloud balance endpoint returned HTTP {response.status_code}.",
-                "status_code": response.status_code,
-            }
-
-        try:
-            data = response.json()
-        except ValueError:
-            return {
-                "status": False,
-                "message": "Ollama Cloud returned a non-JSON balance payload.",
-                "status_code": 200,
-            }
-
-        result: Dict[str, Any] = {"status": True, "data": data}
-        extracted = self._extract_cloud_balance(data) if isinstance(data, dict) else {}
-        if "balance" in extracted:
-            result["balance"] = extracted["balance"]
-        if "included" in extracted:
-            result["included"] = extracted["included"]
-        if "purchased" in extracted:
-            result["purchased"] = extracted["purchased"]
-
-        self._balance_cache = {"ts": now, "data": result}
-        return result
+            return failure
 
     def get_model_info(self) -> dict:
         """

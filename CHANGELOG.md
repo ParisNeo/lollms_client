@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-24 00:49]
+
+- Fix OLLAMA binding initialization logic for better compatibility with newer versions of Ollama.
+
 ## [2026-11-23 22:14]
 
 - `feat: open_image_gen_binding - initialize OpenAI-compatible text-to-image client bindings for OpenImageGen services, implementing shared API contract with OpenAI Images API support (POST/GET models & edits, watermarking, and metadata handling)`
