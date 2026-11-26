@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-24 00:49]
+
+- Fix OLLAMA binding initialization logic for better compatibility with newer versions of Ollama.
+
 ## [2026-11-26 03:08]
 
 - chore: bump version to 1.0.0 and update dependencies
