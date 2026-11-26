@@ -290,6 +290,10 @@ All notable changes to this project will be documented in this file.
 - refactor(vibevoice): remove deprecated VibeVoice TTS binding and cleanup
 
 
+## [2026-11-26 04:51]
+
+- fix(lollms): resolve SSL verification and model detection order in binding
+
 ## [2026-11-24 00:49]
 
 - Fix OLLAMA binding initialization logic for better compatibility with newer versions of Ollama.

@@ -504,23 +504,32 @@ class LollmsBinding(LollmsLLMBinding):
 
         self.service_key = kwargs.get("service_key") or os.getenv("LOLLMS_API_KEY")
 
-        raw_model_name = kwargs.get("model_name")
-        if raw_model_name:
-            self.model_name = raw_model_name
-        else:
-            self.model_name = self._auto_detect_model_name()
-            if not self.model_name:
-                ASCIIColors.warning(
-                    "[LollmsBinding] No model_name provided and auto-detection failed for "
-                    f"host: {self.open_ai_host_address}. Generation methods will return an "
-                    "error until a model is configured or the server becomes reachable."
-                )
         raw_verify_ssl = kwargs.get("verify_ssl_certificate", True)
         if isinstance(raw_verify_ssl, str):
             self.verify_ssl_certificate = raw_verify_ssl.lower().strip() not in ("false", "0", "no", "off", "")
         else:
             self.verify_ssl_certificate = bool(raw_verify_ssl)
         self.certificate_file_path = kwargs.get("certificate_file_path")
+
+        # Compute the SSL verification object BEFORE any call that might touch
+        # the network (e.g. model auto-detection). _init_client() reads
+        # _verify_obj, so it must exist prior to _auto_detect_model_name().
+        self.verify = True
+        verify = True
+        if (
+            not self.verify_ssl_certificate
+            or os.getenv("LOLLMS_SKIP_SSL_VERIFY", "").lower() in ("1", "true", "yes")
+        ):
+            self.verify = False
+            verify = False
+        elif self.certificate_file_path:
+            cert_path = Path(self.certificate_file_path)
+            if not cert_path.exists():
+                raise FileNotFoundError(f"Certificate file not found: {cert_path}")
+            ssl_context = ssl.create_default_context(cafile=str(cert_path))
+            self.verify = str(cert_path)
+            verify = ssl_context
+        self._verify_obj = verify
 
         self.default_completion_format = kwargs.get(
             "default_completion_format", ELF_COMPLETION_FORMAT.Chat
@@ -541,21 +550,21 @@ class LollmsBinding(LollmsLLMBinding):
         self.send_thinking_parameter = kwargs.get("send_thinking_parameter", True)
         self.thinking_effort_keyword = kwargs.get("thinking_effort_keyword", "enable_thinking")
 
-        self.verify = True
-        verify = True
+        # _verify_obj was computed earlier so that _auto_detect_model_name()
+        # (which runs during __init__ and calls _init_client) already knows
+        # whether SSL verification is disabled.
+        raw_model_name = kwargs.get("model_name")
+        if raw_model_name:
+            self.model_name = raw_model_name
+        else:
+            self.model_name = self._auto_detect_model_name()
+            if not self.model_name:
+                ASCIIColors.warning(
+                    "[LollmsBinding] No model_name provided and auto-detection failed for "
+                    f"host: {self.open_ai_host_address}. Generation methods will return an "
+                    "error until a model is configured or the server becomes reachable."
+                )
 
-        if not self.verify_ssl_certificate or os.getenv("LOLLMS_SKIP_SSL_VERIFY", "").lower() in ("1", "true", "yes"):
-            self.verify = False
-            verify = False
-        elif self.certificate_file_path:
-            cert_path = Path(self.certificate_file_path)
-            if not cert_path.exists():
-                raise FileNotFoundError(f"Certificate file not found: {cert_path}")
-            ssl_context = ssl.create_default_context(cafile=str(cert_path))
-            self.verify = str(cert_path)
-            verify = ssl_context
-
-        self._verify_obj = verify
         self._init_client()
         self.completion_format = ELF_COMPLETION_FORMAT.Chat
 
@@ -3512,7 +3521,32 @@ class LollmsBinding(LollmsLLMBinding):
             entries = self.client.models.list()
             model_names = self._extract_models_from_payload(entries.data if hasattr(entries, "data") else entries)
         except Exception as e:
-            ASCIIColors.warning(f"[LollmsBinding] SDK models.list failed: {e}. Falling back to direct endpoints.")
+            error_str = str(e).lower()
+            if "certificate" in error_str or "ssl" in error_str:
+                # TLS failure means the caller thinks SSL is disabled but the
+                # OpenAI SDK client is not honoring it. Rebuild the client with
+                # the current verify object and retry once before giving up.
+                ASCIIColors.warning(
+                    "[LollmsBinding] SDK models.list hit an SSL error "
+                    f"(verify_ssl_certificate={self.verify_ssl_certificate}, "
+                    f"_verify_obj={getattr(self, '_verify_obj', '<unset>')!r}). "
+                    "Rebuilding client and retrying once."
+                )
+                try:
+                    self._init_client()
+                    entries = self.client.models.list()
+                    model_names = self._extract_models_from_payload(
+                        entries.data if hasattr(entries, "data") else entries
+                    )
+                except Exception as retry_exc:
+                    trace_exception(retry_exc)
+                    ASCIIColors.warning(
+                        f"[LollmsBinding] SDK models.list retry failed: {retry_exc}. "
+                        "Falling back to direct endpoints."
+                    )
+            else:
+                trace_exception(e)
+                ASCIIColors.warning(f"[LollmsBinding] SDK models.list failed: {e}. Falling back to direct endpoints.")
 
         if not model_names:
             candidate_endpoints = [
