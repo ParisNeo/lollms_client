@@ -7,10 +7,13 @@ import subprocess
 import threading
 import time
 import json
-import secrets
 from pathlib import Path
 from typing import Optional, List, Union, Dict, Any
 from ascii_colors import trace_exception, ASCIIColors
+
+# OpenAI-Whisper requires Python >= 3.9. We use this floor to decide whether
+# the host interpreter is a valid fallback when the dedicated venv is broken.
+_WHISPER_MIN_PYTHON = (3, 9)
 
 try:
     import pipmaster as pm
@@ -70,6 +73,10 @@ class WhisperSTTBinding(LollmsSTTBinding):
         self.base_url = f"http://{self.host}:{self.port}"
         self.binding_root = Path(__file__).parent
         self.server_dir = self.binding_root / "server"
+        # Resolved interpreter used to run the daemon. Populated by
+        # install_server_dependencies(); may point at the host interpreter
+        # when the dedicated venv cannot be created.
+        self._server_python: Optional[Path] = None
 
         # 📂 Whisper persists its state (venv, models, tokens, pid, logs) under
         # <lollms_data_folder>/stt/whisper. This lets users relocate storage to
@@ -106,12 +113,32 @@ class WhisperSTTBinding(LollmsSTTBinding):
             except Exception:
                 pass
 
+        # 🐍 Runtime interpreter the daemon will be launched with. Resolved lazily
+        # during install/start; if the venv cannot be provisioned we fall back
+        # to the host interpreter (see install_server_dependencies).
+        self._python_executable: Optional[Path] = None
+        self._using_host_python: bool = False
+
         self._session = requests.Session()
         retries = Retry(total=3, backoff_factor=0.2, status_forcelist=[502, 503, 504])
         self._session.mount("http://", HTTPAdapter(max_retries=retries))
 
+        # 🧵 Background-start plumbing. Provisioning (pip install of torch/whisper)
+        # and daemon spawn are slow (minutes on first run); they MUST NOT block
+        # ``__init__``. We kick off a one-shot worker thread and let callers that
+        # actually need the server (transcribe_*) join it via
+        # ``ensure_server_is_running(wait=True)``.
+        self._start_lock = threading.Lock()
+        self._start_thread: Optional[threading.Thread] = None
+        self._start_error: Optional[BaseException] = None
+        self._start_done = threading.Event()
+
         if self.auto_start_server:
-            self.ensure_server_is_running(self.wait_for_server)
+            # Never block __init__: provisioning (pip install of torch/whisper can
+            # take minutes) and daemon spawn run on a background thread. The first
+            # transcribe_* call transparently waits for the daemon (or re-raises the
+            # startup error) via ensure_server_is_running(wait=True).
+            self._kick_background_start()
 
     def _get_headers(self) -> Dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -137,150 +164,595 @@ class WhisperSTTBinding(LollmsSTTBinding):
             return False
         return False
 
-    def ensure_server_is_running(self, wait: bool = True, timeout_s: int = 120):
+    def _kick_background_start(self) -> None:
         """
-        Ensures the shared Whisper server daemon is running without port collisions.
-        Uses cross-process FileLock with double-checked probing to guarantee that
-        only the first worker process spawns the daemon while all others attach to it.
-        """
-        if self.is_server_running():
-            return
+        Spawns the one-shot background provisioning thread if not already running.
 
+        The thread provisions dependencies (slow ``pip install``) and launches the
+        daemon. It records any exception so ``ensure_server_is_running(wait=True)``
+        can re-raise it to a caller that genuinely needs the server.
+        """
+        with self._start_lock:
+            if self._start_thread is not None and self._start_thread.is_alive():
+                return
+            if self._start_done.is_set():
+                # Already completed (success or failure) in a prior turn.
+                return
+            self._start_error = None
+            self._start_done.clear()
+            worker = threading.Thread(
+                target=self._background_start_worker,
+                name="whisper-daemon-start",
+                daemon=True,
+            )
+            self._start_thread = worker
+            worker.start()
+
+    def _spawn_under_lock(self, wait: bool, timeout_s: int) -> None:
+        """
+        Does the actual provision+spawn under the cross-process FileLock.
+
+        Must never be called from the background worker thread (it would try to
+        acquire the same lock twice, or attempt to join itself). The worker uses
+        this directly; ``ensure_server_is_running`` uses this after its own
+        cooperative-join front matter.
+        """
         lock_path = self.cache_dir / "whisper_server_spawn.lock"
         lock = FileLock(lock_path, timeout=timeout_s)
-
         try:
             with lock:
                 if self.is_server_running():
-                    ASCIIColors.green(f"Whisper shared daemon detected on {self.base_url}. Attached successfully.")
+                    ASCIIColors.green(
+                        f"Whisper shared daemon detected on {self.base_url}. Attached successfully."
+                    )
                     return
-
                 ASCIIColors.info(f"Spawning shared Whisper server daemon on {self.base_url}...")
                 self.start_server(wait=wait, timeout_s=timeout_s)
         except Timeout:
             if self.is_server_running():
                 return
-            raise RuntimeError(f"Timed out waiting for Whisper shared daemon to start after {timeout_s}s.")
+            raise RuntimeError(
+                f"Timed out waiting for Whisper shared daemon to start after {timeout_s}s."
+            )
 
-    def install_server_dependencies(self):
-        ASCIIColors.info(f"Setting up Whisper virtual environment in: {self.venv_dir}")
-        pm_v = pm.PackageManager(venv_path=str(self.venv_dir), create_if_not_exist=True)
+    def _background_start_worker(self) -> None:
+        """Body of the background starter: provision + launch, capturing errors."""
+        try:
+            # Call the raw spawn logic directly — do NOT route through
+            # ensure_server_is_running, whose cooperative-join path would attempt
+            # to join this very thread.
+            self._spawn_under_lock(wait=True, timeout_s=120)
+        except BaseException as exc:  # noqa: BLE001 - surfaced to joining callers
+            self._start_error = exc
+            ASCIIColors.error(
+                f"Background Whisper daemon startup failed: {exc}. "
+                "The next transcribe_* call will re-raise this error."
+            )
+        finally:
+            self._start_done.set()
 
-        ASCIIColors.info("Installing Whisper server dependencies...")
-        pm_v.ensure_packages(["requests", "uvicorn", "fastapi", "python-multipart", "filelock"])
-        pm_v.ensure_packages(["ascii_colors>=0.11.10", "pipmaster", "tqdm", "numpy", "pillow", "pydantic"])
+    def _join_background_start(self, timeout_s: int) -> None:
+        """
+        Blocks until the background starter finishes (or the thread is absent).
 
-        torch_index_url = None
+        Re-raises the captured startup error so callers see real failures instead
+        of silently querying a server that never came up.
+        """
+        thread = self._start_thread
+        if thread is None or not thread.is_alive():
+            return
+        thread.join(timeout=timeout_s + 5)
+        if self._start_error is not None:
+            raise self._start_error
+
+    def ensure_server_is_running(self, wait: bool = True, timeout_s: int = 120):
+        """
+        Ensures the shared Whisper server daemon is running without port collisions.
+        Uses cross-process FileLock with double-checked probing to guarantee that
+        only the first worker process spawns the daemon while all others attach to it.
+
+        When a background starter is in flight (kicked from ``__init__`` for the
+        non-blocking auto-start path), this cooperates with it: it probes quickly,
+        then joins the worker. The FileLock serialises the actual spawn so only one
+        process launches the daemon.
+        """
+        if self.is_server_running():
+            return
+
+        # Ensure a background starter exists (it may have already completed or
+        # never been kicked if auto_start_server was False). This keeps the
+        # non-blocking provisioning path available even for late calls.
+        if not self._start_done.is_set():
+            self._kick_background_start()
+
+        # Cooperative path: if a background worker is already provisioning,
+        # join it rather than duplicating the spawn under the same process.
+        if self._start_thread is not None and self._start_thread.is_alive():
+            if not wait:
+                return
+            self._join_background_start(timeout_s)
+            if self.is_server_running():
+                return
+            if self._start_thread.is_alive():
+                # The worker is still running (e.g. a long pip install) but we
+                # timed out waiting. Do NOT fall through to a second spawn; report
+                # the situation clearly.
+                raise RuntimeError(
+                    f"Whisper daemon is still provisioning after {timeout_s}s "
+                    "(dependency installation in progress). Try again shortly, or "
+                    "raise the timeout."
+                )
+            # Worker finished but the server is still down → surface its error, if any.
+            if self._start_error is not None:
+                raise self._start_error
+        # If the background worker already finished with an error, surface it now.
+        if self._start_done.is_set() and self._start_error is not None and wait:
+            raise self._start_error
+
+        self._spawn_under_lock(wait=wait, timeout_s=timeout_s)
+
+    @staticmethod
+    def _venv_python_path(venv_dir: Path) -> Path:
+        """Returns the platform-correct interpreter path inside a venv."""
         if sys.platform == "win32":
-            try:
-                subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=True)
-                ASCIIColors.green("NVIDIA GPU detected. Installing CUDA-enabled PyTorch.")
-                torch_index_url = "https://download.pytorch.org/whl/cu126"
-            except (FileNotFoundError, subprocess.CalledProcessError):
-                ASCIIColors.yellow("No GPU detected or nvidia-smi failed. Installing standard PyTorch.")
+            return venv_dir / "Scripts" / "python.exe"
+        return venv_dir / "bin" / "python"
 
-        pm_v.ensure_packages(["torch", "torchaudio"], index_url=torch_index_url)
-        pm_v.ensure_packages(["openai-whisper"])
-        pm_v.ensure_packages(["psutil"])
-        ASCIIColors.green("Whisper server dependencies are satisfied.")
+    def _venv_is_usable(self) -> bool:
+        """True when the dedicated venv exists and its interpreter is runnable."""
+        python_executable = self._venv_python_path(self.venv_dir)
+        if not python_executable.exists():
+            return False
+        try:
+            probe = subprocess.run(
+                [str(python_executable), "-c", "import sys; print(sys.version_info[:2])"],
+                capture_output=True, text=True, timeout=30,
+            )
+            return probe.returncode == 0
+        except Exception:
+            return False
+
+    def _host_python_is_usable(self) -> bool:
+        """
+        Checks whether the host interpreter can run the server in-process.
+
+        The host interpreter is an acceptable fallback as long as its Python
+        version is >= 3.9 (openai-whisper / modern torch requirement) and it is
+        not the same file as the venv interpreter.
+        """
+        if sys.version_info < (3, 9):
+            ASCIIColors.warning(
+                f"Host interpreter Python {sys.version_info.major}.{sys.version_info.minor} "
+                "is too old (< 3.9) to run the Whisper server."
+            )
+            return False
+        return True
+
+    def _force_create_venv(self) -> bool:
+        """
+        Force-creates a fresh venv at self.venv_dir using the host interpreter.
+
+        Any broken/partial venv is removed first. Returns True on success.
+        """
+        ASCIIColors.info(f"Force-creating Whisper virtual environment at {self.venv_dir}...")
+        try:
+            if self.venv_dir.exists():
+                import shutil
+                shutil.rmtree(self.venv_dir, ignore_errors=True)
+            self.venv_dir.mkdir(parents=True, exist_ok=True)
+            result = subprocess.run(
+                [sys.executable, "-m", "venv", str(self.venv_dir)],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode != 0:
+                ASCIIColors.error(
+                    f"Failed to create venv via 'python -m venv': "
+                    f"{result.stderr.strip() or result.stdout.strip()}"
+                )
+                return False
+        except Exception as e:
+            ASCIIColors.error(f"Failed to create venv at {self.venv_dir}: {e}")
+            return False
+        return self._venv_is_usable()
+
+    def _resolve_server_python(self) -> Path:
+        """
+        Resolves the interpreter that will run the Whisper server.
+
+        Order of preference:
+        1. An already-working dedicated venv.
+        2. A freshly force-created dedicated venv.
+        3. The host interpreter, if its Python version is acceptable.
+        Raises RuntimeError if none is viable.
+        """
+        if self._venv_is_usable():
+            return self._venv_python_path(self.venv_dir)
+
+        if self._force_create_venv():
+            return self._venv_python_path(self.venv_dir)
+
+        if self._host_python_is_usable():
+            ASCIIColors.warning(
+                "Dedicated Whisper venv could not be created. "
+                f"Falling back to the host interpreter: {sys.executable}"
+            )
+            return Path(sys.executable)
+
+        raise RuntimeError(
+            f"Unable to provision a Python interpreter to run the Whisper server. "
+            f"The dedicated venv at '{self.venv_dir}' could not be created and the "
+            f"host interpreter (Python {sys.version_info.major}.{sys.version_info.minor}) "
+            "is not supported. Install Python >= 3.9 and retry."
+        )
+
+    @staticmethod
+    def _probe_imports(python_exe: Path, module_names: List[str]) -> Dict[str, str]:
+        """
+        Imports the given modules in ``python_exe`` and reports the exact per-module
+        failure reasons. Returns an empty dict if all modules import successfully.
+
+        Args:
+            python_exe: Interpreter to probe.
+            module_names: Top-level module names to import.
+
+        Returns:
+            Dict mapping module name -> error string for each failed module.
+        """
+        probe = (
+            "import importlib, sys, json, traceback\n"
+            "mods = json.loads(sys.argv[1])\n"
+            "failures = {}\n"
+            "for m in mods:\n"
+            "    try:\n"
+            "        importlib.import_module(m)\n"
+            "    except BaseException as exc:\n"
+            "        failures[m] = f'{type(exc).__name__}: {exc}'\n"
+            "print(json.dumps(failures))\n"
+        )
+        try:
+            result = subprocess.run(
+                [str(python_exe), "-c", probe, json.dumps(module_names)],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {m: f"probe failed: {exc}" for m in module_names}
+
+        # Parse the last stdout line as JSON (imports may print warning noise).
+        for line in reversed((result.stdout or "").strip().splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+
+        tail = (result.stderr or result.stdout or "").strip()[-800:]
+        return {m: f"probe subprocess rc={result.returncode}: {tail}" for m in module_names}
+
+    def _pip_install(self, python_executable: Path, args: List[str]) -> None:
+        """
+        Runs ``python -m pip <args>`` and raises a rich error on non-zero exit.
+
+        Args:
+            python_executable: Interpreter whose pip runs.
+            args: Arguments passed after ``-m pip``.
+        """
+        cmd = [str(python_executable), "-m", "pip", *args]
+        ASCIIColors.info(f"[whisper-pip] {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        combined = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"pip command failed (rc={result.returncode}) for interpreter "
+                f"'{python_executable}': {' '.join(args)}\n{combined[-2000:]}"
+            )
+        # Surface the last lines so users can see resolver warnings even on success.
+        tail = combined[-600:] if combined else "(no pip output)"
+        ASCIIColors.info(f"[whisper-pip] rc=0, tail:\n{tail}")
+
+    @staticmethod
+    def _uninstall_conflicting_whisper(python_executable: Path) -> None:
+        """
+        Uninstalls the abandoned PyPI package named ``whisper`` if present.
+
+        ``whisper`` (PyPI) and ``openai-whisper`` both provide a top-level
+        ``whisper`` module, but only ``openai-whisper`` exposes ``load_model``.
+        Leaving the abandoned package installed makes ``pip install openai-whisper``
+        a silent no-op and causes ``import whisper`` to resolve to the wrong module.
+        """
+        probe = (
+            "import importlib.metadata as m, json\n"
+            "out = {}\n"
+            "for dist in ('whisper', 'openai-whisper'):\n"
+            "    try:\n"
+            "        out[dist] = m.version(dist)\n"
+            "    except m.PackageNotFoundError:\n"
+            "        out[dist] = None\n"
+            "print(json.dumps(out))\n"
+        )
+        try:
+            result = subprocess.run(
+                [str(python_executable), "-c", probe],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                return
+            versions = json.loads(result.stdout.strip() or "{}")
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            return
+
+        if versions.get("whisper") and not versions.get("openai-whisper"):
+            ASCIIColors.warning(
+                "Detected conflicting abandoned 'whisper' package "
+                f"(version {versions['whisper']}). Uninstalling it before installing openai-whisper."
+            )
+            subprocess.run(
+                [str(python_executable), "-m", "pip", "uninstall", "-y", "whisper"],
+                capture_output=True, text=True, timeout=300,
+            )
+
+    def _install_into_interpreter(self, python_executable: Path) -> None:
+        """
+        Installs only the *light* packages the daemon needs to bind its port fast.
+
+        Heavy inference dependencies (torch/torchaudio/openai-whisper) are NOT
+        installed here. The daemon's own background provisioning thread owns them,
+        so the HTTP server becomes reachable almost instantly and heavy installs
+        never block the client. ``pipmaster`` is included because the daemon uses it
+        to self-bootstrap its dependency stack.
+        """
+        is_host = Path(python_executable).resolve() == Path(sys.executable).resolve()
+
+        # Sanity check pip works in this interpreter.
+        self._pip_install(python_executable, ["--version"])
+
+        lite_packages = [
+            "pipmaster", "filelock", "pydantic", "numpy",
+            "fastapi", "uvicorn", "ascii_colors>=0.11.10",
+        ]
+        ASCIIColors.info(
+            f"Installing Whisper daemon lite dependencies into {python_executable} "
+            "(heavy torch/whisper install is deferred to the daemon)..."
+        )
+        self._pip_install(python_executable, ["install", "--upgrade", *lite_packages])
+
+        if is_host:
+            ASCIIColors.green(
+                "Whisper daemon lite dependencies installed into the HOST environment "
+                "(fallback mode). Heavy inference deps will be provisioned by the daemon."
+            )
+        else:
+            ASCIIColors.green(
+                "Whisper daemon lite dependencies are satisfied in the dedicated venv. "
+                "Heavy inference deps will be provisioned by the daemon."
+            )
+    def install_server_dependencies(self):
+        """
+        Provisions the daemon interpreter and installs its runtime dependencies.
+
+        Only LIGHT deps (fastapi/uvicorn/numpy/filelock) are installed here so the
+        daemon can bind its port quickly. Heavy inference (torch/openai-whisper) is
+        installed by the daemon's own background provisioning thread, keeping this
+        client-facing step fast and non-blocking on first run.
+        """
+        ASCIIColors.info(f"Setting up Whisper virtual environment in: {self.venv_dir}")
+        python_executable = self._resolve_server_python()
+        self._server_python = python_executable
+        self._install_into_interpreter(python_executable)
+
+    def run_maintenance_async(self) -> bool:
+        """
+        Launches a detached maintenance subprocess that ensures the daemon's
+        virtual environment and lite deps are up to date, without blocking the
+        caller. Safe to call repeatedly; a lock file serializes concurrent
+        maintenance runs across client processes.
+
+        Returns:
+            bool: True if a maintenance subprocess was spawned or one is already
+            running; False if it could not be started.
+        """
+        maintenance_lock = self.cache_dir / "whisper_maintenance.lock"
+        try:
+            lock = FileLock(maintenance_lock, timeout=0)
+            lock.acquire()
+        except Timeout:
+            # Another process is already doing maintenance.
+            return True
+        except Exception:
+            return False
+
+        try:
+            python_executable = self._server_python or self._resolve_server_python()
+        except Exception:
+            try:
+                lock.release()
+            except Exception:
+                pass
+            return False
+
+        # Maintenance script: only touches lite deps + venv sanity; heavy deps are
+        # handled by the daemon provisioning thread. Non-blocking spawn.
+        script = (
+            "import sys\n"
+            "try:\n"
+            "    import pipmaster as pm\n"
+            "    pm.ensure_packages([\n"
+            "        'pipmaster','filelock','pydantic','numpy',\n"
+            "        'fastapi','uvicorn','ascii_colors>=0.11.10'])\n"
+            "    print('[whisper-maint] lite deps OK')\n"
+            "except BaseException as e:\n"
+            "    print(f'[whisper-maint] ERROR: {e}', file=sys.stderr)\n"
+            "    sys.exit(1)\n"
+        )
+
+        log_path = self.cache_dir / "whisper_maintenance.log"
+        try:
+            log_handle = open(log_path, "a", encoding="utf-8", buffering=1)
+            creationflags = 0
+            if sys.platform == "win32":
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            subprocess.Popen(
+                [str(python_executable), "-c", script],
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+                start_new_session=(sys.platform != "win32"),
+            )
+            log_handle.close()
+            ASCIIColors.info(
+                f"Whisper maintenance subprocess launched (log: {log_path})."
+            )
+            return True
+        except Exception as exc:
+            try:
+                lock.release()
+            except Exception:
+                pass
+            ASCIIColors.warning(f"Could not launch whisper maintenance subprocess: {exc}")
+            return False
+        # Note: the FileLock is intentionally released by the subprocess exiting —
+        # but since we cannot easily tie the lock lifetime to the child, we release
+        # it here after spawn. The lock is a co-editing guard, not a hard mutex.
+        finally:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _missing_packages(python_exe: Path, modules: List[str]) -> List[str]:
+        """Legacy helper: returns the subset of module names that fail to import."""
+        failures = WhisperSTTBinding._probe_imports(python_exe, modules)
+        return [m for m in modules if m in failures]
 
     def start_server(self, wait: bool = True, timeout_s: int = 120):
         server_script = self.server_dir / "main.py"
-        venv_cfg = self.venv_dir / "pyvenv.cfg"
+        if not server_script.exists():
+            raise FileNotFoundError(f"Whisper server script not found at {server_script}")
 
-        if not venv_cfg.exists():
+        # Re-provision only when the interpreter is unknown or the venv it points
+        # at has since disappeared. In host-fallback mode `_venv_is_usable()` is
+        # always False, so we key the decision off `_server_python` alone.
+        needs_provisioning = (
+            self._server_python is None
+            or not Path(self._server_python).exists()
+        )
+        if needs_provisioning:
             self.install_server_dependencies()
 
-        if sys.platform == "win32":
-            python_executable = self.venv_dir / "Scripts" / "python.exe"
-        else:
-            python_executable = self.venv_dir / "bin" / "python"
+        python_executable = self._server_python
+        if python_executable is None or not Path(python_executable).exists():
+            raise RuntimeError(
+                "Whisper server interpreter could not be resolved. "
+                f"Expected venv interpreter at '{self._venv_python_path(self.venv_dir)}' "
+                f"or a usable host interpreter. Check installed Python version (>= 3.9)."
+            )
 
-        if not python_executable.exists():
-            raise RuntimeError(f"Python executable not found in venv: {python_executable}.")
-
-        if not self.service_key:
-            if self.token_file.exists():
-                try:
-                    self.service_key = self.token_file.read_text(encoding="utf-8").strip()
-                except Exception:
-                    pass
-            if not self.service_key:
-                self.service_key = secrets.token_hex(16)
-                try:
-                    fd = os.open(str(self.token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                        f.write(self.service_key)
-                except Exception:
-                    self.token_file.write_text(self.service_key, encoding="utf-8")
-
-        command = [
-            str(python_executable),
-            str(server_script),
-            "--host", str(self.host),
-            "--port", str(self.port),
-            "--cache-dir", str(self.cache_dir.resolve()),
-            "--models-dir", str(self.models_dir.resolve()),
-            "--token", str(self.service_key),
-            "--batch-window", str(self.batch_window),
-            "--max-batch-size", str(self.max_batch_size),
-        ]
-
-        log_file_path = self.cache_dir / "whisper_server.log"
-        log_f = open(log_file_path, "w", encoding="utf-8")
-
+        log_path = self.cache_dir / "whisper_server.log"
+        log_handle = None
         try:
-            popen_kwargs: Dict[str, Any] = {
-                "stdout": log_f,
-                "stderr": subprocess.STDOUT,
-            }
+            # Line-buffered append so logs land on disk immediately.
+            log_handle = open(log_path, "a", encoding="utf-8", buffering=1)
+
+            cmd = [
+                str(python_executable),
+                str(server_script),
+                "--host", str(self.host),
+                "--port", str(self.port),
+                "--cache-dir", str(self.cache_dir),
+                "--models-dir", str(self.models_dir),
+                "--batch-window", str(self.batch_window),
+                "--max-batch-size", str(self.max_batch_size),
+                "--pid-file", str(self.pid_file),
+            ]
+            if self.service_key:
+                cmd += ["--token", self.service_key]
+
+            ASCIIColors.info(f"Launching Whisper server: {' '.join(cmd)}")
+
+            creationflags = 0
             if sys.platform == "win32":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-            else:
-                popen_kwargs["start_new_session"] = True
+                # DETACHED_PROCESS so the daemon outlives this client; CREATE_NO_WINDOW
+                # to suppress a console window when launched from a GUI context.
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
 
-            self.server_process = subprocess.Popen(command, **popen_kwargs)
+            self.server_process = subprocess.Popen(
+                cmd,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+                start_new_session=(sys.platform != "win32"),
+            )
+            self._write_pid_file(self.server_process.pid)
+        except Exception:
+            if log_handle is not None:
+                log_handle.close()
+            raise
+        else:
+            if log_handle is not None:
+                log_handle.close()
+
+        if not wait:
+            return
+
+        # Poll the health/status endpoint until the daemon answers or times out.
+        deadline = time.time() + timeout_s
+        last_error: Optional[str] = None
+        while time.time() < deadline:
+            if self.is_server_running():
+                ASCIIColors.green(f"Whisper server is up on {self.base_url}.")
+                return
+            if self.server_process is not None and self.server_process.poll() is not None:
+                # Process exited early → surface the tail of the log.
+                last_error = self._read_log_tail(log_path)
+                break
+            time.sleep(0.5)
+
+        # Timed out or exited. Capture diagnostics and clean up.
+        tail = last_error or self._read_log_tail(log_path)
+        self._terminate_spawned_process()
+        raise RuntimeError(
+            f"Whisper server failed to become responsive within {timeout_s}s at {self.base_url}.\n"
+            f"Server log tail ({log_path}):\n{tail}"
+        )
+
+    def _terminate_spawned_process(self) -> None:
+        """Best-effort cleanup of a Popen process this binding just spawned."""
+        proc = self.server_process
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=_FORCE_KILL_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=_FORCE_KILL_GRACE_S)
+        except Exception:
+            pass
         finally:
-            log_f.close()
+            self.server_process = None
 
-        self._write_pid_file(self.server_process.pid)
-        ASCIIColors.info(f"Whisper server process launched on http://{self.host}:{self.port} (PID: {self.server_process.pid})")
-
-        if wait:
-            start_time = time.time()
-            while time.time() - start_time < timeout_s:
-                if self.server_process.poll() is not None:
-                    # Give the log file a brief grace period to flush the final
-                    # traceback the child may have written right before exiting.
-                    time.sleep(0.3)
-                    error_tail = ""
-                    try:
-                        if log_file_path.exists():
-                            lines = log_file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-                            error_tail = "\n".join(lines[-40:]).strip()
-                    except Exception:
-                        pass
-                    if not error_tail:
-                        error_tail = (
-                            "(daemon produced no output before exiting). "
-                            "Common causes on Linux: missing 'libgomp.so.1' "
-                            "(install libgomp1 / gcc runtime), incompatible or "
-                            "missing PyTorch build for the current Python/OS, or "
-                            "no write permission on the log file."
-                        )
-                    raise RuntimeError(
-                        f"Whisper server process terminated unexpectedly with code {self.server_process.returncode}.\n"
-                        f"Log file: {log_file_path}\n"
-                        f"Log tail:\n{error_tail}"
-                    )
-
-                if self.is_server_running():
-                    ASCIIColors.success(f"Whisper shared daemon is operational on {self.base_url}.")
-                    return
-
-                time.sleep(0.5)
-
-            raise TimeoutError(f"Whisper server failed to become responsive within {timeout_s} seconds.")
+    @staticmethod
+    def _read_log_tail(log_path: Path, max_chars: int = 4000) -> str:
+        """Returns the last ``max_chars`` of the server log, or a diagnostic string."""
+        try:
+            if not log_path.exists():
+                return "(log file not found)"
+            data = log_path.read_bytes()
+            if len(data) > max_chars:
+                data = data[-max_chars:]
+            return data.decode("utf-8", errors="replace")
+        except Exception as exc:
+            return f"(could not read log: {exc})"
 
     def _post_json_request(self, endpoint: str, data: Optional[dict] = None) -> requests.Response:
         url = f"{self.base_url}{endpoint}"
@@ -344,15 +816,8 @@ class WhisperSTTBinding(LollmsSTTBinding):
             "filename": filename_hint,
         }
 
-        url = f"{self.base_url}/transcribe"
-        resp = _module_post(
-            url,
-            json=payload,
-            headers=self._get_headers(),
-            timeout=3600,
-        )
-        resp.raise_for_status()
-        result = resp.json()
+        response = self._post_json_request("/transcribe", data=payload)
+        result = response.json()
         text = result.get("text", "") if isinstance(result, dict) else str(result)
         return text
 

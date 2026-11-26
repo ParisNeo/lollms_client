@@ -1,7 +1,7 @@
 title: OpenAI
 author: ParisNeo
 creation_date: 2025-08-13
-last_update_date: 2026-10-05
+last_update_date: 2026-11-24
 description: >
   A binding for the OpenAI Chat Completions and Completions APIs, with two
   authentication methods: an API key (default; billed per token) or
@@ -17,6 +17,13 @@ description: >
   `lollms` binding instead, which exposes the full set of LoLLMS-native
   features (artefacts, discussions, personality loading, etc.) beyond
   the common OpenAI subset.
+
+  Parameters are split in two logical groups. `global_input_parameters`
+  describe how to *reach* the service (transport, authentication, TLS) and are
+  shared by every model served by that endpoint. `model_input_parameters`
+  describe *per-model* behaviour (multimodal embedding format, vLLM/thinking
+  switches, supported reasoning efforts) and belong to a model profile, not to
+  the binding instance.
 global_input_parameters:
   - name: auth_method
     type: str
@@ -62,22 +69,9 @@ global_input_parameters:
     description: "If true, the server is a vLLM instance. Enables vLLM-specific chat_template_kwargs (e.g. enable_thinking) so reasoning/thinking models like Qwen3 are handled correctly."
     mandatory: false
     default: false
-  - name: send_thinking_parameter
-    type: bool
-    description: "Only relevant when is_vllm=true. When true (default), the binding injects chat_template_kwargs.enable_thinking into every request. Set to false to never send enable_thinking to vLLM — required for models whose chat templates do not support this kwarg (e.g. GLM 5.3), where sending it causes hallucinated or garbled output."
-    mandatory: false
-    default: true
-  - name: thinking_effort_keyword
-    type: str
-    description: "Only relevant when is_vllm=true. When can be enable_thinking or reasoning_effort."
-    mandatory: false
-    default: enable_thinking
-    options:
-      - enable_thinking
-      - reasoning_effort
   - name: verify_ssl_certificate
     type: bool
-    description: "Whether to verify SSL certificates on HTTPS connections. Set to false for self-hosted servers with self-signed certificates."
+    description: "Whether to verify SSL certificates on HTTPS connections. Set to false for self-hosted servers with self-signed certificates. This is a transport concern, shared by all models on the endpoint."
     mandatory: false
     default: true
   - name: certificate_file_path
@@ -90,47 +84,40 @@ global_input_parameters:
     description: "The default completion format to use. 'Chat' for chat.completions endpoint, 'Completion' for the legacy completions endpoint. Not used in oauth mode (always Responses API)."
     mandatory: false
     default: "Chat"
-  - name: glm_image_embedding
-    type: bool
-    description: "Enable GLM-5.3-Flash / GLM-4V compatible image embedding format (sequential text-first layout and standard image_url data blocks)."
-    mandatory: false
-    default: false
-  - name: video_enabled
-    type: bool
-    description: "Enable video input comprehension for multimodal video models (e.g. Qwen2.5-VL, GLM-5.3-Flash). Video is not supported in oauth mode."
-    mandatory: false
-    default: false
-  - name: supported_reasoning_efforts
-    type: str
-    description: "Comma-separated list of reasoning effort levels supported by this backend (e.g. 'low, medium, high' for OpenAI, 'low, high, max' for GLM-5.3-Flash). Incoming efforts are projected to the closest supported level."
-    mandatory: false
-    default: ""
 model_input_parameters:
   - name: model_name
     type: str
     description: "The name of the model to use, as exposed by the target service (e.g. 'gpt-4o' on OpenAI, 'llama-3.1-8b-instruct' on a local server, 'Qwen/Qwen3-32B' on vLLM). In oauth mode, pick a model your ChatGPT account is eligible for: list_models() returns the catalog of the signed-in account."
     mandatory: true
     default: "gpt-4o"
+  - name: send_thinking_parameter
+    type: bool
+    description: "Per-model, only relevant when is_vllm=true. When true (default), the binding injects chat_template_kwargs.enable_thinking into every request. Set to false for models whose chat templates do not support this kwarg (e.g. GLM 5.3), where sending it causes hallucinated or garbled output."
+    mandatory: false
+    default: true
+  - name: thinking_effort_keyword
+    type: str
+    description: "Per-model, only relevant when is_vllm=true. Keyword used to express the effort: 'enable_thinking' or 'reasoning_effort'."
+    mandatory: false
+    default: enable_thinking
+    options:
+      - enable_thinking
+      - reasoning_effort
   - name: glm_image_embedding
     type: bool
-    description: "Enables GLM-5.3-Flash / GLM-4V compatible image embedding format (sequential text-first layout and standard image_url data blocks) for multimodal reasoning."
+    description: "Per-model: enables GLM-5.3-Flash / GLM-4V compatible image embedding format (sequential text-first layout and standard image_url data blocks) for multimodal reasoning. Only meaningful for GLM-family vision models."
     mandatory: false
     default: false
   - name: video_enabled
     type: bool
-    description: "Enables video input comprehension for multimodal video models (e.g. Qwen2.5-VL, GLM-5.3-Flash)."
+    description: "Per-model: enables video input comprehension for multimodal video models (e.g. Qwen2.5-VL, GLM-5.3-Flash). Video is not supported in oauth mode."
     mandatory: false
     default: false
   - name: supported_reasoning_efforts
     type: str
-    description: "Comma-separated list of reasoning effort levels supported by this model (e.g. 'low, medium, high' for OpenAI, 'low, high, max' for GLM-5.3-Flash). Incoming efforts are automatically projected to the closest supported level."
+    description: "Per-model: comma-separated list of reasoning effort levels supported by this model (e.g. 'low, medium, high' for OpenAI reasoning models, 'low, high, max' for GLM-5.3-Flash). Incoming efforts are projected to the closest supported level."
     mandatory: false
     default: ""
-  - name: supported_reasoning_efforts
-    type: list
-    description: "List of reasoning effort levels supported by this model (e.g. ['low', 'medium', 'high'] for OpenAI, ['low', 'high', 'max'] for GLM-5.3-Flash). Incoming efforts are automatically projected to the closest supported level."
-    mandatory: false
-    default: null
 compatible_backends:
   official:
     - name: OpenAI
@@ -139,7 +126,7 @@ compatible_backends:
   local_servers:
     - name: vLLM
       url: https://github.com/vllm-project/vllm
-      note: "High-throughput local inference. Set is_vllm=true to enable thinking models support. Exposes /v1 OpenAI-compatible endpoints."
+      note: "High-throughput local inference. Set is_vllm=true on the model profile to enable models support. Exposes /v1 OpenAI-compatible endpoints."
     - name: llama.cpp server
       url: https://github.com/ggerganov/llama.cpp
       note: "Lightweight GGUF inference server with an OpenAI-compatible /v1 endpoint. Also available via the dedicated llama_cpp_server binding for native features."
@@ -199,11 +186,12 @@ compatible_backends:
       url: https://github.com/BerriAI/litellm
       note: "Proxy that translates OpenAI calls to 100+ providers. A dedicated litellm binding exists."
 advisory:
+  - "Model-specific settings (is_vllm, send_thinking_parameter,thinking_effort_keyword, glm_image_embedding, video_enabled, supported_reasoning_efforts) are declared under model_input_parameters and applied by the client through the binding's load_model_profile() hook when a model profile is selected. This keeps binding construction (transport/auth) decoupled from per-model behaviour."
   - "When targeting LoLLMS WebUI or a LoLLMS LCP server, prefer the dedicated `lollms` or `lollms_webui` binding to access native artefacts, discussions, and personality features not exposed via the OpenAI subset."
   - "When targeting Ollama, llama.cpp server, vLLM, or Groq, dedicated bindings exist that may expose backend-specific features. Use this binding only when you need a single uniform interface across providers."
-  - "Set is_vllm=true when connecting to a vLLM server so reasoning/thinking models (e.g. Qwen3) are handled correctly via chat_template_kwargs."
-  - "If a vLLM-served model (e.g. GLM 5.3) hallucinates or produces garbled output, its chat template likely does not support enable_thinking. Set send_thinking_parameter=false to stop sending it entirely."
-  - "Self-hosted servers with self-signed certificates require verify_ssl_certificate=false or a custom certificate_file_path."
+  - "Set is_vllm=true on the model profile when connecting to a vLLM server so reasoning/thinking models (e.g. Qwen3) are handled correctly via chat_template_kwargs."
+  - "If a vLLM-served model (e.g. GLM 5.3) hallucinates or produces garbled output, its chat template likely does not support enable_thinking. Set send_thinking_parameter=false on that model profile to stop sending it entirely."
+  - "Self-hosted servers with self-signed certificates require verify_ssl_certificate=false or a custom certificate_file_path (global/transport settings)."
   - "OAuth mode (auth_method=oauth) first-time setup: call `binding.oauth_login()` once (opens your browser; use `oauth_login(manual=True)` on a headless machine and paste back the final 127.0.0.1 URL). Tokens are stored in oauth_credentials_path and refreshed automatically. `oauth_status()` shows the signed-in account, `oauth_logout()` deletes the local tokens (revoke the app in ChatGPT settings to cut access on OpenAI's side)."
   - "OAuth mode limits: usage counts against your ChatGPT plan limits (see ChatGPT settings, Usage), not API credits. Sampling parameters (temperature, top_p, seed, penalties) and tools are not sent, video input and embeddings are unavailable, and only models eligible for your account work. Your ChatGPT account or workspace must allow plan usage; if the sign-in succeeds but generation returns a 'not eligible' error, that is the cause."
   - "OAuth mode is built on OpenAI's open-source 'Sign in with ChatGPT' preview (https://developers.openai.com/siwc/token-sharing-open-source). Behaviour and eligible models may change on OpenAI's side."

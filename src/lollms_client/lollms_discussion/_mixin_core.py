@@ -265,7 +265,15 @@ class CoreMixin:
             #   • registration uses _save_all() which does not re-enter sync.
             if auto_sync_workspace and not _from_db_reload:
                 try:
-                    self.sync_workspace_to_artefacts()
+                    # Construction-time ingestion must ALWAYS enumerate so that a
+                    # freshly created discussion over a populated workspace shows
+                    # its files immediately — in BOTH managed and agentic modes.
+                    # The bare default (``None``) is heal-only in agentic mode
+                    # (see sync_workspace_to_artefacts), which would leave a new
+                    # agentic session with zero files until the host manually
+                    # synced. Pass ``True`` here to keep eager ingestion bounded
+                    # by the agentic file cap.
+                    self.sync_workspace_to_artefacts(enumerate_workspace=True)
                 except Exception as sync_ex:
                     ASCIIColors.warning(f"[CoreMixin] Auto-ingestion/heal of workspace files failed: {sync_ex}")
 
@@ -427,6 +435,13 @@ class CoreMixin:
         # Re-anchor ArtefactManager (its __init__ deep scan is gated by
         # _is_versioning_enabled(), so it short-circuits in agentic mode).
         object.__setattr__(self, 'artefacts', ArtefactManager(self))
+        # The workspace root just moved — drop the cached path so subsequent
+        # `_get_workspace_root()` / `_resolve_confined_path()` calls resolve
+        # against the new location instead of a stale one.
+        try:
+            self.artefacts._invalidate_workspace_cache()
+        except Exception:
+            pass
 
         # Persist the new workspace path so agentic mode survives reload, and
         # invalidate cached context telemetry so the next prompt reflects reality.
@@ -1101,8 +1116,9 @@ class CoreMixin:
             return False
     def sync_workspace_to_artefacts(
         self,
-        enumerate_workspace: bool = True,
+        enumerate_workspace: Optional[bool] = None,
         max_files: Optional[int] = None,
+        metadata_only: Optional[bool] = None,
     ) -> Dict[str, int]:
         """
         Performs filesystem-as-source-of-truth synchronization between the physical
@@ -1176,6 +1192,18 @@ class CoreMixin:
         if not enumerate_workspace:
             return {"new_artefacts": 0, "updated_artefacts": 0, "deleted_artefacts": 0}
 
+        # ── METADATA-ONLY ENUMERATION ──
+        # Reading the FULL content of every file into the DB during enumeration
+        # is the dominant I/O cost on large trees (it turns a fast `stat()` walk
+        # into thousands of `read_text()` calls that can take minutes on a big
+        # source project). Since enumeration registers files at TREE_UNLOCKABLE
+        # (content is NOT injected into the LLM context), we do not need the
+        # content up front: it is read lazily at unlock time. Default to
+        # metadata-only for AGENTIC workspaces (the huge external-tree case);
+        # managed default workspaces keep content caching for instant unlocks.
+        if metadata_only is None:
+            metadata_only = agentic_mode
+
         if agentic_mode:
             effective_max_files = 2000 if max_files is None else max_files
         else:
@@ -1185,8 +1213,9 @@ class CoreMixin:
         # still be set on the manager. Clear it before doing anything else so a
         # stale flag never suppresses a future legitimate commit.
         object.__setattr__(self.artefacts, "_bulk_sync_active", False)
+        object.__setattr__(self.artefacts, "_bulk_raw_cache", None)
 
-        ws_data_path = getattr(self, 'workspace_data_path', None)
+        ws_data_path = getattr(self, "workspace_data_path", None)
         if not ws_data_path:
             return {"new_artefacts": 0, "updated_artefacts": 0, "deleted_artefacts": 0}
 
@@ -1195,16 +1224,7 @@ class CoreMixin:
 
         report = {"new_artefacts": 0, "updated_artefacts": 0, "deleted_artefacts": 0}
 
-        # --- 1. DISK AS SOURCE OF TRUTH: PURGE DELETED ARTIFACTS FROM DB ---
-        # In agentic mode the enumeration below is BOUNDED (max_files), so the
-        # on-disk view is partial. Purging DB records from a partial view would
-        # wrongly delete artefacts whose files simply fell beyond the cap. Purge
-        # only runs when the scan is complete (managed default workspace).
-        if not agentic_mode:
-            purged_titles = self.artefacts._sync_index_with_disk()
-            report["deleted_artefacts"] = len(purged_titles)
-
-        # --- 2. COLLECT DISK FILES (bounded, deterministic) ---
+        # --- 1. COLLECT DISK FILES (bounded, deterministic) ---
         # We first collect the file descriptors into a sorted list, THEN register
         # them. Registering while iterating interleaves `_save_all()` / `touch()`
         # metadata commits with directory-walk state, which can drop or duplicate
@@ -1264,17 +1284,50 @@ class CoreMixin:
                     continue
                 if _is_ignored_path(rel_parts):
                     continue
-                disk_files.append(f_path)
+                # Capture (size, mtime) once here — a later `stat()` per file in
+                # the ingest loop would double the syscall cost. `None` on error
+                # so the file still registers (we just can't detect "unchanged").
+                try:
+                    _st = f_path.stat()
+                    _size, _mtime = _st.st_size, _st.st_mtime
+                except OSError:
+                    _size, _mtime = None, None
+                disk_files.append((f_path, _size, _mtime))
 
-        disk_files.sort(key=lambda p: str(p.relative_to(workspace_dir)).replace("\\", "/"))
+        disk_files.sort(key=lambda t: str(t[0].relative_to(workspace_dir)).replace("\\", "/"))
 
+        # ── SCAN COMPLETENESS (drives the purge decision below) ──
+        # The purge may only run against a COMPLETE on-disk view. When the
+        # enumeration hit `effective_max_files`, the view is partial: purging
+        # from it would wrongly delete artefacts whose files simply fell
+        # beyond the cap. We record completeness now, BEFORE truncation.
+        scan_complete = True
         if effective_max_files is not None and len(disk_files) > effective_max_files:
             ASCIIColors.warning(
                 f"[CoreMixin] sync_workspace_to_artefacts: {len(disk_files)} files found, "
                 f"registering the first {effective_max_files} (agentic enumeration cap); "
                 f"remaining files stay lazily tracked via workspace tools."
             )
+            scan_complete = False
             disk_files = disk_files[:effective_max_files]
+
+        # --- 1b. DISK AS SOURCE OF TRUTH: PURGE DELETED ARTEFACTS FROM DB ---
+        # Runs ONLY when the scan was COMPLETE, so a bounded agentic pass never
+        # purges a live artefact that merely fell beyond the cap. In managed
+        # mode the scan is always complete by default. In agentic mode this is
+        # the fix for the "deleted workspace file lingers as an artefact
+        # forever" leak. We pass the already-collected relative paths so the
+        # purge reuses this walk instead of re-scanning the tree.
+        if scan_complete:
+            on_disk_rel = [
+                str(p[0].relative_to(workspace_dir)).replace("\\", "/")
+                for p in disk_files
+            ]
+            purged_titles = self.artefacts._sync_index_with_disk(
+                existing_paths=on_disk_rel,
+                allow_purge=True,
+            )
+            report["deleted_artefacts"] = len(purged_titles)
 
         # --- 3. WORKSPACE -> DB (Upsert Active Disk Files) ---
         # PERFORMANCE: `artefacts.get()` re-materializes the WHOLE artefact list
@@ -1316,7 +1369,7 @@ class CoreMixin:
         # makes `_save_all()` update in-memory metadata only, then commit once
         # after the loop (plus once more from the tail `self.commit()`).
         object.__setattr__(self.artefacts, "_bulk_sync_active", True)
-        for f_path in disk_files:
+        for f_path, file_size, file_mtime in disk_files:
             rel_parts = f_path.relative_to(workspace_dir)
 
             rel_str = str(rel_parts).replace("\\", "/")
@@ -1326,7 +1379,11 @@ class CoreMixin:
             if existing_art and _is_ignored_path(existing_art.get("title", "")):
                 continue
 
-            file_size = f_path.stat().st_size
+            if file_size is None:
+                try:
+                    file_size = f_path.stat().st_size
+                except OSError:
+                    continue
             atype = self._classify_artefact_type(file_ext)
 
             art_title = f_path.name
@@ -1341,7 +1398,68 @@ class CoreMixin:
                 art_title = rel_str
 
             if self._is_lightweight_text_file(f_path, file_ext):
-                # ── TEXT FILE: import content into DB, but keep it TREE_UNLOCKABLE ──
+                # ── TEXT FILE: cache content in DB unless metadata-only ──
+                # Change detection: store (size, mtime) on the record and skip
+                # the file entirely when BOTH still match. This makes an
+                # unchanged re-sync O(stat) instead of O(read), which is the
+                # difference between a fast refresh and a minute-long reload on
+                # a large source tree. In metadata-only mode we never READ the
+                # file — content is loaded lazily at unlock time.
+                if existing_art is not None:
+                    same_size = existing_art.get("file_size") == file_size
+                    same_mtime = existing_art.get("file_mtime") == file_mtime
+                    if same_size and same_mtime:
+                        # Nothing changed on disk — leave the record untouched.
+                        continue
+
+                if metadata_only:
+                    # Register/refresh the descriptor WITHOUT reading content.
+                    descriptor = (
+                        f"### File: `{rel_str}`\n\n"
+                        f"- **Type**: {file_ext.upper().lstrip('.') if file_ext else 'Text'} (Text)\n"
+                        f"- **Size**: {file_size:,} bytes\n"
+                        f"- **Location**: `./{rel_str}`\n\n"
+                        f"> Content is loaded on demand. Use `<unlock_file>` to load it "
+                        f"into context, or a tool (read_file, Python, grep) to inspect it.\n"
+                    )
+                    if existing_art is None:
+                        _new = self.artefacts.add(
+                            title=art_title,
+                            physical_path=rel_str,
+                            artefact_type=atype,
+                            content=descriptor,
+                            logical_content=descriptor,
+                            active=False,
+                            visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                            file_size=file_size,
+                            file_mtime=file_mtime,
+                            commit_message="Synced from disk (metadata only, unlockable)"
+                        )
+                        report["new_artefacts"] += 1
+                        for _k in (art_title, rel_str):
+                            if _k:
+                                title_index[str(_k).replace("\\", "/")] = _new
+                    else:
+                        _upd = self.artefacts.update(
+                            title=existing_art.get("title", art_title),
+                            physical_path=rel_str,
+                            new_content=descriptor,
+                            logical_content=descriptor,
+                            new_type=atype,
+                            bump_version=False,
+                            active=(existing_art.get("visibility") == ArtefactVisibility.FULL),
+                            visibility=existing_art.get("visibility", ArtefactVisibility.TREE_UNLOCKABLE),
+                            file_size=file_size,
+                            file_mtime=file_mtime,
+                            commit_message="Refreshed from disk (metadata only)"
+                        )
+                        report["updated_artefacts"] += 1
+                        if _upd:
+                            for _k in (existing_art.get("title"), rel_str):
+                                if _k:
+                                    title_index[str(_k).replace("\\", "/")] = _upd
+                    continue
+
                 try:
                     disk_content = f_path.read_text(encoding="utf-8", errors="ignore")
                 except Exception:
@@ -1355,6 +1473,8 @@ class CoreMixin:
                         content=disk_content,
                         active=False,
                         visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                        file_size=file_size,
+                        file_mtime=file_mtime,
                         commit_message="Synced from disk (text content cached, unlockable)"
                     )
                     report["new_artefacts"] += 1
@@ -1372,6 +1492,8 @@ class CoreMixin:
                             new_type=atype,
                             active=(current_visibility == ArtefactVisibility.FULL),
                             visibility=current_visibility,
+                            file_size=file_size,
+                            file_mtime=file_mtime,
                             commit_message="Updated from disk (text content modified)"
                         )
                         report["updated_artefacts"] += 1
@@ -1393,6 +1515,12 @@ class CoreMixin:
                     f"Use a tool (document tools, SQL query, or Python) to inspect or "
                     f"query it, or <unlock_file> it to load a portion into context.\n"
                 )
+                if existing_art is not None:
+                    same_size = existing_art.get("file_size") == file_size
+                    same_mtime = existing_art.get("file_mtime") == file_mtime
+                    if same_size and same_mtime:
+                        continue
+
                 if existing_art is None:
                     _new = self.artefacts.add(
                         title=art_title,
@@ -1402,6 +1530,8 @@ class CoreMixin:
                         logical_content=content_placeholder,
                         active=True,
                         visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                        file_size=file_size,
+                        file_mtime=file_mtime,
                         commit_message="Synced from disk (as-is entry)"
                     )
                     report["new_artefacts"] += 1
@@ -1409,22 +1539,24 @@ class CoreMixin:
                         if _k:
                             title_index[str(_k).replace("\\", "/")] = _new
                 else:
-                    if f"Size**: {file_size:,}" not in existing_art.get("content", ""):
-                        _upd = self.artefacts.update(
-                            title=existing_art.get("title", art_title),
-                            physical_path=rel_str,
-                            new_content=content_placeholder,
-                            logical_content=content_placeholder,
-                            new_type=atype,
-                            active=True,
-                            visibility=ArtefactVisibility.TREE_UNLOCKABLE,
-                            commit_message="Updated from disk (as-is metadata)"
-                        )
-                        report["updated_artefacts"] += 1
-                        if _upd:
-                            for _k in (existing_art.get("title"), rel_str):
-                                if _k:
-                                    title_index[str(_k).replace("\\", "/")] = _upd
+                    _upd = self.artefacts.update(
+                        title=existing_art.get("title", art_title),
+                        physical_path=rel_str,
+                        new_content=content_placeholder,
+                        logical_content=content_placeholder,
+                        new_type=atype,
+                        bump_version=False,
+                        active=True,
+                        visibility=ArtefactVisibility.TREE_UNLOCKABLE,
+                        file_size=file_size,
+                        file_mtime=file_mtime,
+                        commit_message="Updated from disk (as-is metadata)"
+                    )
+                    report["updated_artefacts"] += 1
+                    if _upd:
+                        for _k in (existing_art.get("title"), rel_str):
+                            if _k:
+                                title_index[str(_k).replace("\\", "/")] = _upd
 
         # Exit bulk mode and persist everything registered this pass in ONE commit.
         object.__setattr__(self.artefacts, "_bulk_sync_active", False)

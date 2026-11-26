@@ -1240,6 +1240,69 @@ class OpenAIBinding(LollmsLLMBinding):
                 ),
             )
 
+    def load_model_profile(self, model_name: str = "", **model_params) -> None:
+        """
+        Apply per-model settings from a model profile (decoupled from construction).
+
+        Called by ``LollmsClient._instantiate_binding_from_profile`` AFTER the
+        binding has been built with connection/auth parameters only. This keeps
+        binding creation (transport/auth) independent from model-profile
+        construction, which is where these knobs are actually declared
+        (``description.yaml`` -> ``model_input_parameters``).
+
+        Only keys explicitly present in ``model_params`` are applied so callers
+        may override a single setting without resetting the rest.
+        """
+        if model_name:
+            self.model_name = model_name
+
+        if "is_vllm" in model_params and model_params["is_vllm"] is not None:
+            raw = model_params["is_vllm"]
+            self.is_vllm = (
+                raw.lower().strip() in ("true", "1", "yes", "on")
+                if isinstance(raw, str) else bool(raw)
+            )
+            # A per-model override invalidates the cached auto-probe result.
+            self._vllm_probed = False
+            self._is_vllm_detected = False
+
+        if (
+            "send_thinking_parameter" in model_params
+            and model_params["send_thinking_parameter"] is not None
+        ):
+            raw = model_params["send_thinking_parameter"]
+            self.send_thinking_parameter = (
+                raw.lower().strip() not in ("false", "0", "no", "off", "")
+                if isinstance(raw, str) else bool(raw)
+            )
+
+        if (
+            "thinking_effort_keyword" in model_params
+            and model_params["thinking_effort_keyword"] is not None
+        ):
+            self.thinking_effort_keyword = str(model_params["thinking_effort_keyword"])
+
+        if "glm_image_embedding" in model_params and model_params["glm_image_embedding"] is not None:
+            self.glm_image_embedding = bool(model_params["glm_image_embedding"])
+
+        if "video_enabled" in model_params and model_params["video_enabled"] is not None:
+            self.video_enabled = bool(model_params["video_enabled"])
+
+        if "thinking_enabled" in model_params and model_params["thinking_enabled"] is not None:
+            self.thinking_enabled = bool(model_params["thinking_enabled"])
+
+        if "default_reasoning_effort" in model_params:
+            self.default_reasoning_effort = model_params["default_reasoning_effort"]
+
+        if "supported_reasoning_efforts" in model_params and model_params["supported_reasoning_efforts"] is not None:
+            raw_efforts = model_params["supported_reasoning_efforts"]
+            if isinstance(raw_efforts, str):
+                self.supported_reasoning_efforts = [
+                    s.strip() for s in raw_efforts.split(",") if s.strip()
+                ]
+            elif isinstance(raw_efforts, (list, tuple)):
+                self.supported_reasoning_efforts = list(raw_efforts)
+
     def cancel(self) -> None:
         """Dispose the SDK / OAuth HTTP clients and signal cancellation."""
         try:
@@ -3395,6 +3458,9 @@ class OpenAIBinding(LollmsLLMBinding):
         Returns:
             bool: True if model loaded successfully.
         """
+        # Decoupled model-profile layer: per-model settings are applied through
+        # the load_model_profile() hook (no server round-trip). The binding's
+        # connection/auth state is untouched by a model switch.
+        self.load_model_profile(model_name)
         self.model = model_name
-        self.model_name = model_name
         return True

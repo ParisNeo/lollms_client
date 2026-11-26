@@ -85,8 +85,8 @@ class LollmsBindingProfile:
             self.default_reasoning_effort = str(self.default_reasoning_effort).strip().lower()
         if not self.thinking_enabled:
             self.default_reasoning_effort = None
-
-
+            
+            
 @dataclass
 class LollmsModelProfile:
     """
@@ -107,6 +107,8 @@ class LollmsModelProfile:
     thinking_enabled: bool = False
     default_reasoning_effort: Optional[str] = None
     native_tools_enabled: bool = False
+    send_thinking_parameter: Optional[bool] = None
+    thinking_effort_keyword: Optional[str] = None
 
     def __post_init__(self):
         self.supported_reasoning_efforts = _normalize_effort_list(
@@ -115,8 +117,15 @@ class LollmsModelProfile:
         if self.default_reasoning_effort:
             self.default_reasoning_effort = str(self.default_reasoning_effort).strip().lower()
         if not self.thinking_enabled:
-            # Capability is declared but inert when thinking is off.
+            # Capability is declared but inert when is off.
             self.default_reasoning_effort = None
+        if self.send_thinking_parameter is not None and isinstance(
+            self.send_thinking_parameter, str
+        ):
+            self.send_thinking_parameter = (
+                self.send_thinking_parameter.lower().strip()
+                not in ("false", "0", "no", "off", "")
+            )
 
 
 class LollmsClient():
@@ -704,18 +713,11 @@ class LollmsClient():
             ASCIIColors.error(f"{modality.upper()} binding profile '{model_profile.binding_profile_name}' not found for model '{alias}'.")
             return None
 
-        # Base connection config from the binding profile
+        # Base connection config from the binding profile. Only transport/auth
+        # settings are passed to the constructor. Per-model behaviour is applied
+        # afterwards through the binding's load_model_profile() hook so that
+        # binding creation stays decoupled from model-profile construction.
         b_config = binding_profile.binding_config.copy() if binding_profile.binding_config else {}
-
-        # Merge binding-profile capability fields into the binding config so they
-        # reach the binding constructor as kwargs. Model-profile values override
-        # these later via setattr.
-        b_config.setdefault("video_enabled", binding_profile.video_enabled)
-        b_config.setdefault("image_token_cost", binding_profile.image_token_cost)
-        b_config.setdefault("thinking_enabled", binding_profile.thinking_enabled)
-        b_config.setdefault("supported_reasoning_efforts", binding_profile.supported_reasoning_efforts)
-        b_config.setdefault("default_reasoning_effort", binding_profile.default_reasoning_effort)
-        b_config.setdefault("native_tools_enabled", binding_profile.native_tools_enabled)
 
         _ssl_debug = os.getenv("LOLLMS_DEBUG_SSL", "").lower() in ("1", "true", "yes")
         if _ssl_debug:
@@ -724,6 +726,20 @@ class LollmsClient():
 
         if "verify_ssl_certificate" in b_config and isinstance(b_config["verify_ssl_certificate"], str):
             b_config["verify_ssl_certificate"] = b_config["verify_ssl_certificate"].lower().strip() in ("true", "1", "yes", "y", "on")
+
+        # Per-model settings that belong to the model profile (not the binding).
+        # Collected here and applied through load_model_profile() after the
+        # binding is constructed.
+        model_params: Dict[str, Any] = {
+            "glm_image_embedding": model_profile.glm_image_embedding,
+            "video_enabled": model_profile.video_enabled,
+            "supported_reasoning_efforts": model_profile.supported_reasoning_efforts,
+            "thinking_enabled": model_profile.thinking_enabled,
+            "default_reasoning_effort": model_profile.default_reasoning_effort,
+        }
+        model_params["send_thinking_parameter"] = model_profile.send_thinking_parameter
+        model_params["thinking_effort_keyword"] = model_profile.thinking_effort_keyword
+        model_params = {k: v for k, v in model_params.items() if v is not None}
 
         # For secondary non-LLM modalities, ensure server spawning does not block the caller's main thread
         if modality != "llm":
@@ -790,6 +806,17 @@ class LollmsClient():
                     setattr(binding, "native_tools_enabled", _profile_flag or _binding_flag)
                 except Exception:
                     pass
+                # Decoupled application of per-model settings: prefer the
+                # binding's load_model_profile() hook (model-profile layer).
+                # Bindings that do not implement it keep their construction
+                # kwargs fallback and are untouched here.
+                if model_params:
+                    loader = getattr(binding, "load_model_profile", None)
+                    if callable(loader):
+                        try:
+                            loader(model_profile.model_name or "", **model_params)
+                        except Exception as _load_err:
+                            trace_exception(_load_err)
                 return binding
         except Exception as e:
             trace_exception(e)
@@ -2529,6 +2556,12 @@ class LollmsClient():
                 out["default_reasoning_effort"] = p.default_reasoning_effort
             if p.native_tools_enabled:
                 out["native_tools_enabled"] = p.native_tools_enabled
+            if p.is_vllm is not None:
+                out["is_vllm"] = p.is_vllm
+            if p.send_thinking_parameter is not None:
+                out["send_thinking_parameter"] = p.send_thinking_parameter
+            if p.thinking_effort_keyword is not None:
+                out["thinking_effort_keyword"] = p.thinking_effort_keyword
             return out
 
         modality_registries = {

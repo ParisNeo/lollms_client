@@ -410,7 +410,66 @@ def _candidate_working_dirs(working_dir: Optional[Path]) -> List[Path]:
     return [cwd] if cwd.is_dir() else []
 
 
-def _resolve_media_path(ref: str, working_dir: Optional[Path]) -> Path:
+def _resolve_existing_file(ref: Any, working_dir: Optional[Path]) -> Path:
+    """Resiliently resolves a file reference to an existing on-disk path.
+
+    The Excel read/edit tools previously trusted an absolute reference verbatim
+    and hard-failed with "File not found" when it did not literally exist — even
+    though the SAME file was present in the discussion workspace (a very common
+    case: the caller/LLM builds an absolute path from the discussion PARENT
+    directory instead of the ``workspace_data`` root, or references a stale
+    path). This resolver recovers such references:
+
+    1. Try the literal path: absolute -> as-is, relative -> ``working_dir / ref``.
+    2. Re-anchor the reference's basename onto ``working_dir``.
+    3. Search every candidate working root with the basename.
+
+    Returns the first existing file, otherwise the original candidate (so the
+    caller's error message still shows a meaningful path).
+    """
+    raw = str(ref or "").strip().strip('"').strip("'")
+    working_root = working_dir.resolve() if working_dir is not None else Path.cwd()
+
+    candidate = Path(raw)
+    literal = candidate if candidate.is_absolute() else (working_root / candidate)
+    if literal.is_file():
+        return literal
+
+    basename = Path(raw).name
+    if not basename:
+        return literal
+
+    roots: List[Path] = []
+    if working_dir is not None:
+        roots.append(working_root)
+    roots.extend(_candidate_working_dirs(working_dir))
+    # Also probe the workspace PARENT (the discussion root) so an absolute
+    # reference built from the discussion directory — e.g.
+    # ``.../discussions/<id>/dashboard.xlsx`` when the file actually lives in
+    # ``.../discussions/<id>/workspace_data/dashboard.xlsx`` — still resolves
+    # by basename even if the caller got the segment wrong.
+    try:
+        roots.append(working_root.parent)
+    except (OSError, RuntimeError):
+        pass
+
+    seen = set()
+    for root in roots:
+        try:
+            probe = (root / basename).resolve()
+        except (OSError, RuntimeError):
+            continue
+        key = str(probe).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if probe.is_file():
+            return probe
+
+    return literal
+
+
+def _resolve_media_path(working_dir: Optional[Path], ref: Any) -> Path:
     """Resolves a workspace-relative media reference to an absolute path (read-only)."""
     raw = str(ref or "").strip().strip('"').strip("'")
     if not raw:
@@ -1081,8 +1140,7 @@ def tool_edit_excel(
             return {"success": False, "error": "No file provided for editing."}
 
         working_dir = _resolve_working_dir(discussion_instance)
-        candidate = Path(str(file).strip())
-        file_path = candidate if candidate.is_absolute() else working_dir / candidate
+        file_path = _resolve_existing_file(file, working_dir)
         if not file_path.is_file():
             return {"success": False, "error": f"File not found: {file_path}"}
 
@@ -1480,8 +1538,7 @@ def tool_read_excel(
             return {"success": False, "error": "No file provided for reading."}
 
         working_dir = _resolve_working_dir(discussion_instance)
-        candidate = Path(str(file).strip())
-        file_path = candidate if candidate.is_absolute() else working_dir / candidate
+        file_path = _resolve_existing_file(file, working_dir)
         if not file_path.is_file():
             return {"success": False, "error": f"File not found: {file_path}"}
 

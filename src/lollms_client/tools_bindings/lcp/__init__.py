@@ -427,7 +427,6 @@ sub-attributes must be feature-checked for None.
                 "_python_file_path": str(py_file_path.resolve()),
                 "_parsed_via_regex_fallback": True
             })
-            ASCIIColors.success(f"[LCP] Regex fallback extracted tool '{tool_name}' from '{py_file_path.name}'.")
 
         return tools if tools else None
 

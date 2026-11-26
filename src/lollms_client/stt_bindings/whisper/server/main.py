@@ -10,6 +10,7 @@ import hashlib
 import argparse
 import tempfile
 import base64
+import subprocess
 import traceback
 import pipmaster as pm
 
@@ -22,8 +23,14 @@ from concurrent.futures import Future
 print(f"[whisper-server] bootstrap: python={sys.executable} argv={sys.argv}", flush=True)
 
 
-def _bootstrap_dependencies() -> None:
-    """Installs/validates required packages with actionable failure diagnostics."""
+def _bootstrap_lite_dependencies() -> None:
+    """
+    Installs/validates only the *light* packages needed for the HTTP layer.
+
+    Heavy inference dependencies (torch/torchaudio/openai-whisper) are deliberately
+    excluded: they are installed by a background provisioning thread AFTER uvicorn
+    has bound the port, so the daemon becomes reachable almost instantly.
+    """
     try:
         import pipmaster as pm
     except ImportError as exc:
@@ -38,11 +45,11 @@ def _bootstrap_dependencies() -> None:
     try:
         pm.ensure_packages([
             "fastapi", "uvicorn", "ascii_colors>=0.11.10",
-            "filelock", "pydantic", "torch", "numpy",
+            "filelock", "pydantic", "numpy",
         ])
     except Exception as exc:
         print(
-            f"[whisper-server] FATAL: dependency bootstrap failed: {exc}",
+            f"[whisper-server] FATAL: lite dependency bootstrap failed: {exc}",
             file=sys.stderr,
             flush=True,
         )
@@ -50,11 +57,13 @@ def _bootstrap_dependencies() -> None:
         raise
 
 
+# The lite HTTP layer must be importable BEFORE uvicorn binds the port, but we
+# still want to fail fast if it can't be provisioned. _bootstrap_lite_dependencies
+# only installs fast, tiny packages (fastapi/uvicorn/numpy/etc.), NOT torch/whisper.
 try:
-    _bootstrap_dependencies()
+    _bootstrap_lite_dependencies()
 
     import numpy as np
-    import torch
     from fastapi import FastAPI, APIRouter, HTTPException, Header
     from pydantic import BaseModel, Field
     from ascii_colors import ASCIIColors, trace_exception
@@ -68,17 +77,111 @@ except BaseException as _startup_error:  # noqa: BLE001 - must surface all start
     )
     traceback.print_exc()
     sys.exit(1)
+
+# 🚀 Heavy transcription stack (torch + openai-whisper) is intentionally NOT
+# imported at startup. The HTTP server must become reachable almost instantly
+# so clients' /status probes succeed while the (potentially multi-minute)
+# torch/torchaudio/openai-whisper install runs concurrently in the background.
+# It is imported lazily and thread-safely by _ensure_transcription_stack(),
+# which the /transcribe endpoints await before touching any torch/whisper API.
+torch = None
+whisper = None
 _WHISPER_IMPORT_ERROR: Optional[BaseException] = None
-try:
-    import whisper
-except Exception as _whisper_import_error:
-    whisper = None
-    _WHISPER_IMPORT_ERROR = _whisper_import_error
-    ASCIIColors.warning(
-        f"openai-whisper is not importable in this environment ({_whisper_import_error}). "
-        "The module stays importable for tests and tooling; transcription will fail at "
-        "model-load time until 'openai-whisper' is correctly installed."
-    )
+_TRANSCRIPTION_LOCK = threading.Lock()
+_TRANSCRIPTION_READY = threading.Event()
+_TRANSCRIPTION_INSTALL_ERROR: Optional[BaseException] = None
+
+
+def _ensure_transcription_stack() -> None:
+    """
+    Ensures ``torch`` and ``whisper`` are importable, installing them first if
+    needed. Thread-safe and idempotent.
+
+    This is the ONLY place that pulls in the heavy dependencies and performs the
+    slow ``pip install``. It is invoked from a background thread started in the
+    ``__main__`` block (so installs happen while the server is already serving),
+    and defensively from the transcription endpoints before torch/whisper are
+    used, guaranteeing the stack is ready by the time a real request needs it.
+    """
+    global torch, whisper, _WHISPER_IMPORT_ERROR, _TRANSCRIPTION_INSTALL_ERROR
+    if _TRANSCRIPTION_READY.is_set():
+        return
+    with _TRANSCRIPTION_LOCK:
+        if _TRANSCRIPTION_READY.is_set():
+            return
+        try:
+            try:
+                import torch as _torch
+            except Exception:
+                _torch = None
+            try:
+                import whisper as _whisper
+            except Exception:
+                _whisper = None
+
+            if _torch is None or _whisper is None:
+                _uninstall_conflicting_whisper()
+                ASCIIColors.info(
+                    "Installing transcription stack (torch/torchaudio/openai-whisper) "
+                    "in the background..."
+                )
+                torch_index_url = None
+                if sys.platform == "win32":
+                    try:
+                        subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=True)
+                        torch_index_url = "https://download.pytorch.org/whl/cu126"
+                        ASCIIColors.green("NVIDIA GPU detected. Installing CUDA-enabled PyTorch.")
+                    except Exception:
+                        torch_index_url = None
+                if torch_index_url:
+                    pm.ensure_packages(["torch", "torchaudio"], index_url=torch_index_url)
+                else:
+                    pm.ensure_packages(["torch", "torchaudio"])
+                pm.ensure_packages(["openai-whisper"])
+
+                import torch as _torch2
+                import whisper as _whisper2
+                _torch, _whisper = _torch2, _whisper2
+
+            torch = _torch
+            whisper = _whisper
+            if whisper is None:
+                _WHISPER_IMPORT_ERROR = RuntimeError("openai-whisper import failed after install")
+            ASCIIColors.green("Transcription stack is ready.")
+        except BaseException as exc:  # noqa: BLE001 - recorded and surfaced at model load
+            _TRANSCRIPTION_INSTALL_ERROR = exc
+            ASCIIColors.error(f"Transcription stack provisioning failed: {exc}")
+        finally:
+            _TRANSCRIPTION_READY.set()
+
+
+def _uninstall_conflicting_whisper() -> None:
+    """
+    Removes the abandoned PyPI package named ``whisper`` if it (and not
+    ``openai-whisper``) is installed, since it ships a conflicting ``whisper``
+    module without ``load_model`` and makes ``pip install openai-whisper`` a no-op.
+    """
+    try:
+        import importlib.metadata as _md
+        try:
+            abandoned = _md.version("whisper")
+        except _md.PackageNotFoundError:
+            abandoned = None
+        try:
+            _md.version("openai-whisper")
+            has_openai = True
+        except _md.PackageNotFoundError:
+            has_openai = False
+        if abandoned and not has_openai:
+            ASCIIColors.warning(
+                f"Detected conflicting abandoned 'whisper' package ({abandoned}). Uninstalling it."
+            )
+            subprocess.run(
+                [sys.executable, "-m", "pip", "uninstall", "-y", "whisper"],
+                capture_output=True, text=True,
+            )
+    except Exception:
+        pass
 
 
 class TranscriptionRequest(BaseModel):
@@ -139,7 +242,7 @@ class ModelManager:
         else:
             self.device = requested_device
         self.device = str(self.device).lower()
-        if self.device.startswith("cuda") and not torch.cuda.is_available():
+        if torch is not None and self.device.startswith("cuda") and not torch.cuda.is_available():
             ASCIIColors.warning("CUDA requested but not available. Falling back to CPU.")
             self.device = "cpu"
 
@@ -151,10 +254,11 @@ class ModelManager:
         self.worker_thread.start()
 
     def _auto_detect_device(self) -> str:
-        if torch.cuda.is_available():
-            return "cuda"
-        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            return "mps"
+        if torch is not None:
+            if torch.cuda.is_available():
+                return "cuda"
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                return "mps"
         return "cpu"
 
     def is_loaded(self) -> bool:
@@ -166,11 +270,13 @@ class ModelManager:
         self.worker_thread.join(timeout=5)
 
     def _load_whisper_model(self, model_name: str):
-        if whisper is None:
+        _ensure_transcription_stack()
+        if whisper is None or torch is None:
+            detail = _WHISPER_IMPORT_ERROR or _TRANSCRIPTION_INSTALL_ERROR or "unknown error"
             raise RuntimeError(
-                "openai-whisper is not available in this environment "
-                f"({_WHISPER_IMPORT_ERROR}). Install 'openai-whisper' in the server "
-                "virtual environment. Do NOT install the unrelated 'whisper' PyPI package."
+                "The transcription stack (torch + openai-whisper) is not available "
+                f"in this environment ({detail}). Do NOT install the unrelated 'whisper' "
+                "PyPI package; install 'openai-whisper' and 'torch' instead."
             )
         if self.model is not None and self.loaded_model_name == model_name:
             return
@@ -497,8 +603,17 @@ def health():
 @router.get("/status")
 def status(authorization: Optional[str] = Header(None), x_server_token: Optional[str] = Header(None)):
     verify_auth_token(authorization, x_server_token)
+    ready = _TRANSCRIPTION_READY.is_set() and _TRANSCRIPTION_INSTALL_ERROR is None
     return {
         "status": "running",
+        "model_ready": ready,
+        "warm": bool(state and state.registry.get_active_managers()),
+        "model_error": (
+            str(_TRANSCRIPTION_INSTALL_ERROR)
+            if _TRANSCRIPTION_INSTALL_ERROR is not None
+            else (str(_WHISPER_IMPORT_ERROR) if _WHISPER_IMPORT_ERROR is not None else None)
+        ),
+        "provisioning": not _TRANSCRIPTION_READY.is_set(),
         "batch_window": state.batch_window if state else 0.02,
         "max_batch_size": state.max_batch_size if state else 8,
         "active_models": [m.loaded_model_name for m in state.registry.get_active_managers() if m.is_loaded()] if state else []
@@ -541,10 +656,20 @@ async def transcribe(
     model_name = request.model_name or "base"
     temp_file = None
     try:
+        # Block until torch+openai-whisper are installed/importable. This is the
+        # ONLY place heavy deps are needed; the HTTP server already bound the port
+        # long before, so /status and /ps remain responsive during provisioning.
+        _ensure_transcription_stack()
+        if torch is None or whisper is None:
+            detail = _WHISPER_IMPORT_ERROR or _TRANSCRIPTION_INSTALL_ERROR or "unknown error"
+            raise HTTPException(
+                status_code=503,
+                detail=f"Whisper inference stack is unavailable: {detail}",
+            )
         requested_device = (request.device or "auto").lower().strip()
         if requested_device in ("auto", ""):
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        elif requested_device.startswith("cuda") and not torch.cuda.is_available():
+            device = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
+        elif requested_device.startswith("cuda") and not (torch is not None and torch.cuda.is_available()):
             ASCIIColors.warning("CUDA requested for transcription but not available. Using CPU.")
             device = "cpu"
         else:
@@ -689,10 +814,17 @@ async def transcribe_diarize(
     voice_sample_files: List[str] = []
 
     try:
+        _ensure_transcription_stack()
+        if torch is None or whisper is None:
+            detail = _WHISPER_IMPORT_ERROR or _TRANSCRIPTION_INSTALL_ERROR or "unknown error"
+            raise HTTPException(
+                status_code=503,
+                detail=f"Whisper inference stack is unavailable: {detail}",
+            )
         requested_device = (request.device or "auto").lower().strip()
         if requested_device in ("auto", ""):
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        elif requested_device.startswith("cuda") and not torch.cuda.is_available():
+            device = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
+        elif requested_device.startswith("cuda") and not (torch is not None and torch.cuda.is_available()):
             device = "cpu"
         else:
             device = requested_device
@@ -918,16 +1050,15 @@ async def transcribe_diarize(
 app.include_router(router)
 
 if __name__ == "__main__":
-    if whisper is None:
-        try:
-            pm.ensure_packages("openai-whisper")
-            import whisper as _whisper_runtime
-            whisper = _whisper_runtime
-            ASCIIColors.success("openai-whisper installed and imported successfully.")
-        except Exception as _whisper_setup_error:
-            ASCIIColors.error(f"openai-whisper is required to run the Whisper server: {_whisper_setup_error}")
-            import sys
-            sys.exit(-1)
+    # 🚀 Provision the heavy transcription stack in the background so the HTTP
+    # server binds and becomes reachable immediately. torch/torchaudio/
+    # openai-whisper install while the daemon already answers /status and /ps;
+    # the /transcribe endpoints await _ensure_transcription_stack() when needed.
+    threading.Thread(
+        target=_ensure_transcription_stack,
+        name="whisper-stack-install",
+        daemon=True,
+    ).start()
 
     import uvicorn
     parser = argparse.ArgumentParser(description="Whisper STT Shared Daemon Server")

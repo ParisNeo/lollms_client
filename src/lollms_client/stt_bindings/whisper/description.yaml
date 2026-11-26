@@ -8,6 +8,16 @@ description: >
   continuous dynamic micro-batching. Multiple lollms_client instances and worker
   processes attach seamlessly to a single shared daemon on loopback with zero VRAM
   duplication and zero port drift.
+
+  Fast reachability: the daemon provisions only LIGHT dependencies
+  (fastapi/uvicorn/numpy/filelock) before binding its port, so /health and
+  /status answer almost immediately. Heavy inference deps (torch/torchaudio/
+  openai-whisper) are installed by a background provisioning thread inside the
+  daemon and/or by a detached maintenance subprocess; /transcribe endpoints
+  block only if inference is still being installed, returning 503 with a clear
+  message while /status holds. Client-side maintenance (venv repair, lite-dep
+  upgrades) is run in a separate process via run_maintenance_async() so the
+  caller is never blocked.
 global_input_parameters:
   - name: host
     type: str

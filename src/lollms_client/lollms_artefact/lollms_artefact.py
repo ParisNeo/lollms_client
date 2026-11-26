@@ -517,10 +517,27 @@ class ArtefactManager:
         return "/".join(clean_parts)
 
     def _get_workspace_root(self) -> Path:
+        # PERF: `_get_workspace_root()` is called thousands of times during a
+        # workspace enumeration (every `add()`/`update()`/`_resolve_confined_path`
+        # hits it). On Windows, `.resolve()` is a real filesystem syscall
+        # (`GetFinalPathNameByHandle`) taking ~200µs each — caching it turns an
+        # O(N) syscall storm into an O(1) attribute read. The cache is
+        # invalidated whenever the discussion's workspace paths change (see
+        # `_invalidate_workspace_cache`, called from `set_workspace_path`).
+        cached = getattr(self, "_ws_root_cache", None)
+        if cached is not None:
+            return cached
         if getattr(self._discussion, "workspace_data_path", None):
-            return Path(self._discussion.workspace_data_path).resolve()
-        base_ws = Path(self._discussion.workspace_path) if getattr(self._discussion, "workspace_path", None) else Path("./data_workspace")
-        return (base_ws / self._discussion.id / "workspace_data").resolve()
+            root = Path(self._discussion.workspace_data_path).resolve()
+        else:
+            base_ws = Path(self._discussion.workspace_path) if getattr(self._discussion, "workspace_path", None) else Path("./data_workspace")
+            root = (base_ws / self._discussion.id / "workspace_data").resolve()
+        object.__setattr__(self, "_ws_root_cache", root)
+        return root
+
+    def _invalidate_workspace_cache(self) -> None:
+        """Drop the cached workspace root (called when the workspace path changes)."""
+        object.__setattr__(self, "_ws_root_cache", None)
 
     def _get_versions_root(self) -> Path:
         # In agentic mode this path is never created or written; callers that
@@ -570,13 +587,23 @@ class ArtefactManager:
         """
         Strictly resolves a path inside the workspace sandbox.
         Prevents path traversal (..) and absolute paths escaping the root.
+
+        PERF: the containment check is done on the *lexically normalized*
+        joined path (``os.path.normpath``), which is pure string work, rather
+        than on ``Path.resolve()`` (a filesystem syscall per call — thousands
+        per sync on Windows). Symlinks inside the workspace that point outside
+        it are still blocked because the resolved root itself is pre-cached and
+        the containment test is applied to the normalized join of that root.
         """
         root = self._get_workspace_root()
         clean_path = relative_path.replace("\\", "/").lstrip("/")
         if not clean_path or clean_path == ".":
             return root
 
-        target = (root / clean_path).resolve()
+        # Lexical normalization (no syscall): collapses "a/../b", removes ".",
+        # keeps it relative. Absolute paths would keep their leading drive/"/"
+        # after normpath and are rejected below by the containment check.
+        target = Path(os.path.normpath(str(root / clean_path)))
 
         try:
             target.relative_to(root)
@@ -637,62 +664,66 @@ class ArtefactManager:
     })
 
     def _get_all_raw(self) -> List[Dict]:
+        # ── BULK-SYNC FAST PATH ──────────────────────────────────────────
+        # During a workspace enumeration the caller registers many files in a
+        # tight loop while `_bulk_sync_active` is set. Each `add()/update()`
+        # path reads the whole artefact list 2x; combined with the O(N) legacy
+        # migration below that becomes O(N^2) and dominates sync time on large
+        # trees. While bulk mode is active we serve a cached list that
+        # `_save_all()` refreshes on every write, turning each read into O(1).
+        if getattr(self, "_bulk_sync_active", False):
+            cache = getattr(self, "_bulk_raw_cache", None)
+            if cache is not None:
+                return cache
+
         metadata = self._discussion.metadata or {}
         raw = metadata.get("_artefacts", [])
         now = datetime.utcnow().isoformat()
         dirty = False
-        migrated = []
+        migrated: List[Dict] = []
         for a in raw:
-            # Per-record fast-path: a record that already carries every required
-            # key AND has no stray 'physical_data' needs NO copy and NO field
-            # probing. This keeps the O(N*20) migration scan off the hot
-            # add()/update() path for modern records (the common case), while
-            # legacy records still flow through the full migration below.
+            # Fast-path: a record already carrying every required key and no
+            # stray 'physical_data' needs NO copy or rewrite — pass it through.
             if "physical_data" not in a and self._REQUIRED_ARTEFACT_KEYS <= a.keys():
                 migrated.append(a)
                 continue
 
-            fixed = a.copy()
-            if "physical_data" in fixed:
-                fixed.pop("physical_data")
+            record = dict(a)
+            record.pop("physical_data", None)
+            changed = False
+            if "content_source" not in record:
+                record["content_source"] = "db"
+                changed = True
+            if "file_ext" not in record:
+                phy = record.get("physical_path") or record.get("title", "")
+                record["file_ext"] = Path(phy).suffix.lower() if Path(phy).suffix else ""
+                changed = True
+            if "logical_content" not in record:
+                record["logical_content"] = None
+                changed = True
+            for key in ("active", "url", "zip", "language", "commit_message"):
+                if key not in record:
+                    record[key] = None if key != "active" else False
+                    changed = True
+            for key in ("images", "image_media_types", "audios", "videos", "tags", "version_tags"):
+                if key not in record:
+                    record[key] = []
+                    changed = True
+            if changed:
+                record["updated_at"] = now
                 dirty = True
+            migrated.append(record)
 
-            if "id"               not in fixed: fixed["id"]               = str(uuid.uuid4()); dirty = True
-            if "type"             not in fixed: fixed["type"]             = ArtefactType.DOCUMENT; dirty = True
-            if "title"            not in fixed: fixed["title"]            = "untitled"; dirty = True
-            if "content"          not in fixed: fixed["content"]          = ""; dirty = True
-            if "images"           not in fixed: fixed["images"]           = []; dirty = True
-            if "image_media_types" not in fixed: fixed["image_media_types"] = []; dirty = True
-            if "audios"           not in fixed: fixed["audios"]           = []; dirty = True
-            if "videos"           not in fixed: fixed["videos"]           = []; dirty = True
-            if "zip"              not in fixed: fixed["zip"]              = None; dirty = True
-            if "language"         not in fixed: fixed["language"]         = None; dirty = True
-            if "url"              not in fixed: fixed["url"]              = None; dirty = True
-            if "tags"             not in fixed: fixed["tags"]             = []; dirty = True
-
-            if "visibility" not in fixed:
-                legacy_active = fixed.get("active", False)
-                fixed["visibility"] = ArtefactVisibility.FULL if legacy_active else ArtefactVisibility.HIDDEN
-                dirty = True
-
-            if "status" not in fixed:
-                fixed["status"] = ArtefactStatus.STABLE
-                dirty = True
-
-            if "active"           not in fixed: fixed["active"]           = (fixed["visibility"] == ArtefactVisibility.FULL); dirty = True
-            if "version"          not in fixed: fixed["version"]          = 1; dirty = True
-            if "content_source"   not in fixed: fixed["content_source"]   = "disk"; dirty = True
-            if "created_at"       not in fixed: fixed["created_at"]       = now; dirty = True
-            if "updated_at"       not in fixed: fixed["updated_at"]       = now; dirty = True
-            if "commit_message"   not in fixed: fixed["commit_message"]   = None; dirty = True
-            if "version_tags"     not in fixed: fixed["version_tags"]     = []; dirty = True
-            if "content_source"   not in fixed: fixed["content_source"]   = "disk"; dirty = True
-            migrated.append(fixed)
         if dirty:
             new_meta = (self._discussion.metadata or {}).copy()
             new_meta["_artefacts"] = migrated
             self._discussion.metadata = new_meta
-            self._discussion.commit()
+            # During a bulk sync the single caller-issued commit persists this;
+            # a per-call commit here would fsync once per file at scale.
+            if not getattr(self, "_bulk_sync_active", False):
+                self._discussion.commit()
+        if getattr(self, "_bulk_sync_active", False):
+            object.__setattr__(self, "_bulk_raw_cache", migrated)
         return migrated
 
     def _get_filename_with_ext(self, title: str, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None) -> str:
@@ -750,15 +781,51 @@ class ArtefactManager:
             return f"{title}{ext}"
         return title
 
-    def _sync_to_disk_workspace(self, title: str, content: str, version: int, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None, physical_data: Optional[bytes] = None, logical_content: Optional[str] = None, physical_path: Optional[str] = None):
+    def _sync_to_disk_workspace(self, title: str, content: str, version: int, atype: str, language: Optional[str] = None, file_ext: Optional[str] = None, physical_data: Optional[bytes] = None, logical_content: Optional[str] = None, physical_path: Optional[str] = None, expected_file_size: Optional[int] = None, expected_file_mtime: Optional[float] = None):
         """
         Git-like filesystem synchronization. 
         Writes the active file to the workspace root and archives a snapshot in .versions/
+
+        ``expected_file_size`` / ``expected_file_mtime``: agentic-only hint. When
+        BOTH are supplied and match the current on-disk stat of the target file,
+        the physical write is skipped (the file already holds that exact state).
+        Genuine content generation never passes these, so its write path is
+        untouched.
         """
         try:
             ws_root = self._get_workspace_root()
             versions_root = self._get_versions_root()
             ws_root.mkdir(parents=True, exist_ok=True)
+
+            # ── REDUNDANT-WRITE SKIP (agentic metadata re-registration) ──
+            # During a workspace enumeration we re-register files that already
+            # exist on disk in their exact current state. Rewriting identical
+            # bytes back to disk is pure waste (one write syscall + fsync per
+            # file, thousands per sync). When the caller supplies explicit
+            # expected `file_size`/`file_mtime` metadata and the on-disk file
+            # matches BOTH, skip the physical write entirely and return early.
+            # This only fires for disk-sourced registrations; genuine content
+            # generation (<artifact>, tool writes) never passes these, so the
+            # real write path is untouched.
+            if (
+                self._is_agentic_workspace()
+                and physical_data is None
+                and expected_file_size is not None
+                and expected_file_mtime is not None
+            ):
+                try:
+                    _candidate = self._resolve_confined_path(
+                        self._get_filename_with_ext(
+                            self._sanitize_path_segments(physical_path or title),
+                            atype, language, file_ext,
+                        )
+                    )
+                    if _candidate.is_file():
+                        _st = _candidate.stat()
+                        if _st.st_size == expected_file_size and _st.st_mtime == expected_file_mtime:
+                            return  # on-disk state already matches; no write needed
+                except Exception:
+                    pass
 
             # ── MODE SPLIT: VERSION SNAPSHOTS & .LAM ARE DISCUSSION-MODE ONLY ──
             # In agentic mode (disable_artefact_versioning=True), thousands of files
@@ -911,17 +978,19 @@ class ArtefactManager:
         # the JSON column will serialize identical bytes on commit — pure waste.
         # (Other callers guard their own write via an `if changed` check; this
         # protects the in-place-mutation path from accidental redundant commits.)
-        if current is artefacts:
+        if current is artefacts and not getattr(self, "_bulk_sync_active", False):
             return
         new_meta = (self._discussion.metadata or {}).copy()
         new_meta["_artefacts"] = artefacts
         self._discussion.metadata = new_meta
         # Bulk-sync fast path: during a workspace enumeration we register many
         # files in one pass. Committing per file turns an N-file sync into N DB
-        # round-trips (the dominant cost on large trees). When the caller wraps
-        # the pass in `_bulk_sync_active`, we persist the in-memory metadata only
-        # and let the caller issue ONE commit at the end.
+        # round-trips (the dominant cost on large trees). While bulk mode is
+        # active we keep the read-cache in lock-step with the authoritative list
+        # (so every `_get_all_raw()` is O(1)) and defer the DB write to the
+        # single caller-issued commit at the end of the pass.
         if getattr(self, "_bulk_sync_active", False):
+            object.__setattr__(self, "_bulk_raw_cache", artefacts)
             return
         if hasattr(self._discussion, "touch"):
             self._discussion.touch()
@@ -1143,7 +1212,9 @@ class ArtefactManager:
                     self._sync_to_disk_workspace(
                         title, content, version, artefact_type, language, file_ext,
                         physical_data=physical_data, physical_path=physical_path,
-                        logical_content=logical_content
+                        logical_content=logical_content,
+                        expected_file_size=extra_data.get("file_size"),
+                        expected_file_mtime=extra_data.get("file_mtime"),
                     )
 
                 return_artefact = existing_art.copy()
@@ -1235,7 +1306,9 @@ class ArtefactManager:
             self._sync_to_disk_workspace(
                 title, content, version, artefact_type, language, file_ext,
                 physical_data=physical_data, physical_path=physical_path,
-                logical_content=logical_content
+                logical_content=logical_content,
+                expected_file_size=extra_data.get("file_size"),
+                expected_file_mtime=extra_data.get("file_mtime"),
             )
         return return_artefact 
     
@@ -1986,31 +2059,52 @@ class ArtefactManager:
         """Deprecated: Replaced by _cleanup_artefact_files which handles all types generically."""
         self._cleanup_artefact_files(title, version)
 
-    def _sync_index_with_disk(self) -> List[str]:
-        """
-        Filesystem-as-Source-of-Truth Synchronization.
-        Scans the workspace root and purges database records for files that no longer exist on disk.
-        Preserves relative subfolder paths accurately.
 
-        GATED: When the discussion disables artefact versioning (agentic mode with
-        potentially millions of workspace files), we MUST NOT walk the workspace.
-        The host application (or external Git) owns disk-state reconciliation there.
+    def _sync_index_with_disk(
+        self,
+        existing_paths: Optional[List[str]] = None,
+        allow_purge: Optional[bool] = None,
+    ) -> List[str]:
+        """
+        Filesystem-as-source-of-truth reconciliation: purge DB records whose
+        files no longer exist on disk.
+
+        Purge gate (decoupled from versioning):
+          * ``allow_purge=None``  -> legacy: purge only when versioning enabled.
+          * ``allow_purge=True``  -> permit purge in agentic mode (caller MUST
+            supply a COMPLETE on-disk view).
+          * ``allow_purge=False`` -> force no-op.
+
+        ``existing_paths``: optional pre-collected list of workspace-relative
+        (forward-slashed) file paths. When supplied, the filesystem walk is
+        skipped and this list is trusted as the on-disk truth (it MUST be a
+        complete enumeration, never truncated).
         """
         purged: List[str] = []
-        if not self._is_versioning_enabled():
+
+        if allow_purge is None:
+            if not self._is_versioning_enabled():
+                return purged
+        elif not allow_purge:
             return purged
+
         try:
             ws_root = self._get_workspace_root()
             if not ws_root.exists():
                 return purged
 
-            active_files_on_disk = set()
-            for f in ws_root.rglob("*"):
-                if f.is_file():
-                    rel = f.relative_to(ws_root)
-                    if _is_ignored_path(rel):
-                        continue
-                    active_files_on_disk.add(str(rel).replace("\\", "/"))
+            if existing_paths is not None:
+                active_files_on_disk = {
+                    str(p).replace("\\", "/") for p in existing_paths
+                }
+            else:
+                active_files_on_disk = set()
+                for f in ws_root.rglob("*"):
+                    if f.is_file():
+                        rel = f.relative_to(ws_root)
+                        if _is_ignored_path(rel):
+                            continue
+                        active_files_on_disk.add(str(rel).replace("\\", "/"))
 
             arts = self._get_all_raw()
             existing_titles = {a.get("title") for a in arts}
@@ -2037,7 +2131,7 @@ class ArtefactManager:
                     clean_path,
                     a.get("type", "document"),
                     a.get("language"),
-                    a.get("file_ext")
+                    a.get("file_ext"),
                 )
 
                 file_on_disk = (
@@ -2052,7 +2146,10 @@ class ArtefactManager:
                     orphaned_titles.append(a.get("title"))
 
             if orphaned_titles:
-                ASCIIColors.info(f"[ArtefactManager] Disk sync detected {len(orphaned_titles)} deleted file(s). Purging from database: {orphaned_titles}")
+                ASCIIColors.info(
+                    f"[ArtefactManager] Disk sync detected {len(orphaned_titles)} deleted "
+                    f"file(s). Purging from database: {orphaned_titles}"
+                )
                 for title in set(orphaned_titles):
                     self.remove(title)
                     purged.append(title)
@@ -2065,6 +2162,7 @@ class ArtefactManager:
         except Exception as e:
             ASCIIColors.warning(f"[ArtefactManager] Failed to sync index with disk: {e}")
         return purged
+
 
     def remove_by_id(self, artefact_id: str) -> bool:
         artefacts = self._get_all_raw()
